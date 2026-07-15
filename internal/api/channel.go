@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/ingress"
 	"github.com/WuKongIM/WuKongIM/internal/options"
 	"github.com/WuKongIM/WuKongIM/internal/service"
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/cluster"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wkhttp"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
@@ -21,16 +23,35 @@ import (
 
 type channel struct {
 	wklog.Log
-	s *Server
+	s                      *Server
+	tagInvalidationRetries *channelTagRetryQueue
 }
+
+const (
+	channelTagInvalidationInitialTimeout = 750 * time.Millisecond
+	channelTagInvalidationRetryWorkers   = 8
+)
 
 // NewChannel 创建API
 func newChannel(s *Server) *channel {
-	return &channel{
+	ch := &channel{
 		s:   s,
 		Log: wklog.NewWKLog("Channel"),
 	}
+	ch.tagInvalidationRetries = newChannelTagRetryQueue(channelTagInvalidationRetryWorkers, func(target channelTagInvalidationTarget) error {
+		err := ch.invalidateChannelTag(target, nil, true)
+		if err != nil {
+			ch.Warn("channel tag invalidation retry failed",
+				zap.Error(err), zap.String("channelId", target.channelID), zap.Uint8("channelType", target.channelType))
+		}
+		return err
+	})
+	return ch
 }
+
+func (ch *channel) start() { ch.tagInvalidationRetries.Start() }
+
+func (ch *channel) stop() { ch.tagInvalidationRetries.Stop() }
 
 // Route Route
 func (ch *channel) route(r *wkhttp.WKHttp) {
@@ -221,10 +242,7 @@ func (ch *channel) addSubscriberWithReq(req subscriberAddReq) error {
 			ch.Error("移除所有订阅者失败！", zap.Error(err), zap.String("channelId", req.ChannelId), zap.Uint8("channelType", req.ChannelType))
 			return err
 		}
-		tagKey := service.TagManager.GetChannelTag(req.ChannelId, req.ChannelType)
-		if tagKey != "" {
-			service.TagManager.RemoveTag(tagKey)
-		}
+		ch.updateTagBySubscribers(req.ChannelId, req.ChannelType, nil, true)
 	}
 
 	newSubscribers := req.Subscribers
@@ -254,6 +272,7 @@ func (ch *channel) addSubscriberWithReq(req subscriberAddReq) error {
 			ch.Error("添加订阅者失败！", zap.Error(err), zap.Int("members", len(members)), zap.String("channelId", req.ChannelId), zap.Uint8("channelType", req.ChannelType))
 			return err
 		}
+		ch.updateTagBySubscribers(req.ChannelId, req.ChannelType, newSubscribers, false)
 
 		if req.ChannelType != wkproto.ChannelTypeLive { // 直播频道不添加会话
 			conversations := make([]wkdb.Conversation, 0, len(newSubscribers))
@@ -278,12 +297,6 @@ func (ch *channel) addSubscriberWithReq(req subscriberAddReq) error {
 				return err
 			}
 		}
-
-		err = ch.updateTagBySubscribers(req.ChannelId, req.ChannelType, newSubscribers, false)
-		if err != nil {
-			ch.Error("更新tag失败！", zap.Error(err))
-			return err
-		}
 	}
 
 	return nil
@@ -298,93 +311,69 @@ func (ch *channel) addSubscribers(channelId string, channelType uint8, members [
 	return nil
 }
 
-// // cmd和普通频道
-func (ch *channel) updateTagBySubscribers(channelId string, channelType uint8, subscribers []string, remove bool) error {
-
-	updateTag := func(chId string, chType uint8) {
-		tagKey := service.TagManager.GetChannelTag(chId, chType)
-		if tagKey != "" {
-			if service.TagManager.Exist(tagKey) {
-				newTagKey := wkutil.GenUUID()
-				if remove {
-					err := service.TagManager.RemoveUsers(tagKey, subscribers)
-					if err != nil {
-						ch.Error("updateTagByAddSubscribers: removeUsers failed", zap.Error(err))
-						return
-					}
-				} else {
-					err := service.TagManager.AddUsers(tagKey, subscribers)
-					if err != nil {
-						ch.Error("updateTagByAddSubscribers: addUsers failed", zap.Error(err))
-						return
-					}
-				}
-
-				err := service.TagManager.RenameTag(tagKey, newTagKey)
-				if err != nil {
-					ch.Error("updateTagByAddSubscribers: renameTag failed", zap.Error(err))
-					return
-				}
-				service.TagManager.SetChannelTag(chId, chType, newTagKey)
-			}
+// updateTagBySubscribers invalidates delivery snapshots after the durable
+// membership update. Cache maintenance failures are retried and must not turn
+// an already-committed membership change into an API failure.
+func (ch *channel) updateTagBySubscribers(channelId string, channelType uint8, subscribers []string, remove bool) {
+	includeCMD := ch.isCMDChannelTagActive(channelId, channelType)
+	targets := channelTagInvalidationTargets(channelId, channelType, includeCMD)
+	failures := failedChannelTagInvalidations(targets, func(target channelTagInvalidationTarget) error {
+		err := ch.invalidateChannelTagWithTimeout(target, subscribers, remove, channelTagInvalidationInitialTimeout)
+		if err != nil {
+			ch.Error("updateTagBySubscribers: invalidate channel tag failed",
+				zap.Error(err), zap.String("channelId", target.channelID), zap.Uint8("channelType", target.channelType))
 		}
+		return err
+	})
+	for _, target := range failures {
+		ch.Warn("updateTagBySubscribers: channel tag retry scheduled",
+			zap.String("channelId", target.channelID),
+			zap.Uint8("channelType", target.channelType),
+		)
+		ch.tagInvalidationRetries.Enqueue(target)
 	}
+}
 
-	// 获取频道的领导节点
-	leaderId, err := service.Cluster.LeaderIdOfChannel(channelId, channelType)
+func (ch *channel) invalidateChannelTag(target channelTagInvalidationTarget, subscribers []string, remove bool) error {
+	return ch.invalidateChannelTagWithTimeout(target, subscribers, remove, 5*time.Second)
+}
+
+func (ch *channel) invalidateChannelTagWithTimeout(target channelTagInvalidationTarget, subscribers []string, remove bool, timeout time.Duration) error {
+	tagOwnerID, err := resolveChannelTagOwner(service.Cluster, target.channelID, target.channelType)
 	if err != nil {
-		ch.Error("updateTagByAddSubscribers: get leader id failed", zap.Error(err))
 		return err
 	}
-	if leaderId == 0 {
-		ch.Error("updateTagByAddSubscribers: leader id is 0")
-		return nil
+	if tagOwnerID == 0 {
+		return fmt.Errorf("tag owner is 0 for channel %s", target.channelID)
 	}
-
-	if options.G.IsLocalNode(leaderId) {
-		updateTag(channelId, channelType)
-	} else {
-		err = ch.s.client.UpdateTag(leaderId, &ingress.TagUpdateReq{
-			ChannelId:   channelId,
-			ChannelType: channelType,
-			Uids:        subscribers,
-			Remove:      remove,
-			ChannelTag:  true,
-		})
-		if err != nil {
-			ch.Error("updateTagByAddSubscribers: updateOrMakeTag failed", zap.Error(err))
-			return err
-		}
+	if options.G.IsLocalNode(tagOwnerID) {
+		return ingress.UpdateChannelTag(service.TagManager, target.channelID, target.channelType, subscribers, remove)
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return ch.s.client.UpdateTagWithContext(ctx, tagOwnerID, &ingress.TagUpdateReq{
+		ChannelId:   target.channelID,
+		ChannelType: target.channelType,
+		Uids:        subscribers,
+		Remove:      remove,
+		ChannelTag:  true,
+	})
+}
 
-	// 更新cmd频道的tag
+func (ch *channel) isCMDChannelTagActive(channelId string, channelType uint8) bool {
 	cmdChannelId := options.G.OrginalConvertCmdChannel(channelId)
-	// 获取或请求cmd频道的分布式配置
 	cfg, err := service.Cluster.LoadOnlyChannelClusterConfig(cmdChannelId, channelType)
-	if err != nil && err != wkdb.ErrNotFound {
-		ch.Info("updateTagByAddSubscribers: loadOnlyChannelClusterConfig failed", zap.Error(err))
-		return nil
+	if errors.Is(err, cluster.ErrChannelClusterConfigNotFound) || errors.Is(err, wkdb.ErrNotFound) {
+		return false
 	}
-	if cfg.LeaderId == 0 { // 说明频道还没选举过，不存在被激活，这里无需去创建tag了
-		return nil
+	if err != nil {
+		// On lookup failure, prefer correctness and invalidate instead of risking
+		// a stale CMD delivery snapshot.
+		ch.Warn("isCMDChannelTagActive: load config failed; invalidate defensively",
+			zap.Error(err), zap.String("channelId", cmdChannelId), zap.Uint8("channelType", channelType))
+		return true
 	}
-	if options.G.IsLocalNode(cfg.LeaderId) {
-		updateTag(cmdChannelId, channelType)
-	} else {
-		err = ch.s.client.UpdateTag(cfg.LeaderId, &ingress.TagUpdateReq{
-			ChannelId:   cmdChannelId,
-			ChannelType: channelType,
-			Uids:        subscribers,
-			Remove:      remove,
-			ChannelTag:  true,
-		})
-		if err != nil {
-			ch.Error("updateTagByAddSubscribers: updateOrMakeTag failed", zap.Error(err))
-			return err
-		}
-	}
-
-	return nil
+	return cfg.LeaderId != 0
 }
 
 // func (ch *Channel) makeReceiverTag(channelId string, channelType uint8) error {
@@ -469,6 +458,7 @@ func (ch *channel) removeSubscriber(c *wkhttp.Context) {
 		c.ResponseError(err)
 		return
 	}
+	ch.updateTagBySubscribers(req.ChannelId, req.ChannelType, req.Subscribers, true)
 
 	// 删除订阅者的会话缓存
 	if req.ChannelType != wkproto.ChannelTypeLive { // 直播频道不处理最近会话
@@ -488,13 +478,6 @@ func (ch *channel) removeSubscriber(c *wkhttp.Context) {
 				return
 			}
 		}
-	}
-
-	err = ch.updateTagBySubscribers(req.ChannelId, req.ChannelType, req.Subscribers, true)
-	if err != nil {
-		ch.Error("removeSubscriber: update tag failed", zap.Error(err))
-		c.ResponseError(errors.New("更新tag失败！"))
-		return
 	}
 	c.ResponseOK()
 }
@@ -537,11 +520,7 @@ func (ch *channel) removeAllSubscriber(c *wkhttp.Context) {
 		return
 	}
 
-	// 删除tag
-	tagKey := service.TagManager.GetChannelTag(req.ChannelId, req.ChannelType)
-	if tagKey != "" {
-		service.TagManager.RemoveTag(tagKey)
-	}
+	ch.updateTagBySubscribers(req.ChannelId, req.ChannelType, nil, true)
 
 	c.ResponseOK()
 }

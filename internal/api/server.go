@@ -19,6 +19,7 @@ type Server struct {
 	migrateTask   *MigrateTask   // 迁移任务
 	apiServer     *apiServer     // api服务
 	managerServer *managerServer // api服务（管理）
+	channelAPI    *channel
 }
 
 func New() *Server {
@@ -29,6 +30,7 @@ func New() *Server {
 		client:      ingress.NewClient(),
 	}
 	s.requset = newRequset(s)
+	s.channelAPI = newChannel(s)
 	s.apiServer = newApiServer(s)
 	s.migrateTask = NewMigrateTask(s) // 迁移任务
 	s.managerServer = newManagerServer(s)
@@ -38,6 +40,7 @@ func New() *Server {
 func (s *Server) Start() error {
 
 	s.timingWheel.Start()
+	s.channelAPI.start()
 	s.apiServer.start()
 
 	if options.G.Manager.On {
@@ -53,8 +56,9 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) Stop() {
-	s.timingWheel.Stop()
 	s.apiServer.stop()
+	s.channelAPI.stop()
+	s.timingWheel.Stop()
 	if options.G.Manager.On {
 		s.managerServer.stop()
 	}

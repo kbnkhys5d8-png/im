@@ -233,7 +233,7 @@ func (h *Handler) getCommonTag(ctx *eventbus.ChannelContext) (*types.Tag, error)
 	// 判断当前的频道tag是否等于tagKey,如果不等于则删除旧的tag
 	oldTagKey := service.TagManager.GetChannelTag(ctx.ChannelId, ctx.ChannelType)
 	if oldTagKey != "" && oldTagKey != tagKey {
-		service.TagManager.RemoveTag(oldTagKey)
+		service.TagManager.RetireTag(oldTagKey)
 	}
 	tag, err := h.commonService.GetOrRequestAndMakeTagWithLocal(ctx.ChannelId, ctx.ChannelType, tagKey)
 	if err != nil {
@@ -272,19 +272,23 @@ func (h *Handler) getOrMakeTagForLeader(fakeChannelId string, channelType uint8)
 		tag *types.Tag
 		err error
 	)
-
-	tagKey := service.TagManager.GetChannelTag(fakeChannelId, channelType)
-	if tagKey != "" {
-		tag = service.TagManager.Get(tagKey)
-	}
-	if tag == nil {
-		// 如果没有则制作tag
-		tag, err = h.makeChannelTag(fakeChannelId, channelType)
-		if err != nil {
-			h.Error("processMakeTag: makeTag failed", zap.Error(err), zap.String("tagKey", tagKey))
-			return nil, err
+	err = service.TagManager.WithChannelTagLock(fakeChannelId, channelType, func() error {
+		tagKey := service.TagManager.GetChannelTag(fakeChannelId, channelType)
+		if tagKey != "" {
+			tag = service.TagManager.Get(tagKey)
 		}
-
+		if tag == nil {
+			// The channel lock orders rebuilds with membership invalidations.
+			tag, err = h.makeChannelTag(fakeChannelId, channelType)
+			if err != nil {
+				h.Error("processMakeTag: makeTag failed", zap.Error(err), zap.String("tagKey", tagKey))
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return tag, nil
 }

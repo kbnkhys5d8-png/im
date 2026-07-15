@@ -46,13 +46,17 @@ func (c *Client) RequestTag(toNodeId uint64, req *TagReq) (*TagResp, error) {
 
 // UpdateTag 更新tag
 func (c *Client) UpdateTag(nodeId uint64, req *TagUpdateReq) error {
+	timeoutCtx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	defer cancel()
+	return c.UpdateTagWithContext(timeoutCtx, nodeId, req)
+}
+
+func (c *Client) UpdateTagWithContext(ctx context.Context, nodeId uint64, req *TagUpdateReq) error {
 	data, err := req.Encode()
 	if err != nil {
 		return err
 	}
-	timeoutCtx, cancel := context.WithTimeout(context.Background(), time.Second*5)
-	defer cancel()
-	resp, err := service.Cluster.RequestWithContext(timeoutCtx, nodeId, "/wk/ingress/updateTag", data)
+	resp, err := service.Cluster.RequestWithContext(ctx, nodeId, "/wk/ingress/updateTag", data)
 	if err != nil {
 		return err
 	}

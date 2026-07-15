@@ -51,6 +51,8 @@ func newPoller(index int, eventPool *EventPool) *poller {
 	}
 
 	var err error
+	// The poller executes tasks inline when the bounded pool is full. This keeps
+	// ordering and applies backpressure without dropping dequeued events.
 	p.handlePool, err = ants.NewPool(options.G.Poller.UserGoroutine, ants.WithNonblocking(true), ants.WithPanicHandler(func(i interface{}) {
 		p.Error("user handle panic", zap.Any("panic", i), zap.Stack("stack"))
 	}))
@@ -105,6 +107,7 @@ func (p *poller) tick() {
 	}
 	if p.tickCount%options.G.Poller.ClearIntervalTick == 0 {
 		p.tickCount = 0
+		p.Lock()
 		for _, h := range p.tmpHandlers {
 			if h.isTimeout() {
 				p.waitlist.remove(h.Uid)
@@ -113,6 +116,7 @@ func (p *poller) tick() {
 				}
 			}
 		}
+		p.Unlock()
 	}
 
 	p.tmpHandlers = p.tmpHandlers[:0]
@@ -120,22 +124,39 @@ func (p *poller) tick() {
 
 func (p *poller) handleEvents() {
 	p.waitlist.readHandlers(&p.tmpHandlers)
-	var err error
 	for _, h := range p.tmpHandlers {
-		if h.hasEvent() {
-			events := h.events()
-			err = p.handlePool.Submit(func() {
-				h.advanceEvents(events)
-			})
-			if err != nil {
-				p.Error("submit user handle task failed", zap.String("error", err.Error()), zap.Int("events", len(events)))
-			}
+		if !h.hasEvent() || !h.tryBeginProcessing() {
+			continue
 		}
+		events := h.events()
+		if len(events) == 0 {
+			h.finishProcessing()
+			continue
+		}
+		handler := h
+		p.submitTask(func() {
+			handler.advanceEvents(events)
+		})
 	}
 	p.tmpHandlers = p.tmpHandlers[:0]
 	if cap(p.tmpHandlers) > 1024 {
 		p.tmpHandlers = nil
 	}
+}
+
+func (p *poller) submitTask(task func()) {
+	if err := p.handlePool.Submit(task); err != nil {
+		p.runTaskInline(task)
+	}
+}
+
+func (p *poller) runTaskInline(task func()) {
+	defer func() {
+		if v := recover(); v != nil {
+			p.Error("user inline task panic", zap.Any("panic", v), zap.Stack("stack"))
+		}
+	}()
+	task()
 }
 
 func (p *poller) handler(uid string) *userHandler {

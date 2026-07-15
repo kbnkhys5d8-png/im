@@ -11,7 +11,6 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
-	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"go.uber.org/zap"
 )
@@ -164,14 +163,9 @@ func (i *Ingress) handleUpdateTag(c *wkserver.Context) {
 		return
 	}
 
-	if req.TagKey == "" && req.ChannelId == "" {
-		i.Error("tagKey and channelId is nil", zap.Any("req", req))
-		c.WriteErr(errors.New("tagKey is nil"))
-		return
-	}
-	if len(req.Uids) == 0 {
-		i.Error("uids is nil", zap.Any("req", req))
-		c.WriteErr(errors.New("uids is nil"))
+	if err = validateTagUpdateReq(req); err != nil {
+		i.Error("handleUpdateTag: invalid request", zap.Error(err), zap.Any("req", req))
+		c.WriteErr(err)
 		return
 	}
 
@@ -180,11 +174,20 @@ func (i *Ingress) handleUpdateTag(c *wkserver.Context) {
 	// 	realFakeChannelId = options.G.CmdChannelConvertOrginalChannel(req.ChannelId)
 	// }
 
-	tagKey := req.TagKey
-	if tagKey == "" {
-		if req.ChannelId != "" {
-			tagKey = service.TagManager.GetChannelTag(req.ChannelId, req.ChannelType)
+	if req.ChannelTag {
+		err = UpdateChannelTagWithKey(service.TagManager, req.ChannelId, req.ChannelType, req.TagKey, req.Uids, req.Remove)
+		if err != nil {
+			i.Error("handleUpdateTag: update channel tag failed", zap.Error(err), zap.String("channelId", req.ChannelId), zap.Uint8("channelType", req.ChannelType))
+			c.WriteErr(err)
+			return
 		}
+		c.WriteOk()
+		return
+	}
+
+	tagKey := req.TagKey
+	if tagKey == "" && req.ChannelId != "" {
+		tagKey = service.TagManager.GetChannelTag(req.ChannelId, req.ChannelType)
 	}
 	if tagKey != "" {
 		if service.TagManager.Exist(tagKey) {
@@ -192,20 +195,16 @@ func (i *Ingress) handleUpdateTag(c *wkserver.Context) {
 				err = service.TagManager.RemoveUsers(tagKey, req.Uids)
 				if err != nil {
 					i.Warn("handleUpdateTag: remove users failed", zap.Error(err))
+					c.WriteErr(err)
+					return
 				}
 			} else {
 				err = service.TagManager.AddUsers(tagKey, req.Uids)
 				if err != nil {
 					i.Warn("handleUpdateTag: add users failed", zap.Error(err))
+					c.WriteErr(err)
+					return
 				}
-			}
-			if req.ChannelTag {
-				newTagKey := wkutil.GenUUID()
-				err = service.TagManager.RenameTag(tagKey, newTagKey)
-				if err != nil {
-					i.Warn("handleUpdateTag: rename tag failed", zap.Error(err))
-				}
-				service.TagManager.SetChannelTag(req.ChannelId, req.ChannelType, newTagKey)
 			}
 		}
 	}
@@ -280,4 +279,3 @@ func (i *Ingress) handleGetSubscribers(c *wkserver.Context) {
 	}
 	c.Write(data)
 }
-

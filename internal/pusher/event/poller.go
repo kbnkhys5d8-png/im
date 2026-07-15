@@ -44,7 +44,9 @@ func newPoller(index int, eventPool *EventPool) *poller {
 	}
 
 	var err error
-	p.handlePool, err = ants.NewPool(options.G.Poller.ChannelGoroutine, ants.WithNonblocking(true), ants.WithPanicHandler(func(i interface{}) {
+	// The poller executes tasks inline when the bounded pool is full. This keeps
+	// ordering and applies backpressure without dropping dequeued events.
+	p.handlePool, err = ants.NewPool(options.G.Poller.PushGoroutine, ants.WithNonblocking(true), ants.WithPanicHandler(func(i interface{}) {
 		p.Panic("channel handle panic", zap.Any("panic", i), zap.Stack("stack"))
 	}))
 	if err != nil {
@@ -77,18 +79,35 @@ func (p *poller) loopEvent() {
 }
 
 func (p *poller) handleEvents() {
-	var err error
 	for _, h := range p.handlers {
-		if h.hasEvent() {
-			events := h.events()
-			err = p.handlePool.Submit(func() {
-				h.advanceEvents(events)
-			})
-			if err != nil {
-				p.Error("submit push handle task failed", zap.String("error", err.Error()))
-			}
+		if !h.hasEvent() || !h.tryBeginProcessing() {
+			continue
 		}
+		events := h.events()
+		if len(events) == 0 {
+			h.finishProcessing()
+			continue
+		}
+		handler := h
+		p.submitTask(func() {
+			handler.advanceEvents(events)
+		})
 	}
+}
+
+func (p *poller) submitTask(task func()) {
+	if err := p.handlePool.Submit(task); err != nil {
+		p.runTaskInline(task)
+	}
+}
+
+func (p *poller) runTaskInline(task func()) {
+	defer func() {
+		if v := recover(); v != nil {
+			p.Error("push inline task panic", zap.Any("panic", v), zap.Stack("stack"))
+		}
+	}()
+	task()
 }
 
 func (p *poller) advance() {

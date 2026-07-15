@@ -20,8 +20,8 @@ type channelHandler struct {
 	channelId    string
 	channelType  uint8
 	channelKey   string
-	slotLeaderId uint64 // 频道的槽领导节点Id
-	lastActive   uint64 // 最后活跃时间
+	slotLeaderId uint64        // 频道的槽领导节点Id
+	lastActive   atomic.Uint64 // 最后活跃时间
 	pending      struct {
 		sync.RWMutex
 		eventQueue *eventbus.EventQueue
@@ -43,9 +43,9 @@ func newChannelHandler(channelId string, channelType uint8, poller *poller) *cha
 		channelType: channelType,
 		poller:      poller,
 		handler:     poller.eventPool.handler,
-		lastActive:  fasttime.UnixTimestamp(),
 		Log:         wklog.NewWKLog(fmt.Sprintf("channelHandler[%s]", channelKey)),
 	}
+	uh.lastActive.Store(fasttime.UnixTimestamp())
 	uh.pending.eventQueue = eventbus.NewEventQueue(fmt.Sprintf("channel:%s", channelKey))
 	return uh
 }
@@ -56,7 +56,7 @@ func (c *channelHandler) addEvent(event *eventbus.Event) {
 	event.Index = c.pending.eventQueue.LastIndex() + 1
 	c.pending.eventQueue.Append(event)
 
-	c.lastActive = fasttime.UnixTimestamp()
+	c.lastActive.Store(fasttime.UnixTimestamp())
 }
 
 func (c *channelHandler) hasEvent() bool {
@@ -66,6 +66,14 @@ func (c *channelHandler) hasEvent() bool {
 		return false
 	}
 	return c.processingIndex < c.pending.eventQueue.LastIndex()
+}
+
+func (c *channelHandler) tryBeginProcessing() bool {
+	return c.processing.CAS(false, true)
+}
+
+func (c *channelHandler) finishProcessing() {
+	c.processing.Store(false)
 }
 
 func (u *channelHandler) events() []*eventbus.Event {
@@ -85,10 +93,11 @@ func (u *channelHandler) events() []*eventbus.Event {
 
 // 推进事件
 func (c *channelHandler) advanceEvents(events []*eventbus.Event) {
-
-	c.processing.Store(true)
 	defer func() {
-		c.processing.Store(false)
+		c.finishProcessing()
+		if c.hasEvent() {
+			c.poller.advance()
+		}
 	}()
 
 	// 检查和更新leaderId
@@ -116,10 +125,6 @@ func (c *channelHandler) advanceEvents(events []*eventbus.Event) {
 		c.poller.putContext(ctx)
 	}
 
-	// 推进事件
-	if c.pending.eventQueue.Len() > 0 {
-		c.poller.advance()
-	}
 }
 
 // checkAndUpdateLeaderIdChange 检查并更新leaderId变化
@@ -141,7 +146,10 @@ func (c *channelHandler) checkAndUpdateLeaderIdChange() error {
 
 // isTimeout 判断用户是否超时
 func (c *channelHandler) isTimeout() bool {
-	return fasttime.UnixTimestamp()-c.lastActive > uint64(options.G.Poller.ChannelTimeout.Seconds())
+	c.pending.RLock()
+	idle := !c.processing.Load() && c.processingIndex >= c.pending.eventQueue.LastIndex()
+	c.pending.RUnlock()
+	return idle && fasttime.UnixTimestamp()-c.lastActive.Load() > uint64(options.G.Poller.ChannelTimeout.Seconds())
 }
 
 // groupByType 将待处理事件按照事件类型分组

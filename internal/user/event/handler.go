@@ -17,7 +17,7 @@ import (
 type userHandler struct {
 	wklog.Log
 	Uid        string
-	lastActive uint64 // 最后活跃时间
+	lastActive atomic.Uint64 // 最后活跃时间
 	pending    struct {
 		sync.RWMutex
 		eventQueue *eventbus.EventQueue
@@ -41,14 +41,14 @@ type userHandler struct {
 
 func newUserHandler(uid string, poller *poller) *userHandler {
 	uh := &userHandler{
-		Uid:        uid,
-		poller:     poller,
-		handler:    poller.eventPool.handler,
-		lastActive: fasttime.UnixTimestamp(),
-		conns:      newConns(),
-		Log:        wklog.NewWKLog(fmt.Sprintf("userHandler[%s]", uid)),
-		stat:       false,
+		Uid:     uid,
+		poller:  poller,
+		handler: poller.eventPool.handler,
+		conns:   newConns(),
+		Log:     wklog.NewWKLog(fmt.Sprintf("userHandler[%s]", uid)),
+		stat:    false,
 	}
+	uh.lastActive.Store(fasttime.UnixTimestamp())
 	uh.pending.eventQueue = eventbus.NewEventQueue(fmt.Sprintf("user:%s", uid))
 	return uh
 }
@@ -59,7 +59,7 @@ func (u *userHandler) addEvent(event *eventbus.Event) {
 	event.Index = u.pending.eventQueue.LastIndex() + 1
 	u.pending.eventQueue.Append(event)
 
-	u.lastActive = fasttime.UnixTimestamp()
+	u.lastActive.Store(fasttime.UnixTimestamp())
 
 	if event.Conn != nil {
 		event.Conn.LastActive = fasttime.UnixTimestamp()
@@ -75,9 +75,17 @@ func (u *userHandler) hasEvent() bool {
 	return u.processingIndex < u.pending.eventQueue.LastIndex()
 }
 
+func (u *userHandler) tryBeginProcessing() bool {
+	return u.processing.CompareAndSwap(false, true)
+}
+
+func (u *userHandler) finishProcessing() {
+	u.processing.Store(false)
+}
+
 func (u *userHandler) events() []*eventbus.Event {
-	u.pending.RLock()
-	defer u.pending.RUnlock()
+	u.pending.Lock()
+	defer u.pending.Unlock()
 	events := u.pending.eventQueue.SliceWithSize(u.processingIndex+1, u.pending.eventQueue.LastIndex()+1, options.G.Poller.UserEventMaxSizePerBatch)
 	if len(events) == 0 {
 		return nil
@@ -92,10 +100,11 @@ func (u *userHandler) events() []*eventbus.Event {
 
 // 推进事件
 func (u *userHandler) advanceEvents(events []*eventbus.Event) {
-
-	u.processing.Store(true)
 	defer func() {
-		u.processing.Store(false)
+		u.finishProcessing()
+		if u.hasEvent() {
+			u.poller.advance()
+		}
 	}()
 
 	slotLeaderId := u.leaderId()
@@ -126,10 +135,6 @@ func (u *userHandler) advanceEvents(events []*eventbus.Event) {
 
 		// 释放上下文
 		u.poller.putContext(ctx)
-	}
-
-	if u.pending.eventQueue.Len() > 0 {
-		u.poller.advance()
 	}
 
 }
@@ -163,12 +168,15 @@ func (u *userHandler) leaderId() uint64 {
 // 连接成功
 func (u *userHandler) addConn(conn *eventbus.Conn) {
 	u.conns.addOrUpdateConn(conn)
-	u.lastActive = fasttime.UnixTimestamp()
+	u.lastActive.Store(fasttime.UnixTimestamp())
 }
 
 // isTimeout 判断用户是否超时
 func (u *userHandler) isTimeout() bool {
-	return fasttime.UnixTimestamp()-u.lastActive > uint64(options.G.Poller.UserTimeout.Seconds())
+	u.pending.RLock()
+	idle := !u.processing.Load() && u.processingIndex >= u.pending.eventQueue.LastIndex()
+	u.pending.RUnlock()
+	return idle && fasttime.UnixTimestamp()-u.lastActive.Load() > uint64(options.G.Poller.UserTimeout.Seconds())
 }
 
 // groupByType 将待处理事件按照事件类型分组

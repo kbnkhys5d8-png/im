@@ -117,8 +117,7 @@ func (s *apiServer) setRoutes() {
 	conn := newConnApi(s.s)
 	conn.route(s.r)
 	// channel
-	ch := newChannel(s.s)
-	ch.route(s.r)
+	s.s.channelAPI.route(s.r)
 	// message
 	msg := newMessage(s.s)
 	msg.route(s.r)

@@ -233,13 +233,14 @@ func (h *Handler) sendPacketIsVail(sendPacket *wkproto.SendPacket, conn *eventbu
 
 	actMsgKey, err := wkutil.AesEncryptPkcs7Base64(signBuff.Bytes(), aesKey, aesIV)
 	if err != nil {
-		h.Error("msgKey is illegal！", zap.Error(err), zap.String("sign", signStr), zap.String("aesKey", string(aesKey)), zap.String("aesIV", string(aesIV)), zap.Any("conn", conn))
+		fields := append([]zap.Field{zap.Error(err)}, safeConnectionLogFields(conn)...)
+		h.Error("msgKey is illegal！", fields...)
 		return false, err
 	}
 	actMsgKeyStr := sendPacket.MsgKey
 	exceptMsgKey := wkutil.MD5Bytes(actMsgKey)
 	if actMsgKeyStr != exceptMsgKey {
-		h.Error("msgKey is illegal！", zap.String("except", exceptMsgKey), zap.String("act", actMsgKeyStr), zap.String("sign", signStr), zap.String("aesKey", string(aesKey)), zap.String("aesIV", string(aesIV)), zap.Any("conn", conn))
+		h.Error("msgKey is illegal！", safeConnectionLogFields(conn)...)
 		return false, errors.New("msgKey is illegal！")
 	}
 	return true, nil

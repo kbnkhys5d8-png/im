@@ -5,9 +5,30 @@ import (
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
 	"github.com/WuKongIM/WuKongIM/internal/options"
+	"github.com/WuKongIM/WuKongIM/internal/service"
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/icluster"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"github.com/stretchr/testify/assert"
 )
+
+type userEventTestCluster struct {
+	icluster.ICluster
+}
+
+func (u *userEventTestCluster) GetSlotId(string) uint32 { return 1 }
+
+func (u *userEventTestCluster) SlotLeaderId(uint32) uint64 {
+	// This unit test only verifies event dispatch. Use a remote leader so it
+	// does not require the global production metrics service.
+	return options.G.Cluster.NodeId + 1
+}
+
+func installUserEventTestCluster(t *testing.T) {
+	t.Helper()
+	previous := service.Cluster
+	service.Cluster = &userEventTestCluster{}
+	t.Cleanup(func() { service.Cluster = previous })
+}
 
 type mockUserEventHandler struct {
 	connectC      chan struct{}
@@ -15,7 +36,9 @@ type mockUserEventHandler struct {
 }
 
 func (m *mockUserEventHandler) OnEvent(ctx *eventbus.UserContext) {
-
+	if ctx.EventType == eventbus.EventConnect {
+		m.Connect(ctx)
+	}
 }
 
 func (m *mockUserEventHandler) Connect(ctx *eventbus.UserContext) {
@@ -47,6 +70,7 @@ func TestUserEventPool_Start(t *testing.T) {
 
 	err := pool.Start()
 	assert.Nil(t, err)
+	t.Cleanup(pool.Stop)
 }
 
 func TestUserEventPool_Stop(t *testing.T) {
@@ -58,6 +82,7 @@ func TestUserEventPool_Stop(t *testing.T) {
 }
 
 func TestUserEventPool_AddConnectEvent(t *testing.T) {
+	installUserEventTestCluster(t)
 	handler := &mockUserEventHandler{
 		connectC: make(chan struct{}, 1),
 	}

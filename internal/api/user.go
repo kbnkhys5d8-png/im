@@ -12,6 +12,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/service"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
 	"github.com/WuKongIM/WuKongIM/pkg/network"
+	"github.com/WuKongIM/WuKongIM/pkg/ringlock"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wkhttp"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
@@ -25,13 +26,15 @@ import (
 // user 用户相关API
 type user struct {
 	wklog.Log
-	s *Server
+	s               *Server
+	tokenUpdateLock *ringlock.RingLock
 }
 
 func newUser(s *Server) *user {
 	return &user{
-		Log: wklog.NewWKLog("user"),
-		s:   s,
+		Log:             wklog.NewWKLog("user"),
+		s:               s,
+		tokenUpdateLock: ringlock.NewRingLock(1024),
 	}
 }
 
@@ -281,7 +284,7 @@ func (u *user) updateToken(c *wkhttp.Context) {
 		return
 	}
 
-	u.Debug("req", zap.Any("req", req))
+	u.Debug("update token request", updateTokenLogFields(req)...)
 
 	// 使用共享权限服务检查频道权限
 	reasonCode, err := service.Permission.HasPermissionForChannel(req.UID, wkproto.ChannelTypePerson)
@@ -294,6 +297,10 @@ func (u *user) updateToken(c *wkhttp.Context) {
 		c.ResponseStatus(int(reasonCode))
 		return
 	}
+
+	lockKey := tokenUpdateLockKey(req.UID, req.DeviceFlag)
+	u.tokenUpdateLock.Lock(lockKey)
+	defer u.tokenUpdateLock.Unlock(lockKey)
 
 	user, err := service.Store.GetUser(req.UID) // 确保用户存在
 	if err != nil && err != wkdb.ErrNotFound {
@@ -322,6 +329,11 @@ func (u *user) updateToken(c *wkhttp.Context) {
 	if err != nil && err != wkdb.ErrNotFound {
 		u.Error("获取设备信息失败！", zap.Error(err), zap.String("uid", req.UID), zap.Uint8("deviceFlag", req.DeviceFlag.ToUint8()))
 		c.ResponseError(err)
+		return
+	}
+	if !deviceTokenUpdateRequired(device, req) {
+		u.Debug("token和设备等级未变化，跳过重复更新", zap.String("uid", req.UID), zap.Uint8("deviceFlag", req.DeviceFlag.ToUint8()))
+		c.ResponseOK()
 		return
 	}
 
@@ -646,6 +658,22 @@ type UpdateTokenReq struct {
 	Token       string              `json:"token"`        // 用户的token
 	DeviceFlag  wkproto.DeviceFlag  `json:"device_flag"`  // 设备标识  0.app 1.web
 	DeviceLevel wkproto.DeviceLevel `json:"device_level"` // 设备等级 0.为从设备 1.为主设备
+}
+
+func deviceTokenUpdateRequired(device wkdb.Device, req UpdateTokenReq) bool {
+	return wkdb.IsEmptyDevice(device) || device.Token != req.Token || device.DeviceLevel != uint8(req.DeviceLevel)
+}
+
+func updateTokenLogFields(req UpdateTokenReq) []zap.Field {
+	return []zap.Field{
+		zap.String("uid", req.UID),
+		zap.Uint8("deviceFlag", req.DeviceFlag.ToUint8()),
+		zap.Uint8("deviceLevel", uint8(req.DeviceLevel)),
+	}
+}
+
+func tokenUpdateLockKey(uid string, deviceFlag wkproto.DeviceFlag) string {
+	return fmt.Sprintf("%s:%d", uid, deviceFlag.ToUint8())
 }
 
 // Check 检查输入

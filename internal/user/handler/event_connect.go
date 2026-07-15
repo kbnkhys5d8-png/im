@@ -70,7 +70,7 @@ func (h *Handler) handleConnect(event *eventbus.Event) (wkproto.ReasonCode, *wkp
 	// -------------------- token verify --------------------
 	if connectPacket.UID == options.G.ManagerUID {
 		if options.G.ManagerTokenOn && connectPacket.Token != options.G.ManagerToken {
-			h.Error("manager token verify fail", zap.String("uid", uid), zap.String("token", connectPacket.Token))
+			h.Error("manager token verify fail", tokenVerifyFailureLogFields(uid, event.SourceNodeId, connectPacket.DeviceFlag)...)
 			return wkproto.ReasonAuthFail, nil, nil
 		}
 		devceLevel = wkproto.DeviceLevelSlave // 默认都是slave设备
@@ -85,7 +85,7 @@ func (h *Handler) handleConnect(event *eventbus.Event) (wkproto.ReasonCode, *wkp
 			return wkproto.ReasonAuthFail, nil, err
 		}
 		if device.Token != connectPacket.Token {
-			h.Error("token verify fail", zap.String("uid", uid), zap.Uint64("sourceNodeId", event.SourceNodeId), zap.String("expectToken", device.Token), zap.String("actToken", connectPacket.Token))
+			h.Error("token verify fail", tokenVerifyFailureLogFields(uid, event.SourceNodeId, connectPacket.DeviceFlag)...)
 			return wkproto.ReasonAuthFail, nil, errors.New("token verify fail")
 		}
 		devceLevel = wkproto.DeviceLevel(device.DeviceLevel)
@@ -157,13 +157,14 @@ func (h *Handler) handleConnect(event *eventbus.Event) (wkproto.ReasonCode, *wkp
 
 					}(oldConn))
 				}
-				h.Info("auth: close old conn for master", zap.Any("oldConn", oldConn))
+				h.Info("auth: close old conn for master", safeConnectionLogFields(oldConn)...)
 			}
 		} else if devceLevel == wkproto.DeviceLevelSlave { // 如果设备是slave级别，则把相同的deviceId关闭
 			for _, oldConn := range oldConns {
 				if oldConn.ConnId != conn.ConnId && oldConn.DeviceId == connectPacket.DeviceID {
 					service.CommonService.AfterFunc(time.Second*2, func(od *eventbus.Conn) func() {
-						h.Info("auth: close old conn for slave", zap.Any("oldConn", oldConn), zap.Int64("oldConnId", oldConn.ConnId), zap.Int64("newConnId", conn.ConnId))
+						fields := append(safeConnectionLogFields(oldConn), zap.Int64("newConnId", conn.ConnId))
+						h.Info("auth: close old conn for slave", fields...)
 						return func() {
 							eventbus.User.CloseConn(od)
 						}
@@ -222,6 +223,14 @@ func (h *Handler) handleConnect(event *eventbus.Event) (wkproto.ReasonCode, *wkp
 	connack.HasServerVersion = hasServerVersion
 
 	return wkproto.ReasonSuccess, connack, nil
+}
+
+func tokenVerifyFailureLogFields(uid string, sourceNodeID uint64, deviceFlag wkproto.DeviceFlag) []zap.Field {
+	return []zap.Field{
+		zap.String("uid", uid),
+		zap.Uint64("sourceNodeId", sourceNodeID),
+		zap.String("deviceFlag", deviceFlag.String()),
+	}
 }
 
 // 获取客户端的aesKey和aesIV

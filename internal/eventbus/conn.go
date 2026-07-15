@@ -137,6 +137,5 @@ func (c *Conn) Equal(cn *Conn) bool {
 }
 
 func (c *Conn) String() string {
-
-	return fmt.Sprintf("ConnId:%d, Uid:%s, DeviceId:%s, DeviceFlag:%d, DeviceLevel:%d, NodeId:%d, Auth:%v, ProtoVersion:%d, AesIV:%s, AesKey:%s", c.ConnId, c.Uid, c.DeviceId, c.DeviceFlag, c.DeviceLevel, c.NodeId, c.Auth, c.ProtoVersion, c.AesIV, c.AesKey)
+	return fmt.Sprintf("ConnId:%d, Uid:%s, DeviceFlag:%d, DeviceLevel:%d, NodeId:%d, Auth:%v, ProtoVersion:%d", c.ConnId, c.Uid, c.DeviceFlag, c.DeviceLevel, c.NodeId, c.Auth, c.ProtoVersion)
 }

@@ -3,6 +3,7 @@ package event
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
 	"github.com/WuKongIM/WuKongIM/internal/options"
@@ -20,6 +21,7 @@ type pushHandler struct {
 	handler eventbus.PushEventHandler
 	// 处理中的下标位置
 	processingIndex uint64
+	processing      atomic.Bool
 }
 
 func newPushHandler(id int, poller *poller) *pushHandler {
@@ -45,13 +47,24 @@ func (p *pushHandler) addEvent(event *eventbus.Event) {
 func (p *pushHandler) hasEvent() bool {
 	p.pending.RLock()
 	defer p.pending.RUnlock()
+	if p.processing.Load() {
+		return false
+	}
 	return p.processingIndex < p.pending.eventQueue.LastIndex()
+}
+
+func (p *pushHandler) tryBeginProcessing() bool {
+	return p.processing.CompareAndSwap(false, true)
+}
+
+func (p *pushHandler) finishProcessing() {
+	p.processing.Store(false)
 }
 
 func (p *pushHandler) events() []*eventbus.Event {
 	p.pending.Lock()
 	defer p.pending.Unlock()
-	events := p.pending.eventQueue.SliceWithSize(p.processingIndex+1, p.pending.eventQueue.LastIndex()+1, options.G.Poller.UserEventMaxSizePerBatch)
+	events := p.pending.eventQueue.SliceWithSize(p.processingIndex+1, p.pending.eventQueue.LastIndex()+1, options.G.Poller.PushEventMaxSizePerBatch)
 	if len(events) == 0 {
 		return nil
 	}
@@ -65,6 +78,12 @@ func (p *pushHandler) events() []*eventbus.Event {
 
 // 推进事件
 func (p *pushHandler) advanceEvents(events []*eventbus.Event) {
+	defer func() {
+		p.finishProcessing()
+		if p.hasEvent() {
+			p.poller.advance()
+		}
+	}()
 
 	// 按类型分组
 	group := p.groupByType(events)
@@ -82,10 +101,6 @@ func (p *pushHandler) advanceEvents(events []*eventbus.Event) {
 		p.poller.putContext(ctx)
 	}
 
-	// 推进事件
-	if p.pending.eventQueue.Len() > 0 {
-		p.poller.advance()
-	}
 }
 
 // groupByType 将待处理事件按照事件类型分组

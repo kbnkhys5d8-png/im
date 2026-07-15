@@ -13,10 +13,25 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/service"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
+	"github.com/lni/goutils/syncutil"
 )
 
+const defaultRetiredTagGrace = 30 * time.Second
+
+type retiredTag struct {
+	tag       *types.Tag
+	expiresAt time.Time
+}
+
 type TagManager struct {
-	bluckets []*tagBlucket
+	bluckets     []*tagBlucket
+	channelLocks []sync.Mutex
+	retiredTags  struct {
+		sync.RWMutex
+		items map[string]retiredTag
+	}
+	retiredTagGrace   time.Duration
+	retiredTagStopper *syncutil.Stopper
 	// 获取当前节点版本号
 	nodeVersion func() uint64
 	wklog.Log
@@ -25,9 +40,13 @@ type TagManager struct {
 
 func NewTagManager(blucketCount int, nodeVersion func() uint64) *TagManager {
 	tg := &TagManager{
-		nodeVersion: nodeVersion,
-		Log:         wklog.NewWKLog("TagManager"),
+		nodeVersion:       nodeVersion,
+		Log:               wklog.NewWKLog("TagManager"),
+		channelLocks:      make([]sync.Mutex, 1024),
+		retiredTagGrace:   defaultRetiredTagGrace,
+		retiredTagStopper: syncutil.NewStopper(),
 	}
+	tg.retiredTags.items = make(map[string]retiredTag)
 	tg.bluckets = make([]*tagBlucket, blucketCount)
 	for i := 0; i < blucketCount; i++ {
 		tg.bluckets[i] = newTagBlucket(i, options.G.Tag.Expire, tg.existTag)
@@ -43,9 +62,11 @@ func (t *TagManager) Start() error {
 			return err
 		}
 	}
+	t.retiredTagStopper.RunWorker(t.retiredTagCleanupLoop)
 	return nil
 }
 func (t *TagManager) Stop() {
+	t.retiredTagStopper.Stop()
 	for _, b := range t.bluckets {
 		b.stop()
 	}
@@ -62,7 +83,10 @@ func (t *TagManager) MakeTagWithTagKey(tagKey string, uids []string) (*types.Tag
 	if err != nil {
 		return nil, err
 	}
+	t.Lock()
+	t.removeRetiredTag(tagKey)
 	t.getBlucketByTagKey(tagKey).setTag(tag)
+	t.Unlock()
 	return tag, nil
 }
 
@@ -82,6 +106,36 @@ func (t *TagManager) MakeTagNotCacheWithTagKey(tagKey string, uids []string) (*t
 	tag.Nodes = nodes
 
 	return tag, nil
+}
+
+// UpdateChannelTag invalidates the cached membership snapshot. The store is the
+// source of truth, so the next message rebuilds the tag from committed data.
+// uids/remove are kept for wire compatibility with older callers.
+func (t *TagManager) UpdateChannelTag(fakeChannelId string, channelType uint8, expectedTagKey string, uids []string, remove bool) error {
+	_ = uids
+	_ = remove
+	return t.WithChannelTagLock(fakeChannelId, channelType, func() error {
+		t.Lock()
+		defer t.Unlock()
+
+		channelBlucket := t.getBlucketByChannel(fakeChannelId, channelType)
+		mappedTagKey := channelBlucket.getChannelTag(fakeChannelId, channelType)
+		channelBlucket.removeChannelTag(fakeChannelId, channelType)
+		if mappedTagKey != "" {
+			t.retireTag(mappedTagKey)
+		}
+		if expectedTagKey != "" && expectedTagKey != mappedTagKey {
+			t.retireTag(expectedTagKey)
+		}
+		return nil
+	})
+}
+
+func (t *TagManager) WithChannelTagLock(fakeChannelId string, channelType uint8, fn func() error) error {
+	lock := t.getChannelLock(fakeChannelId, channelType)
+	lock.Lock()
+	defer lock.Unlock()
+	return fn()
 }
 
 func (t *TagManager) AddUsers(tagKey string, uids []string) error {
@@ -152,7 +206,16 @@ func (t *TagManager) RemoveUsers(tagKey string, uids []string) error {
 }
 
 func (t *TagManager) RemoveTag(tagKey string) {
+	t.Lock()
+	defer t.Unlock()
 	t.removeTag(tagKey)
+	t.removeRetiredTag(tagKey)
+}
+
+func (t *TagManager) RetireTag(tagKey string) {
+	t.Lock()
+	defer t.Unlock()
+	t.retireTag(tagKey)
 }
 
 func (t *TagManager) GetUsers(tagKey string) []string {
@@ -169,14 +232,20 @@ func (t *TagManager) GetUsers(tagKey string) []string {
 
 func (t *TagManager) Get(tagKey string) *types.Tag {
 	tag := t.getTag(tagKey)
+	active := tag != nil
 	if tag == nil {
-		return nil
+		tag = t.getRetiredTag(tagKey, time.Now())
+		if tag == nil {
+			return nil
+		}
 	}
 	if tag.NodeVersion < t.nodeVersion() {
 		t.Warn("tag is expired, tagNodeVersion < currentNodeVersion ", zap.String("tagKey", tagKey), zap.Uint64("tagNodeVersion", tag.NodeVersion), zap.Uint64("currentNodeVersion", t.nodeVersion()))
 		return nil
 	}
-	tag.LastGetTime = time.Now()
+	if active {
+		tag.LastGetTime = time.Now()
+	}
 	tag.GetCount.Inc()
 	return tag
 }
@@ -186,18 +255,27 @@ func (t *TagManager) Exist(tagKey string) bool {
 }
 
 func (t *TagManager) RenameTag(oldTagKey, newTagKey string) error {
+	t.Lock()
+	defer t.Unlock()
+
 	tag := t.getTag(oldTagKey)
 	if tag == nil {
 		return errors.TagNotExist(oldTagKey)
 	}
 	tag.Key = newTagKey
 	tag.LastGetTime = time.Now()
+	t.removeRetiredTag(oldTagKey)
+	t.removeRetiredTag(newTagKey)
 	t.setTag(tag)
 	t.removeTag(oldTagKey)
 	return nil
 }
 
 func (t *TagManager) SetChannelTag(fakeChannelId string, channelType uint8, tagKey string) {
+	t.Lock()
+	defer t.Unlock()
+
+	t.removeRetiredTag(tagKey)
 	blucket := t.getBlucketByChannel(fakeChannelId, channelType)
 	blucket.setChannelTag(fakeChannelId, channelType, tagKey)
 	tag := t.getTag(tagKey)
@@ -213,6 +291,9 @@ func (t *TagManager) GetChannelTag(fakeChannelId string, channelType uint8) stri
 }
 
 func (t *TagManager) RemoveChannelTag(fakeChannelId string, channelType uint8) {
+	t.Lock()
+	defer t.Unlock()
+
 	blucket := t.getBlucketByChannel(fakeChannelId, channelType)
 	blucket.removeChannelTag(fakeChannelId, channelType)
 }
@@ -247,6 +328,79 @@ func (t *TagManager) getBlucketByChannel(channelId string, channelType uint8) *t
 	h.Write([]byte(wkutil.ChannelToKey(channelId, channelType)))
 	i := h.Sum32() % uint32(len(t.bluckets))
 	return t.bluckets[i]
+}
+
+func (t *TagManager) getChannelLock(channelId string, channelType uint8) *sync.Mutex {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(wkutil.ChannelToKey(channelId, channelType)))
+	return &t.channelLocks[h.Sum32()%uint32(len(t.channelLocks))]
+}
+
+func (t *TagManager) retireTag(tagKey string) {
+	tag := t.getTag(tagKey)
+	if tag == nil {
+		return
+	}
+	t.removeTag(tagKey)
+	t.retiredTags.Lock()
+	t.retiredTags.items[tagKey] = retiredTag{
+		tag:       tag,
+		expiresAt: time.Now().Add(t.retiredTagGrace),
+	}
+	t.retiredTags.Unlock()
+}
+
+func (t *TagManager) getRetiredTag(tagKey string, now time.Time) *types.Tag {
+	t.retiredTags.RLock()
+	entry, ok := t.retiredTags.items[tagKey]
+	t.retiredTags.RUnlock()
+	if !ok {
+		return nil
+	}
+	if now.Before(entry.expiresAt) {
+		return entry.tag
+	}
+
+	t.retiredTags.Lock()
+	current, exists := t.retiredTags.items[tagKey]
+	if exists && !now.Before(current.expiresAt) {
+		delete(t.retiredTags.items, tagKey)
+	}
+	t.retiredTags.Unlock()
+	return nil
+}
+
+func (t *TagManager) removeRetiredTag(tagKey string) {
+	t.retiredTags.Lock()
+	delete(t.retiredTags.items, tagKey)
+	t.retiredTags.Unlock()
+}
+
+func (t *TagManager) cleanupRetiredTags(now time.Time) {
+	t.retiredTags.Lock()
+	for tagKey, entry := range t.retiredTags.items {
+		if !now.Before(entry.expiresAt) {
+			delete(t.retiredTags.items, tagKey)
+		}
+	}
+	t.retiredTags.Unlock()
+}
+
+func (t *TagManager) retiredTagCleanupLoop() {
+	interval := t.retiredTagGrace / 2
+	if interval <= 0 || interval > time.Second {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case now := <-ticker.C:
+			t.cleanupRetiredTags(now)
+		case <-t.retiredTagStopper.ShouldStop():
+			return
+		}
+	}
 }
 
 func (t *TagManager) mergeNodes(tag *types.Tag, nodes []*types.Node) {
