@@ -1,18 +1,30 @@
 package plugin
 
 import (
+	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 )
 
 type rpc struct {
 	s *Server
 	wklog.Log
+
+	searchSourceStore     searchSourceStore
+	searchSourceReady     func() error
+	searchSourceNodeID    func() uint64
+	searchSourceRoster    func() ([]uint64, error)
+	searchSourceAuthority func(channelID string, channelType uint8) (wkdb.ChannelClusterConfig, error)
 }
 
 func newRpc(s *Server) *rpc {
 	return &rpc{
-		s:   s,
-		Log: wklog.NewWKLog("plugin.rpc"),
+		s:                     s,
+		Log:                   wklog.NewWKLog("plugin.rpc"),
+		searchSourceStore:     defaultSearchSourceStore(),
+		searchSourceReady:     s.searchReady.check,
+		searchSourceNodeID:    defaultSearchSourceNodeID,
+		searchSourceRoster:    defaultSearchSourceRoster,
+		searchSourceAuthority: defaultSearchSourceAuthority,
 	}
 }
 
@@ -33,5 +45,9 @@ func (a *rpc) routes() {
 
 	// ------------------- 最近会话 -------------------
 	a.s.rpcServer.Route("/conversation/channels", a.conversationChannels) // 获取最近会话的频道集合
+
+	// ------------------- 本地持久化搜索源 -------------------
+	a.s.rpcServer.Route("/search/source/channels", a.requireSearchSourceAuthorization(a.searchSourceChannelsRoute))
+	a.s.rpcServer.Route("/search/source/messages", a.requireSearchSourceAuthorization(a.searchSourceMessagesRoute))
 
 }

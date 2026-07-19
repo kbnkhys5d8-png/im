@@ -122,6 +122,65 @@ func TestPropose(t *testing.T) {
 
 }
 
+func TestStopWaitsForInFlightNotNeedAppliedObserver(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	rg := raftgroup.New(newTestOptions(
+		raftgroup.WithStorage(newTestStorage()),
+		raftgroup.WithNotNeedApplied(true),
+		raftgroup.WithAppliedObserver(func(string, uint64) error {
+			close(entered)
+			<-release
+			return nil
+		}),
+	))
+	if err := rg.Start(); err != nil {
+		t.Fatal(err)
+	}
+	node := newTestRaftNode(
+		"stop-in-flight", 1, 0, types.RaftState{},
+		raft.WithElectionOn(true),
+		raft.WithReplicas([]uint64{1}),
+		raft.WithAdvance(rg.Advance),
+	)
+	rg.AddRaft(node)
+	waitHasLeader(node)
+	proposed := make(chan error, 1)
+	go func() {
+		_, err := rg.Propose("stop-in-flight", 1, []byte("message"))
+		proposed <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("apply observer was not entered")
+	}
+	stopped := make(chan struct{})
+	go func() {
+		rg.Stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+		t.Fatal("RaftGroup.Stop returned while apply observer was in flight")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("RaftGroup.Stop did not wait for apply observer completion")
+	}
+	select {
+	case err := <-proposed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("proposal did not finish after observer release")
+	}
+}
+
 func BenchmarkPropose(b *testing.B) {
 	tt := &testTransport{
 		groups: make(map[uint64]*raftgroup.RaftGroup),

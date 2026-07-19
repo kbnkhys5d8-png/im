@@ -150,7 +150,9 @@ func (rg *RaftGroup) handleTruncateReq(r IRaft, e types.Event) {
 }
 
 func (rg *RaftGroup) handleApplyReq(r IRaft, e types.Event) {
+	rg.applyWG.Add(1)
 	err := rg.goPool.Submit(func() {
+		defer rg.applyWG.Done()
 		// 已提交
 		// rg.wait.didCommit(r.Key(), e.EndIndex-1)
 		var lastLogIndex uint64
@@ -184,6 +186,11 @@ func (rg *RaftGroup) handleApplyReq(r IRaft, e types.Event) {
 			lastLogIndex = logs[len(logs)-1].Index
 		} else {
 			lastLogIndex = e.EndIndex - 1
+			if rg.opts.AppliedObserver != nil {
+				if err := rg.opts.AppliedObserver(r.Key(), lastLogIndex); err != nil {
+					rg.Warn("observe applied index failed", zap.String("key", r.Key()), zap.Uint64("index", lastLogIndex), zap.Error(err))
+				}
+			}
 		}
 
 		rg.AddEvent(r.Key(), types.Event{
@@ -196,6 +203,7 @@ func (rg *RaftGroup) handleApplyReq(r IRaft, e types.Event) {
 		rg.Advance()
 	})
 	if err != nil {
+		rg.applyWG.Done()
 		rg.Error("submit apply req failed", zap.Error(err))
 		rg.AddEvent(r.Key(), types.Event{
 			Type:   types.ApplyResp,

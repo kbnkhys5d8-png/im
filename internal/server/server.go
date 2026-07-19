@@ -86,6 +86,8 @@ type Server struct {
 	pluginServer *plugin.Server
 }
 
+const searchSourceBootstrapStartupTimeout = 30 * time.Second
+
 func New(opts *options.Options) *Server {
 	now := time.Now().UTC()
 
@@ -238,6 +240,7 @@ func New(opts *options.Options) *Server {
 			plugin.WithInstall(s.opts.Plugin.Install),
 		),
 	)
+	s.pluginServer.SetSearchSourceRuntimeReady(s.clusterServer.SearchSourceReady)
 	service.PluginManager = s.pluginServer
 	return s
 }
@@ -255,8 +258,12 @@ func (s *Server) Start() error {
 	s.printEnhancedBanner()
 
 	startTime := time.Now()
+	ready := false
 
 	defer func() {
+		if !ready {
+			return
+		}
 		duration := time.Since(startTime)
 		s.Info(fmt.Sprintf("🚀 Server is ready! (startup time: %v)", duration))
 	}()
@@ -290,7 +297,21 @@ func (s *Server) Start() error {
 	if err != nil {
 		return err
 	}
-
+	bootstrapErr := initializeSearchSourceBeforeTraffic(
+		s.ctx,
+		searchSourceBootstrapStartupTimeout,
+		func(ctx context.Context) error {
+			_, err := plugin.ApplySearchSourceOfflineBootstrapMarker(
+				ctx,
+				filepath.Join(s.opts.DataDir, plugin.SearchSourceOfflineBootstrapMarkerName),
+			)
+			return err
+		},
+		s.pluginServer.SetSearchSourceBootstrapResult,
+	)
+	if bootstrapErr != nil {
+		s.Error("offline search source bootstrap failed; search source disabled", zap.Error(bootstrapErr))
+	}
 	s.engine.OnConnect(s.onConnect)
 	s.engine.OnData(s.onData)
 	s.engine.OnClose(s.onClose)
@@ -340,7 +361,21 @@ func (s *Server) Start() error {
 		return err
 	}
 
+	ready = true
 	return nil
+}
+
+func initializeSearchSourceBeforeTraffic(
+	parent context.Context,
+	timeout time.Duration,
+	apply func(context.Context) error,
+	record func(error),
+) error {
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	err := apply(ctx)
+	record(err)
+	return err
 }
 
 func (s *Server) StopNoErr() {

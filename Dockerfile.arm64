@@ -29,6 +29,7 @@ WORKDIR /go/cache
 
 ADD go.mod .
 ADD go.sum .
+ADD third_party/wkrpc ./third_party/wkrpc
 RUN go mod download
 
 WORKDIR /go/release

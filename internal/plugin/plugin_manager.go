@@ -3,6 +3,8 @@ package plugin
 import (
 	"sort"
 	"sync"
+
+	"github.com/panjf2000/gnet/v2"
 )
 
 type pluginManager struct {
@@ -46,6 +48,18 @@ func (pm *pluginManager) remove(no string) {
 	}
 }
 
+func (pm *pluginManager) removeIf(no string, conn gnet.Conn) bool {
+	pm.Lock()
+	defer pm.Unlock()
+	for i, plugin := range pm.plugins {
+		if plugin.info.No == no && plugin.conn == conn {
+			pm.plugins = append(pm.plugins[:i], pm.plugins[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
 func (pm *pluginManager) get(no string) *Plugin {
 	pm.RLock()
 	defer pm.RUnlock()
@@ -72,5 +86,5 @@ func (pm *pluginManager) getByName(name string) []*Plugin {
 func (pm *pluginManager) all() []*Plugin {
 	pm.RLock()
 	defer pm.RUnlock()
-	return pm.plugins
+	return append([]*Plugin(nil), pm.plugins...)
 }

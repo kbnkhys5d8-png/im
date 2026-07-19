@@ -145,6 +145,14 @@ func (m *waitBucket) didApply(key string, maxLogIndex uint64) {
 }
 
 func (m *waitBucket) put(progress *progress) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, current := range m.progresses {
+		if current == progress {
+			m.progresses = append(m.progresses[:i], m.progresses[i+1:]...)
+			break
+		}
+	}
 	close(progress.waitC)
 	progress.reset()
 	m.progressPool.Put(progress)

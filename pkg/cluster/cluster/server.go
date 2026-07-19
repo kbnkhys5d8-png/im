@@ -280,6 +280,12 @@ func (s *Server) GetStore() *store.Store {
 	return s.store
 }
 
+// SearchSourceReady reports only the health of the asynchronous local search
+// watermark path. It does not participate in IM message admission or Raft.
+func (s *Server) SearchSourceReady() error {
+	return s.channelServer.SearchSourceReady()
+}
+
 // 配置改变
 func (s *Server) OnConfigChange(cfg *types.Config) {
 

@@ -5,13 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/service"
@@ -21,19 +21,49 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/fasthash"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/WuKongIM/wkrpc"
+	"github.com/panjf2000/gnet/v2"
 	"go.uber.org/zap"
 )
 
 type Server struct {
-	rpcServer     *wkrpc.Server
-	pluginManager *pluginManager
-	rpc           *rpc
+	rpcServer       *wkrpc.Server
+	pluginManager   *pluginManager
+	searchAuth      *localPluginAuthorizer
+	searchReady     *searchSourceReadiness
+	searchQueryGate searchQueryGateFunc
+	rpc             *rpc
 	wklog.Log
 	opts       *Options
 	sandboxDir string // 沙箱目录
 
 	userPluginBuckets []*userPluginBucket
 	bucketSize        int // 缓存桶大小
+
+	childMu  sync.Mutex
+	children map[*pluginChild]struct{}
+	stopping bool
+}
+
+const searchSourceProcessExitWait = 3 * time.Second
+
+type pluginChild struct {
+	name string
+	cmd  *exec.Cmd
+	done chan struct{}
+}
+
+type pluginShutdownOps struct {
+	stopPlugins  func() error
+	waitChildren func(context.Context) error
+	killChildren func()
+	stopRPC      func()
+	closeAuth    func()
+}
+
+type pluginShutdownResult struct {
+	stopErr      error
+	graceErr     error
+	afterKillErr error
 }
 
 func NewServer(opts *Options) *Server {
@@ -42,7 +72,13 @@ func NewServer(opts *Options) *Server {
 	if err != nil {
 		panic(err)
 	}
-	rpcServer := wkrpc.New(addr)
+	searchAuth := newLocalPluginAuthorizer()
+	rpcServer := wkrpc.New(addr, wkrpc.WithConnectionAuthorizer(func(uid string, conn gnet.Conn) error {
+		if uid != searchSourcePluginNo {
+			return nil
+		}
+		return searchAuth.authorizeStart(conn.Fd(), uid, conn)
+	}))
 
 	// 如果插件目录不存在则创建
 	if _, err := os.Stat(opts.Dir); os.IsNotExist(err) {
@@ -67,12 +103,16 @@ func NewServer(opts *Options) *Server {
 	// }
 
 	s := &Server{
-		rpcServer:     rpcServer,
-		opts:          opts,
-		pluginManager: newPluginManager(),
-		Log:           wklog.NewWKLog("plugin.server"),
-		sandboxDir:    sandboxDir,
-		bucketSize:    10,
+		rpcServer:       rpcServer,
+		opts:            opts,
+		pluginManager:   newPluginManager(),
+		searchAuth:      searchAuth,
+		searchReady:     &searchSourceReadiness{},
+		searchQueryGate: defaultSearchQueryGate,
+		Log:             wklog.NewWKLog("plugin.server"),
+		sandboxDir:      sandboxDir,
+		bucketSize:      10,
+		children:        make(map[*pluginChild]struct{}),
 	}
 	s.rpc = newRpc(s)
 
@@ -83,8 +123,23 @@ func NewServer(opts *Options) *Server {
 	return s
 }
 
+// SetSearchSourceBootstrapResult opens the local search-source routes only
+// after the one-time offline bootstrap check has completed successfully.
+// A bootstrap failure must not prevent the IM server itself from starting.
+func (s *Server) SetSearchSourceBootstrapResult(err error) {
+	s.searchReady.setBootstrapResult(err)
+}
+
+func (s *Server) SetSearchSourceRuntimeReady(check func() error) {
+	s.searchReady.setRuntimeReady(check)
+}
+
 func (s *Server) Start() error {
 	if err := s.rpcServer.Start(); err != nil {
+		return err
+	}
+	if err := waitForSecureUnixSocket(s.opts.SocketPath, 2*time.Second); err != nil {
+		s.rpcServer.Stop()
 		return err
 	}
 	s.rpc.routes()
@@ -105,9 +160,41 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) Stop() {
-	s.rpcServer.Stop()
+	s.childMu.Lock()
+	s.stopping = true
+	s.childMu.Unlock()
 
-	s.stopPlugins()
+	// Keep RPC alive while plugins receive /stop. The exact child registry is
+	// authoritative even when a plugin file was renamed or removed.
+	result := runPluginShutdown(searchSourceProcessExitWait, pluginShutdownOps{
+		stopPlugins: s.stopPlugins, waitChildren: s.waitForPluginChildren,
+		killChildren: s.killPluginChildren, stopRPC: s.rpcServer.Stop, closeAuth: s.searchAuth.close,
+	})
+	if result.stopErr != nil {
+		s.Warn("stop plugins gracefully failed", zap.Error(result.stopErr))
+	}
+	if result.graceErr != nil {
+		s.Warn("plugin child exit timed out; killed exact managed children", zap.Error(result.graceErr))
+	}
+	if result.afterKillErr != nil {
+		s.Error("plugin children did not exit after kill", zap.Error(result.afterKillErr))
+	}
+}
+
+func runPluginShutdown(timeout time.Duration, ops pluginShutdownOps) pluginShutdownResult {
+	result := pluginShutdownResult{stopErr: ops.stopPlugins()}
+	waitCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	result.graceErr = ops.waitChildren(waitCtx)
+	cancel()
+	if result.graceErr != nil {
+		ops.killChildren()
+		killCtx, killCancel := context.WithTimeout(context.Background(), timeout)
+		result.afterKillErr = ops.waitChildren(killCtx)
+		killCancel()
+	}
+	ops.stopRPC()
+	ops.closeAuth()
+	return result
 }
 
 // Plugins 获取插件列表
@@ -212,24 +299,6 @@ func (s *Server) removeIsAiFromCache(uid string) {
 	fh := fasthash.Hash(uid)
 	index := int(fh) % s.bucketSize
 	s.userPluginBuckets[index].removeIsAi(uid)
-}
-
-func getUnixSocket(socketPath string) (string, error) {
-
-	err := os.Remove(socketPath)
-	if err != nil && !os.IsNotExist(err) {
-		log.Printf(`removing "%s": %s`, socketPath, err)
-		panic(err)
-	}
-
-	socketDir := path.Dir(socketPath)
-
-	err = os.MkdirAll(socketDir, 0777)
-	if err != nil {
-		return "", err
-	}
-
-	return fmt.Sprintf("unix://%s", socketPath), nil
 }
 
 // installPlugins 安装插件
@@ -454,26 +523,16 @@ func isPluginExt(ext string) bool {
 }
 
 func (s *Server) stopPlugins() error {
-	pluginDir := s.opts.Dir
-	// 获取插件目录下的所有文件
-	files, err := os.ReadDir(pluginDir)
-	if err != nil {
-		return err
-	}
-
-	for _, file := range files {
-		if file.IsDir() {
-			continue
-		}
-
-		// 停止插件
-		err := s.stopPluginApp(file.Name())
-		if err != nil {
-			s.Error("stop plugin error", zap.Error(err))
-			continue
+	plugins := s.pluginManager.all()
+	timeoutCtx, cancel := context.WithTimeout(context.Background(), searchSourceProcessExitWait)
+	defer cancel()
+	var stopErr error
+	for _, plugin := range plugins {
+		if err := plugin.Stop(timeoutCtx); err != nil {
+			stopErr = errors.Join(stopErr, err)
 		}
 	}
-	return nil
+	return stopErr
 }
 
 // 启动插件程序
@@ -501,14 +560,84 @@ func (s *Server) startPluginApp(name string) error {
 	if errors.Is(cmd.Err, exec.ErrDot) {
 		cmd.Err = nil
 	}
-	// start the process
+	// Start and register under the same lock that establishes the shutdown
+	// boundary, so Stop cannot miss a concurrently launched child.
+	s.childMu.Lock()
+	if s.stopping {
+		s.childMu.Unlock()
+		return errors.New("plugin server is stopping")
+	}
 	err = cmd.Start()
 	if err != nil {
+		s.childMu.Unlock()
 		s.Error("starting plugin process failed", zap.Error(err), zap.String("plugin", name))
 		return err
 	}
+	pid := cmd.Process.Pid
+	if name == searchSourcePluginName {
+		if err := s.searchAuth.manageSearchProcess(pid, name); err != nil {
+			s.childMu.Unlock()
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			return fmt.Errorf("authorize managed search plugin process: %w", err)
+		}
+	}
+	child := &pluginChild{name: name, cmd: cmd, done: make(chan struct{})}
+	s.children[child] = struct{}{}
+	s.childMu.Unlock()
+	go func() {
+		err := cmd.Wait()
+		if name == searchSourcePluginName {
+			s.searchAuth.unmanageSearchProcess(pid)
+		}
+		s.childMu.Lock()
+		delete(s.children, child)
+		close(child.done)
+		s.childMu.Unlock()
+		if err != nil {
+			s.Warn("plugin process exited", zap.String("plugin", name), zap.Int("pid", pid), zap.Error(err))
+		}
+	}()
 
 	return nil
+}
+
+func (s *Server) waitForPluginChildren(ctx context.Context) error {
+	for {
+		s.childMu.Lock()
+		if len(s.children) == 0 {
+			s.childMu.Unlock()
+			return nil
+		}
+		done := make([]<-chan struct{}, 0, len(s.children))
+		for child := range s.children {
+			done = append(done, child.done)
+		}
+		s.childMu.Unlock()
+		for _, childDone := range done {
+			select {
+			case <-childDone:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+}
+
+func (s *Server) killPluginChildren() {
+	s.childMu.Lock()
+	children := make([]*pluginChild, 0, len(s.children))
+	for child := range s.children {
+		children = append(children, child)
+	}
+	s.childMu.Unlock()
+	for _, child := range children {
+		if child.cmd.Process != nil {
+			if err := child.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+				s.Warn("kill plugin child failed", zap.String("plugin", child.name), zap.Error(err))
+			}
+		}
+	}
 }
 
 func (s *Server) restartPlugin(name string) error {
@@ -516,6 +645,13 @@ func (s *Server) restartPlugin(name string) error {
 	err := s.stopPluginApp(name)
 	if err != nil {
 		return err
+	}
+	if name == searchSourcePluginName {
+		waitCtx, cancel := context.WithTimeout(context.Background(), searchSourceProcessExitWait)
+		defer cancel()
+		if err := s.searchAuth.waitForNoManagedSearchProcess(waitCtx); err != nil {
+			return fmt.Errorf("wait for managed search plugin process exit: %w", err)
+		}
 	}
 
 	// 启动插件

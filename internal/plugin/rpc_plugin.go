@@ -41,6 +41,17 @@ func (a *rpc) pluginStart(c *wkrpc.Context) {
 		c.WriteErr(fmt.Errorf("plugin no is empty"))
 		return
 	}
+	if pluginInfo.No == searchSourcePluginNo || c.Uid() == searchSourcePluginNo {
+		if pluginInfo.No != searchSourcePluginNo || c.Uid() != searchSourcePluginNo {
+			c.WriteErr(errSearchSourceUnauthorized)
+			return
+		}
+		if err := a.s.searchAuth.authorizeRequest(c.Conn().Fd(), pluginInfo.No, c.Conn()); err != nil {
+			a.Warn("search source plugin start rejected", zap.Error(err))
+			c.WriteErr(errSearchSourceUnauthorized)
+			return
+		}
+	}
 
 	plugin := newPlugin(a.s, c.Conn(), pluginInfo)
 	a.s.pluginManager.add(plugin)
@@ -179,7 +190,10 @@ func (a *rpc) pluginChange(plugin1, plugin2 wkdb.Plugin) bool {
 
 func (a *rpc) pluginClose(c *wkrpc.Context) {
 	pluginNo := c.Uid()
-	a.s.pluginManager.remove(pluginNo)
+	if pluginNo == searchSourcePluginNo {
+		a.s.searchAuth.revokeConnection(c.Conn().Fd(), c.Conn())
+	}
+	a.s.pluginManager.removeIf(pluginNo, c.Conn())
 	a.Info("plugin close", zap.String("pluginNo", pluginNo))
 	c.WriteOk()
 }

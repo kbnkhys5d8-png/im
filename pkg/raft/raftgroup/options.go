@@ -21,6 +21,9 @@ type Options struct {
 	LogPrefix string
 	// NotNeedApplied 是否不需要应用日志,如果为true，表示不需要应用日志，只需要存储日志，也就是不会调用storage.Apply方法
 	NotNeedApplied bool
+	// AppliedObserver observes the committed index in the NotNeedApplied path.
+	// Observer failures are diagnostic only and never change the Raft apply result.
+	AppliedObserver func(key string, index uint64) error
 
 	// 事件
 	Event IEvent
@@ -95,6 +98,12 @@ func WithLogPrefix(prefix string) Option {
 func WithNotNeedApplied(notNeedApplied bool) Option {
 	return func(o *Options) {
 		o.NotNeedApplied = notNeedApplied
+	}
+}
+
+func WithAppliedObserver(observer func(key string, index uint64) error) Option {
+	return func(o *Options) {
+		o.AppliedObserver = observer
 	}
 }
 

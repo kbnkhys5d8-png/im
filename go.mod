@@ -2,6 +2,8 @@ module github.com/WuKongIM/WuKongIM
 
 go 1.23
 
+replace github.com/WuKongIM/wkrpc => ./third_party/wkrpc
+
 require (
 	github.com/RussellLuo/timingwheel v0.0.0-20220218152713-54845bda3108
 	github.com/WuKongIM/WuKongIMGoProto v1.2.3

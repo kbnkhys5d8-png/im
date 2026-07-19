@@ -75,6 +75,9 @@ type MessageDB interface {
 	LoadNextRangeMsgs(channelId string, channelType uint8, start, end uint64, limit int) ([]Message, error)
 
 	LoadNextRangeMsgsForSize(channelId string, channelType uint8, startMessageSeq, endMessageSeq uint64, limitSize uint64) ([]Message, error)
+	// LoadNextRangeSearchSourceMessages reads one bounded page from a stable
+	// snapshot for the local search-source RPC.
+	LoadNextRangeSearchSourceMessages(channelId string, channelType uint8, startMessageSeq, endMessageSeq uint64, limit int, limitSize uint64) ([]SearchSourceMessage, error)
 	// LoadMsg 加载指定seq的消息
 	LoadMsg(channelId string, channelType uint8, seq uint64) (Message, error)
 	// // TruncateLogTo 截断消息, 从messageSeq开始截断,messageSeq=0 表示清空所有日志 （保留下来的内容包含messageSeq）
@@ -242,6 +245,8 @@ type ChannelDB interface {
 	HasAllowlist(channelId string, channelType uint8) (bool, error)
 
 	// 更新频道的应用索引
+	// UpdateChannelAppliedIndex durably advances the search-source watermark.
+	// Values at or below the current watermark are idempotent no-ops.
 	UpdateChannelAppliedIndex(channelId string, channelType uint8, index uint64) error
 	// 获取频道的应用索引
 	GetChannelAppliedIndex(channelId string, channelType uint8) (uint64, error)

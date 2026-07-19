@@ -9,6 +9,7 @@ import (
 
 type dblock struct {
 	channelClusterConfig *channelClusterConfigLock
+	channelAppliedIndex  *channelClusterConfigLock
 	subscriberCountLock  *subscriberCountLock
 	allowlistCountLock   *allowlistCountLock
 	denylistCountLock    *denylistCountLock
@@ -22,6 +23,7 @@ type dblock struct {
 func newDBLock() *dblock {
 	return &dblock{
 		channelClusterConfig:   newChannelClusterConfigLock(),
+		channelAppliedIndex:    newChannelClusterConfigLock(),
 		subscriberCountLock:    newSubscriberCountLock(),
 		allowlistCountLock:     newAllowlistCountLock(),
 		denylistCountLock:      newDenylistCountLock(),
@@ -35,6 +37,7 @@ func newDBLock() *dblock {
 
 func (d *dblock) start() {
 	d.channelClusterConfig.StartCleanLoop()
+	d.channelAppliedIndex.StartCleanLoop()
 	d.subscriberCountLock.StartCleanLoop()
 	d.allowlistCountLock.StartCleanLoop()
 	d.denylistCountLock.StartCleanLoop()
@@ -45,6 +48,7 @@ func (d *dblock) start() {
 
 func (d *dblock) stop() {
 	d.channelClusterConfig.StopCleanLoop()
+	d.channelAppliedIndex.StopCleanLoop()
 	d.subscriberCountLock.StopCleanLoop()
 	d.allowlistCountLock.StopCleanLoop()
 	d.denylistCountLock.StopCleanLoop()

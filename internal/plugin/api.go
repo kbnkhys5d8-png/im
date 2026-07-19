@@ -105,9 +105,24 @@ func (s *Server) handleGetPlugins(c *wkhttp.Context) {
 // 处理插件的路由
 func (s *Server) handlePluginRoute(c *wkhttp.Context) {
 	pluginNo := c.Param("plugin")
+	pluginPath := c.Param("path")
+	isSearchQuery := pluginNo == searchSourcePluginNo && pluginPath == searchQueryPluginPath
+	if s.searchQueryGate == nil || s.searchQueryGate(pluginNo, pluginPath) != nil {
+		if isSearchQuery {
+			c.JSON(http.StatusServiceUnavailable, struct {
+				Msg    string `json:"msg"`
+				Status int    `json:"status"`
+			}{Msg: searchQueryUnavailableMsg, Status: http.StatusServiceUnavailable})
+			return
+		}
+	}
 	plugin := s.pluginManager.get(pluginNo)
 	if plugin == nil {
-		c.JSON(http.StatusBadRequest, gin.H{
+		status := http.StatusBadRequest
+		if isSearchQuery {
+			status = http.StatusNotFound
+		}
+		c.JSON(status, gin.H{
 			"msg":    "plugin not found",
 			"status": http.StatusNotFound,
 		})
@@ -120,14 +135,16 @@ func (s *Server) handlePluginRoute(c *wkhttp.Context) {
 		case types.PluginStatusOffline:
 			msg = "plugin offline"
 		}
-		c.JSON(http.StatusBadRequest, gin.H{
+		status := http.StatusBadRequest
+		if isSearchQuery {
+			status = http.StatusServiceUnavailable
+		}
+		c.JSON(status, gin.H{
 			"msg":    msg,
 			"status": http.StatusServiceUnavailable,
 		})
 		return
 	}
-
-	pluginPath := c.Param("path")
 
 	headerMap := make(map[string]string)
 	for k, v := range c.Request.Header {

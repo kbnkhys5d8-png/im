@@ -481,10 +481,7 @@ func (wk *BatchDB) executeBatch(bs []*Batch) {
 	err := bt.Commit(pebble.Sync)
 	if err != nil {
 		for _, b := range bs {
-			b.err = err
-			if b.waitC != nil {
-				b.waitC <- err
-			}
+			b.complete(err)
 		}
 		return
 	}
@@ -493,11 +490,7 @@ func (wk *BatchDB) executeBatch(bs []*Batch) {
 	// fmt.Println("executeBatch耗时--->", end, len(bs))
 
 	for _, b := range bs {
-		if b.waitC != nil {
-			b.waitC <- b.err
-		}
-		// 释放资源
-		b.release()
+		b.complete(nil)
 	}
 
 }
@@ -542,9 +535,23 @@ func (b *Batch) Commit() error {
 }
 
 func (b *Batch) CommitWait() error {
-	b.waitC = make(chan error, 1)
+	waitC := make(chan error, 1)
+	b.waitC = waitC
 	b.db.batchChan <- b
-	return <-b.waitC
+	err := <-waitC
+	b.release()
+	return err
+}
+
+func (b *Batch) complete(err error) {
+	if err != nil {
+		b.err = err
+	}
+	if b.waitC != nil {
+		b.waitC <- b.err
+		return
+	}
+	b.release()
 }
 
 func (b *Batch) release() {

@@ -488,6 +488,16 @@ func (wk *wukongDB) DeleteChannel(channelId string, channelType uint8) error {
 func (wk *wukongDB) UpdateChannelAppliedIndex(channelId string, channelType uint8, index uint64) error {
 
 	wk.metrics.UpdateChannelAppliedIndexAdd(1)
+	wk.dblock.channelAppliedIndex.lockByChannel(channelId, channelType)
+	defer wk.dblock.channelAppliedIndex.unlockByChannel(channelId, channelType)
+
+	current, err := wk.GetChannelAppliedIndex(channelId, channelType)
+	if err != nil {
+		return err
+	}
+	if index <= current {
+		return nil
+	}
 
 	indexBytes := make([]byte, 8)
 	wk.endian.PutUint64(indexBytes, index)

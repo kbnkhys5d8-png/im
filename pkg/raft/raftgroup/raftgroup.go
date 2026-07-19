@@ -2,6 +2,7 @@ package raftgroup
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/raft/track"
@@ -22,7 +23,8 @@ type RaftGroup struct {
 	tmpRafts []IRaft
 	stopped  bool
 
-	goPool *ants.Pool
+	goPool  *ants.Pool
+	applyWG sync.WaitGroup
 	wklog.Log
 
 	mq *EventQueue
@@ -98,7 +100,11 @@ func (rg *RaftGroup) Start() error {
 }
 
 func (rg *RaftGroup) Stop() {
+	// Stop the event loop first so it cannot submit another apply task, then
+	// wait for every already-submitted apply worker before downstream storage
+	// observers are drained and closed.
 	rg.stopper.Stop()
+	rg.applyWG.Wait()
 }
 
 func (rg *RaftGroup) Advance() {

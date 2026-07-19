@@ -14,9 +14,10 @@ import (
 )
 
 type Server struct {
-	raftGroups []*raftgroup.RaftGroup
-	opts       *Options
-	storage    *storage
+	raftGroups            []*raftgroup.RaftGroup
+	opts                  *Options
+	storage               *storage
+	searchAppliedObserver *searchAppliedObserver
 	wklog.Log
 
 	// 正在唤醒的频道
@@ -35,11 +36,13 @@ func NewServer(opts *Options) *Server {
 		wakeLeaderLock: ringlock.NewRingLock(1024),
 	}
 	s.storage = newStorage(opts.DB, s)
+	s.searchAppliedObserver = newSearchAppliedObserver(opts.DB)
 	for i := 0; i < opts.GroupCount; i++ {
 		rg := raftgroup.New(
 			raftgroup.NewOptions(
 				raftgroup.WithLogPrefix("channel"),
 				raftgroup.WithNotNeedApplied(true),
+				raftgroup.WithAppliedObserver(s.searchAppliedObserver.Observe),
 				raftgroup.WithTransport(opts.Transport),
 				raftgroup.WithStorage(s.storage),
 				raftgroup.WithEvent(s)),
@@ -52,10 +55,11 @@ func NewServer(opts *Options) *Server {
 }
 
 func (s *Server) Start() error {
-
+	s.searchAppliedObserver.Start()
 	for _, rg := range s.raftGroups {
 		err := rg.Start()
 		if err != nil {
+			s.searchAppliedObserver.Stop()
 			return err
 		}
 	}
@@ -66,6 +70,11 @@ func (s *Server) Stop() {
 	for _, rg := range s.raftGroups {
 		rg.Stop()
 	}
+	s.searchAppliedObserver.Stop()
+}
+
+func (s *Server) SearchSourceReady() error {
+	return s.searchAppliedObserver.Ready()
 }
 
 // 唤醒频道领导
