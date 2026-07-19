@@ -627,7 +627,9 @@ func (wk *wukongDB) SetChannelLastMessageSeq(channelId string, channelType uint8
 var minMessagePrimaryKey = [16]byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
 var maxMessagePrimaryKey = [16]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
 
-func (wk *wukongDB) searchMessageByIndex(req MessageSearchReq, db *pebble.DB, iterFnc func(m Message) bool) (bool, error) {
+const maxClientMsgNoIndexCandidates = 4096
+
+func (wk *wukongDB) searchMessageByIndex(req MessageSearchReq, db *pebble.DB, iterFnc func(m Message) bool, ascending bool, candidateLimit int) (bool, error) {
 	var lowKey []byte
 	var highKey []byte
 
@@ -662,27 +664,40 @@ func (wk *wukongDB) searchMessageByIndex(req MessageSearchReq, db *pebble.DB, it
 	})
 	defer iter.Close()
 
-	for iter.Last(); iter.Valid(); iter.Prev() {
+	valid := iter.Last()
+	step := iter.Prev
+	if ascending {
+		valid = iter.First()
+		step = iter.Next
+	}
+	candidates := 0
+	for ; valid; valid = step() {
+		candidates++
+		if candidateLimit > 0 && candidates > candidateLimit {
+			return true, ErrMessageSearchCandidateLimit
+		}
 		primaryBytes, err := key.ParseMessageSecondIndexKey(iter.Key())
 		if err != nil {
 			wk.Error("parseMessageIndexKey", zap.Error(err))
 			continue
 		}
 
-		iter := db.NewIter(&pebble.IterOptions{
+		messageIter := db.NewIter(&pebble.IterOptions{
 			LowerBound: key.NewMessageColumnKeyWithPrimary(primaryBytes, key.MinColumnKey),
 			UpperBound: key.NewMessageColumnKeyWithPrimary(primaryBytes, key.MaxColumnKey),
 		})
 
-		defer iter.Close()
-
 		var msg Message
-		err = wk.iteratorChannelMessages(iter, 0, func(m Message) bool {
+		readErr := wk.iteratorChannelMessages(messageIter, 0, func(m Message) bool {
 			msg = m
 			return false
 		})
-		if err != nil {
-			return false, err
+		closeErr := messageIter.Close()
+		if readErr != nil {
+			return false, readErr
+		}
+		if closeErr != nil {
+			return false, closeErr
 		}
 		if iterFnc != nil {
 			if !iterFnc(msg) {
@@ -729,6 +744,15 @@ func (wk *wukongDB) SearchMessages(req MessageSearchReq) ([]Message, error) {
 				return true
 			}
 
+			if strings.TrimSpace(req.ChannelId) != "" && req.ChannelType != 0 && req.OffsetMessageSeq > 0 {
+				if req.Pre && uint64(m.MessageSeq) <= req.OffsetMessageSeq {
+					return true
+				}
+				if !req.Pre && uint64(m.MessageSeq) >= req.OffsetMessageSeq {
+					return true
+				}
+			}
+
 			if len(req.Payload) > 0 && !bytes.Contains(m.Payload, req.Payload) {
 				return true
 			}
@@ -762,6 +786,18 @@ func (wk *wukongDB) SearchMessages(req MessageSearchReq) ([]Message, error) {
 		db := wk.channelDb(req.ChannelId, req.ChannelType)
 		msgs := make([]Message, 0, req.Limit)
 		fnc := iterFnc(&msgs)
+		if strings.TrimSpace(req.ClientMsgNo) != "" {
+			indexReq := req
+			indexReq.FromUid = ""
+			candidateLimit := 0
+			if strings.TrimSpace(req.FromUid) != "" {
+				candidateLimit = maxClientMsgNoIndexCandidates
+			}
+			if _, err := wk.searchMessageByIndex(indexReq, db, fnc, req.Pre, candidateLimit); err != nil {
+				return nil, err
+			}
+			return msgs, nil
+		}
 
 		startSeq := req.OffsetMessageSeq
 		var endSeq uint64 = math.MaxUint64
@@ -796,7 +832,7 @@ func (wk *wukongDB) SearchMessages(req MessageSearchReq) ([]Message, error) {
 		msgs := make([]Message, 0)
 		fnc := iterFnc(&msgs)
 		// 通过索引查询
-		has, err := wk.searchMessageByIndex(req, db, fnc)
+		has, err := wk.searchMessageByIndex(req, db, fnc, false, 0)
 		if err != nil {
 			return nil, err
 		}

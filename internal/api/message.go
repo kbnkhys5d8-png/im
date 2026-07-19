@@ -582,12 +582,14 @@ func (m *message) syncack(c *wkhttp.Context) {
 
 func (m *message) searchMessages(c *wkhttp.Context) {
 	var req struct {
-		LoginUid     string   `json:"login_uid"`
-		ChannelID    string   `json:"channel_id"`
-		ChannelType  uint8    `json:"channel_type"`
-		MessageSeqs  []uint32 `json:"message_seqs"`
-		MessageIds   []int64  `json:"message_ids"`
-		ClientMsgNos []string `json:"client_msg_nos"`
+		LoginUid         string   `json:"login_uid"`
+		ChannelID        string   `json:"channel_id"`
+		ChannelType      uint8    `json:"channel_type"`
+		MessageSeqs      []uint32 `json:"message_seqs"`
+		MessageIds       []int64  `json:"message_ids"`
+		ClientMsgNos     []string `json:"client_msg_nos"`
+		ClientMsgNoLimit int      `json:"client_msg_no_limit"`
+		ExpectedFromUid  string   `json:"expected_from_uid"`
 	}
 	bodyBytes, err := BindJSON(&req, c)
 	if err != nil {
@@ -598,6 +600,21 @@ func (m *message) searchMessages(c *wkhttp.Context) {
 	if strings.TrimSpace(req.ChannelID) == "" {
 		c.ResponseError(errors.New("channel_id不能为空！"))
 		return
+	}
+	if len(req.ClientMsgNos) > maxClientMsgNoSearchKeys {
+		c.ResponseError(errors.New("client_msg_nos数量超过限制！"))
+		return
+	}
+	if req.ClientMsgNoLimit != 0 && (req.ClientMsgNoLimit < 1 || req.ClientMsgNoLimit > maxClientMsgNoSearchResults ||
+		len(req.ClientMsgNos) != 1 || len(req.MessageSeqs) != 0 || len(req.MessageIds) != 0 || strings.TrimSpace(req.ExpectedFromUid) == "") {
+		c.ResponseError(errors.New("client_msg_no_limit查询参数不合法！"))
+		return
+	}
+	for _, clientMsgNo := range req.ClientMsgNos {
+		if strings.TrimSpace(clientMsgNo) == "" {
+			c.ResponseError(errors.New("client_msg_no不能为空！"))
+			return
+		}
 	}
 
 	fakeChannelId := req.ChannelID
@@ -649,21 +666,40 @@ func (m *message) searchMessages(c *wkhttp.Context) {
 		}
 	}
 
+	clientMsgNoResults := make([]wkdb.Message, 0)
+	clientMsgNoLimit := effectiveClientMsgNoSearchLimit(req.ClientMsgNoLimit)
+	boundedClientMsgNoQuery := req.ClientMsgNoLimit > 0
 	for _, clientMsgNo := range req.ClientMsgNos {
-		results, err := service.Store.SearchMessages(wkdb.MessageSearchReq{
-			ChannelId:   fakeChannelId,
-			ChannelType: req.ChannelType,
-			ClientMsgNo: clientMsgNo,
-			Limit:       1000,
-		})
+		searchReq := newLegacyClientMsgNoStoreSearchRequest(fakeChannelId, req.ChannelType, clientMsgNo)
+		if boundedClientMsgNoQuery {
+			remaining := clientMsgNoLimit - len(clientMsgNoResults)
+			searchReq = newClientMsgNoStoreSearchRequest(
+				fakeChannelId, req.ChannelType, clientMsgNo, req.ExpectedFromUid, remaining,
+			)
+		}
+		results, err := service.Store.SearchMessages(searchReq)
 		if err != nil && err != wkdb.ErrNotFound {
+			if isBoundedClientMsgNoCandidateOverflow(err, req.ClientMsgNoLimit) {
+				c.JSON(http.StatusOK, &syncMessageResp{More: 1, Messages: make([]*types.MessageResp, 0)})
+				return
+			}
 			m.Error("查询消息失败！", zap.Error(err), zap.String("clientMsgNo", clientMsgNo))
 			c.ResponseError(err)
 			return
 		}
-		if len(results) > 0 {
-			messages = append(messages, results[0])
+		if !boundedClientMsgNoQuery {
+			messages = appendLegacyClientMsgNoResult(messages, results)
+			continue
 		}
+		var more int
+		clientMsgNoResults, more = boundedClientMsgNoResults(clientMsgNoResults, results, clientMsgNoLimit)
+		if more != 0 {
+			c.JSON(http.StatusOK, &syncMessageResp{More: more, Messages: make([]*types.MessageResp, 0)})
+			return
+		}
+	}
+	if boundedClientMsgNoQuery {
+		messages = appendFoundMessages(messages, clientMsgNoResults)
 	}
 
 	resps := make([]*types.MessageResp, 0, len(messages))
@@ -675,8 +711,68 @@ func (m *message) searchMessages(c *wkhttp.Context) {
 		}
 	}
 	c.JSON(http.StatusOK, &syncMessageResp{
-		Messages: resps,
+		ClientMsgNoQueryVersion: completeClientMsgNoQueryVersion(req.ClientMsgNoLimit, 0),
+		Messages:                resps,
 	})
+}
+
+func appendFoundMessages(messages, results []wkdb.Message) []wkdb.Message {
+	return append(messages, results...)
+}
+
+func appendLegacyClientMsgNoResult(messages, results []wkdb.Message) []wkdb.Message {
+	if len(results) == 0 {
+		return messages
+	}
+	return append(messages, results[0])
+}
+
+const (
+	clientMsgNoQueryProtocolVersion = 2
+	maxClientMsgNoSearchKeys        = 16
+	maxClientMsgNoSearchResults     = 64
+)
+
+func completeClientMsgNoQueryVersion(requestedLimit, more int) int {
+	if requestedLimit < 1 || more != 0 {
+		return 0
+	}
+	return clientMsgNoQueryProtocolVersion
+}
+
+func effectiveClientMsgNoSearchLimit(requested int) int {
+	if requested < 1 || requested > maxClientMsgNoSearchResults {
+		return maxClientMsgNoSearchResults
+	}
+	return requested
+}
+
+func clientMsgNoStoreSearchLimit(limit int) int {
+	return limit + 1
+}
+
+func isBoundedClientMsgNoCandidateOverflow(err error, requestedLimit int) bool {
+	return requestedLimit > 0 && errors.Is(err, wkdb.ErrMessageSearchCandidateLimit)
+}
+
+func newClientMsgNoStoreSearchRequest(channelID string, channelType uint8, clientMsgNo, expectedFromUID string, limit int) wkdb.MessageSearchReq {
+	return wkdb.MessageSearchReq{
+		ChannelId: channelID, ChannelType: channelType, ClientMsgNo: clientMsgNo,
+		FromUid: expectedFromUID, Limit: clientMsgNoStoreSearchLimit(limit),
+	}
+}
+
+func newLegacyClientMsgNoStoreSearchRequest(channelID string, channelType uint8, clientMsgNo string) wkdb.MessageSearchReq {
+	return wkdb.MessageSearchReq{
+		ChannelId: channelID, ChannelType: channelType, ClientMsgNo: clientMsgNo, Limit: 1,
+	}
+}
+
+func boundedClientMsgNoResults(messages, results []wkdb.Message, limit int) ([]wkdb.Message, int) {
+	if limit < 1 || len(messages) > limit || len(results) > limit-len(messages) {
+		return nil, 1
+	}
+	return appendFoundMessages(messages, results), 0
 }
 
 func (m *message) searchMessage(c *wkhttp.Context) {

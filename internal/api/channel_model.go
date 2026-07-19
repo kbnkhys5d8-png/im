@@ -203,8 +203,9 @@ var emptySyncMessageResp = syncMessageResp{
 }
 
 type syncMessageResp struct {
-	StartMessageSeq uint64               `json:"start_message_seq"` // 开始序列号
-	EndMessageSeq   uint64               `json:"end_message_seq"`   // 结束序列号
-	More            int                  `json:"more"`              // 是否还有更多 1.是 0.否
-	Messages        []*types.MessageResp `json:"messages"`          // 消息数据
+	StartMessageSeq         uint64               `json:"start_message_seq"`                     // 开始序列号
+	EndMessageSeq           uint64               `json:"end_message_seq"`                       // 结束序列号
+	More                    int                  `json:"more"`                                  // 是否还有更多 1.是 0.否
+	ClientMsgNoQueryVersion int                  `json:"client_msg_no_query_version,omitempty"` // client_msg_no 有界查询完整性协议
+	Messages                []*types.MessageResp `json:"messages"`                              // 消息数据
 }
