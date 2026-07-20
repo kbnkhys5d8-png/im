@@ -73,12 +73,62 @@ func TestSaveChannelClusterConfigs(t *testing.T) {
 
 	err = d.SaveChannelClusterConfigs(configs)
 	assert.NoError(t, err)
+	assert.Zero(t, configs[0].Id)
 
 	results, err := d.GetChannelClusterConfigs(0, count)
 	assert.NoError(t, err)
 
 	assert.Equal(t, len(results), count)
 
+}
+
+func TestSaveChannelClusterConfigsCachesNormalizedConfig(t *testing.T) {
+	d := newTestDB(t)
+	err := d.Open()
+	assert.NoError(t, err)
+
+	defer func() {
+		err := d.Close()
+		assert.NoError(t, err)
+	}()
+
+	configs := []wkdb.ChannelClusterConfig{{
+		ChannelId:       "channel1",
+		ChannelType:     1,
+		ReplicaMaxCount: 3,
+		Replicas:        []uint64{1, 2, 3},
+		LeaderId:        1001,
+		Term:            1,
+		ConfVersion:     1,
+	}}
+
+	err = d.SaveChannelClusterConfigs(configs)
+	assert.NoError(t, err)
+	assert.Zero(t, configs[0].Id)
+
+	candidates, err := d.GetChannelClusterConfigs(0, 1)
+	assert.NoError(t, err)
+	assert.Len(t, candidates, 1)
+
+	current, err := d.GetChannelClusterConfig(configs[0].ChannelId, configs[0].ChannelType)
+	assert.NoError(t, err)
+	assert.Greater(t, current.Id, uint64(0))
+	assert.True(t, candidates[0].Equal(current))
+
+	configs[0].Term = 2
+	configs[0].ConfVersion = 2
+	err = d.SaveChannelClusterConfigs(configs)
+	assert.NoError(t, err)
+	assert.Zero(t, configs[0].Id)
+
+	candidates, err = d.GetChannelClusterConfigs(0, 1)
+	assert.NoError(t, err)
+	assert.Len(t, candidates, 1)
+
+	current, err = d.GetChannelClusterConfig(configs[0].ChannelId, configs[0].ChannelType)
+	assert.NoError(t, err)
+	assert.Greater(t, current.Id, uint64(0))
+	assert.True(t, candidates[0].Equal(current))
 }
 
 func TestGetChannelClusterConfig(t *testing.T) {

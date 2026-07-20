@@ -117,8 +117,11 @@ func (wk *wukongDB) SaveChannelClusterConfigs(channelClusterConfigs []ChannelClu
 	// }
 	// 再添加新的
 	batch := db.NewBatch()
-	for _, cfg := range channelClusterConfigs {
+	normalizedConfigs := make([]ChannelClusterConfig, len(channelClusterConfigs))
+	for i, cfg := range channelClusterConfigs {
 		primaryKey := key.ChannelToNum(cfg.ChannelId, cfg.ChannelType)
+		cfg.Id = primaryKey
+		normalizedConfigs[i] = cfg
 		if err := wk.writeChannelClusterConfig(primaryKey, cfg, batch); err != nil {
 			return err
 		}
@@ -129,7 +132,7 @@ func (wk *wukongDB) SaveChannelClusterConfigs(channelClusterConfigs []ChannelClu
 	}
 
 	// 批量更新缓存
-	wk.clusterConfigCache.BatchSetChannelClusterConfigs(channelClusterConfigs)
+	wk.clusterConfigCache.BatchSetChannelClusterConfigs(normalizedConfigs)
 
 	return nil
 }
