@@ -11,7 +11,7 @@ const (
 	searchQueryGateEnv        = "SEARCH_LOCAL_FAIL_CLOSED_FILE"
 	searchQueryGatePath       = "/run/tsdd-search-control/usersearch-disabled-v1"
 	searchQueryPluginPath     = "/usersearch"
-	searchQueryUnavailableMsg = "user search is temporarily unavailable"
+	searchQueryUnavailableMsg = "search is locally disabled"
 )
 
 var errSearchQueryUnavailable = errors.New(searchQueryUnavailableMsg)

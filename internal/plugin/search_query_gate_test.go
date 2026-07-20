@@ -61,7 +61,7 @@ func TestSearchQueryGateReturnsActual503BeforeLegacyPlugin(t *testing.T) {
 	if response.Code != http.StatusServiceUnavailable {
 		t.Fatalf("HTTP status = %d, want 503", response.Code)
 	}
-	if got, want := response.Body.String(), `{"msg":"user search is temporarily unavailable","status":503}`; got != want {
+	if got, want := response.Body.String(), `{"msg":"search is locally disabled","status":503}`; got != want {
 		t.Fatalf("body = %q, want %q", got, want)
 	}
 }
