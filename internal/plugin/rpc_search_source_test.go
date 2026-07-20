@@ -98,6 +98,61 @@ func TestSearchSourceChannelsReturnsV5TopologyAndWatermarks(t *testing.T) {
 	}
 }
 
+func TestSearchSourceChannelsRetriesTransientConfigurationChange(t *testing.T) {
+	before := validSearchSourceConfig()
+	after := before
+	after.Term++
+	after.ConfVersion++
+	store := &fakeSearchSourceStore{
+		configs:  []wkdb.ChannelClusterConfig{before},
+		applied:  1,
+		physical: 1,
+	}
+	rpc := testSearchSourceRPC(store)
+	authorityCalls := 0
+	rpc.searchSourceAuthority = func(string, uint8) (wkdb.ChannelClusterConfig, error) {
+		authorityCalls++
+		return after, nil
+	}
+
+	resp, err := rpc.searchSourceChannels(searchSourceChannelPageRequest{Version: 5, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if authorityCalls != 2 {
+		t.Fatalf("authority reads = %d, want one retry", authorityCalls)
+	}
+	if len(resp.Channels) != 1 || resp.Channels[0].Term != after.Term || resp.Channels[0].ConfigVersion != after.ConfVersion {
+		t.Fatalf("inventory response = %+v, want stable updated generation", resp)
+	}
+}
+
+func TestSearchSourceChannelsBoundsContinuousConfigurationChanges(t *testing.T) {
+	before := validSearchSourceConfig()
+	store := &fakeSearchSourceStore{
+		configs:  []wkdb.ChannelClusterConfig{before},
+		applied:  1,
+		physical: 1,
+	}
+	rpc := testSearchSourceRPC(store)
+	authorityCalls := 0
+	rpc.searchSourceAuthority = func(string, uint8) (wkdb.ChannelClusterConfig, error) {
+		authorityCalls++
+		changed := before
+		changed.Term += uint32(authorityCalls)
+		changed.ConfVersion += uint64(authorityCalls)
+		return changed, nil
+	}
+
+	_, err := rpc.searchSourceChannels(searchSourceChannelPageRequest{Version: 5, Limit: 10})
+	if !errors.Is(err, errSearchSourceFence) {
+		t.Fatalf("error = %v, want bounded fail-closed fence", err)
+	}
+	if authorityCalls != 3 {
+		t.Fatalf("authority reads = %d, want three bounded attempts", authorityCalls)
+	}
+}
+
 func TestSearchSourceMessagesV5ExplicitlyEncodesSearchPolicyFields(t *testing.T) {
 	cfg := validSearchSourceConfig()
 	store := &fakeSearchSourceStore{

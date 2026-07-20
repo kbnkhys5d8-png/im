@@ -24,6 +24,7 @@ const (
 	searchSourceMessageResponseBytes = 4 * 1024 * 1024
 	searchSourceResponseReserveBytes = 64
 	searchSourceMaxNextSeq           = wkdb.MaxMessageSequence + 1
+	searchSourceChannelReadAttempts  = 3
 
 	searchSourceErrorKindChannelRetry = "channel_retry"
 	searchSourceErrorCodeApplyPending = "apply_pending"
@@ -268,28 +269,16 @@ func (a *rpc) searchSourceChannels(req searchSourceChannelPageRequest) (searchSo
 	if err != nil {
 		return searchSourceChannelPageResponse{}, err
 	}
-	for _, before := range configs {
-		if before.Id <= resp.ScannedTo || !validSearchSourceSingleNodeConfig(before, nodeID) {
+	for _, candidate := range configs {
+		if candidate.Id <= resp.ScannedTo || !validSearchSourceSingleNodeConfig(candidate, nodeID) {
 			return searchSourceChannelPageResponse{}, errSearchSourceFence
 		}
-		resp.ScannedTo = before.Id
-		applied, physical, err := a.searchSourceTail(before.ChannelId, before.ChannelType)
+		resp.ScannedTo = candidate.Id
+		channel, err := a.readStableSearchSourceChannel(candidate, nodeID)
 		if err != nil {
 			return searchSourceChannelPageResponse{}, err
 		}
-		after, err := a.searchSourceAuthority(before.ChannelId, before.ChannelType)
-		if err != nil {
-			return searchSourceChannelPageResponse{}, err
-		}
-		if !validSearchSourceSingleNodeConfig(after, nodeID) || !before.Equal(after) {
-			return searchSourceChannelPageResponse{}, errSearchSourceFence
-		}
-		resp.Channels = append(resp.Channels, searchSourceChannel{
-			ConfigID: before.Id, ChannelID: before.ChannelId, ChannelType: before.ChannelType,
-			LeaderID: before.LeaderId, Term: before.Term, ConfigVersion: before.ConfVersion,
-			LastMessageSeq: applied, AppliedMessageSeq: applied, PhysicalMessageSeq: physical,
-			ApplyPending: physical > applied, OfflineBootstrapRequired: applied == 0 && physical > 0,
-		})
+		resp.Channels = append(resp.Channels, channel)
 	}
 	if _, _, err := a.validateSearchSourceRoster(); err != nil {
 		return searchSourceChannelPageResponse{}, err
@@ -401,6 +390,34 @@ func (a *rpc) searchSourceTail(channelID string, channelType uint8) (uint64, uin
 		return 0, 0, fmt.Errorf("invalid search source watermarks: applied=%d physical=%d", applied, physical)
 	}
 	return applied, physical, nil
+}
+
+func (a *rpc) readStableSearchSourceChannel(candidate wkdb.ChannelClusterConfig, nodeID uint64) (searchSourceChannel, error) {
+	configID, channelID, channelType := candidate.Id, candidate.ChannelId, candidate.ChannelType
+	for attempt := 0; attempt < searchSourceChannelReadAttempts; attempt++ {
+		applied, physical, err := a.searchSourceTail(channelID, channelType)
+		if err != nil {
+			return searchSourceChannel{}, err
+		}
+		current, err := a.searchSourceAuthority(channelID, channelType)
+		if err != nil {
+			return searchSourceChannel{}, err
+		}
+		if !validSearchSourceSingleNodeConfig(current, nodeID) || current.Id != configID ||
+			current.ChannelId != channelID || current.ChannelType != channelType {
+			return searchSourceChannel{}, errSearchSourceFence
+		}
+		if candidate.Equal(current) {
+			return searchSourceChannel{
+				ConfigID: current.Id, ChannelID: current.ChannelId, ChannelType: current.ChannelType,
+				LeaderID: current.LeaderId, Term: current.Term, ConfigVersion: current.ConfVersion,
+				LastMessageSeq: applied, AppliedMessageSeq: applied, PhysicalMessageSeq: physical,
+				ApplyPending: physical > applied, OfflineBootstrapRequired: applied == 0 && physical > 0,
+			}, nil
+		}
+		candidate = current
+	}
+	return searchSourceChannel{}, errSearchSourceFence
 }
 
 func validSearchSourceSingleNodeConfig(cfg wkdb.ChannelClusterConfig, nodeID uint64) bool {
