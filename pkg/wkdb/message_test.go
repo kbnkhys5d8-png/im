@@ -128,13 +128,18 @@ func TestTruncateLogTo(t *testing.T) {
 
 	resultMessages, err := d.LoadNextRangeMsgs(channelId, channelType, 51, 0, 0)
 	assert.NoError(t, err)
-	assert.Equal(t, 0, len(resultMessages))
+	assert.Len(t, resultMessages, 1)
+	assert.Equal(t, uint32(51), resultMessages[0].MessageSeq)
 
 	resultMessages, err = d.LoadNextRangeMsgs(channelId, channelType, 0, 51, 0)
 	assert.NoError(t, err)
 	assert.Equal(t, 50, len(resultMessages))
 	assert.Equal(t, uint32(1), resultMessages[0].MessageSeq)
 	assert.Equal(t, uint32(50), resultMessages[len(resultMessages)-1].MessageSeq)
+
+	lastSeq, _, err := d.GetChannelLastMessageSeq(channelId, channelType)
+	assert.NoError(t, err)
+	assert.Equal(t, uint64(51), lastSeq)
 }
 
 func BenchmarkAppendMessages(b *testing.B) {

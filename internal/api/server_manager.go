@@ -1,11 +1,14 @@
 package api
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/options"
 	"github.com/WuKongIM/WuKongIM/internal/plugin"
@@ -22,8 +25,9 @@ import (
 )
 
 type managerServer struct {
-	s *Server
-	r *wkhttp.WKHttp
+	s          *Server
+	r          *wkhttp.WKHttp
+	httpServer *http.Server
 	wklog.Log
 	addr string
 }
@@ -62,12 +66,16 @@ func (m *managerServer) start() {
 
 	m.setRoutes()
 
-	go func() {
-		err := m.r.Run(m.addr) // listen and serve
-		if err != nil {
+	m.httpServer = &http.Server{
+		Addr:    m.addr,
+		Handler: m.r,
+	}
+	go func(server *http.Server) {
+		err := server.ListenAndServe()
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			panic(err)
 		}
-	}()
+	}(m.httpServer)
 	m.Info("ManagerServer started", zap.String("addr", m.addr))
 
 	_, port := parseAddr(m.addr)
@@ -75,7 +83,15 @@ func (m *managerServer) start() {
 }
 
 func (m *managerServer) stop() {
+	if m.httpServer == nil {
+		return
+	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := m.httpServer.Shutdown(ctx); err != nil {
+		m.Warn("ManagerServer shutdown failed", zap.Error(err))
+	}
 }
 
 func (m *managerServer) setRoutes() {

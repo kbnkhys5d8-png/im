@@ -84,7 +84,7 @@ func TestSendBatchOptimization(t *testing.T) {
 		}
 
 		err := node.sendBatch([]*proto.Message{msg})
-		assert.NoError(t, err)
+		assert.EqualError(t, err, "connect is not connected")
 	})
 
 	t.Run("BatchMessages", func(t *testing.T) {
@@ -100,7 +100,7 @@ func TestSendBatchOptimization(t *testing.T) {
 		}
 
 		err := node.sendBatch(messages)
-		assert.NoError(t, err)
+		assert.EqualError(t, err, "connect is not connected")
 	})
 
 	t.Run("EmptyBatch", func(t *testing.T) {
@@ -173,7 +173,7 @@ func TestBatchMessagePerformance(t *testing.T) {
 	encodeTime := time.Since(start)
 	require.NoError(t, err)
 
-	t.Logf("Encoded %d messages in %v (%.2f msg/ms)", 
+	t.Logf("Encoded %d messages in %v (%.2f msg/ms)",
 		messageCount, encodeTime, float64(messageCount)/float64(encodeTime.Milliseconds()))
 
 	// 测试解码性能
@@ -183,7 +183,7 @@ func TestBatchMessagePerformance(t *testing.T) {
 	decodeTime := time.Since(start)
 	require.NoError(t, err)
 
-	t.Logf("Decoded %d messages in %v (%.2f msg/ms)", 
+	t.Logf("Decoded %d messages in %v (%.2f msg/ms)",
 		messageCount, decodeTime, float64(messageCount)/float64(decodeTime.Milliseconds()))
 
 	// 验证解码正确性
@@ -195,11 +195,11 @@ func TestBatchMessagePerformance(t *testing.T) {
 func TestBatchMessageErrorHandling(t *testing.T) {
 	t.Run("InvalidData", func(t *testing.T) {
 		batchMsg := &proto.BatchMessage{}
-		
+
 		// 测试空数据
 		err := batchMsg.Decode([]byte{})
 		assert.Error(t, err)
-		
+
 		// 测试不完整数据
 		err = batchMsg.Decode([]byte{1, 2})
 		assert.Error(t, err)

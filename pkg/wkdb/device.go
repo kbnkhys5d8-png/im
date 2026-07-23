@@ -251,75 +251,75 @@ func (wk *wukongDB) SearchDevice(req DeviceSearchReq) ([]Device, error) {
 	}
 
 	allDevices := make([]Device, 0, req.Limit*len(wk.dbs))
-	for _, db := range wk.dbs {
-		devices := make([]Device, 0, req.Limit)
-		fnc := iterFnc(&devices)
+	indexedDevices := make([]Device, 0, req.Limit)
+	has, err := wk.searchDeviceByIndex(req, iterFnc(&indexedDevices))
+	if err != nil {
+		return nil, err
+	}
+	if has {
+		allDevices = append(allDevices, indexedDevices...)
+	} else {
+		for _, db := range wk.dbs {
+			devices := make([]Device, 0, req.Limit)
+			fnc := iterFnc(&devices)
 
-		has, err := wk.searchDeviceByIndex(req, fnc)
-		if err != nil {
-			return nil, err
-		}
-		if has { // 如果有触发索引，则无需全局查询
-			allDevices = append(allDevices, devices...)
-			continue
-		}
+			start := uint64(req.OffsetCreatedAt)
+			end := uint64(math.MaxUint64)
+			if req.OffsetCreatedAt > 0 {
+				if req.Pre {
+					start = uint64(req.OffsetCreatedAt + 1)
+					end = uint64(math.MaxUint64)
+				} else {
+					start = 0
+					end = uint64(req.OffsetCreatedAt)
+				}
+			}
 
-		start := uint64(req.OffsetCreatedAt)
-		end := uint64(math.MaxUint64)
-		if req.OffsetCreatedAt > 0 {
+			iter := db.NewIter(&pebble.IterOptions{
+				LowerBound: key.NewDeviceSecondIndexKey(key.TableDevice.SecondIndex.CreatedAt, start, 0),
+				UpperBound: key.NewDeviceSecondIndexKey(key.TableDevice.SecondIndex.CreatedAt, end, 0),
+			})
+			defer iter.Close()
+
+			var iterStepFnc func() bool
 			if req.Pre {
-				start = uint64(req.OffsetCreatedAt + 1)
-				end = uint64(math.MaxUint64)
+				if !iter.First() {
+					continue
+				}
+				iterStepFnc = iter.Next
 			} else {
-				start = 0
-				end = uint64(req.OffsetCreatedAt)
+				if !iter.Last() {
+					continue
+				}
+				iterStepFnc = iter.Prev
 			}
+
+			for ; iter.Valid(); iterStepFnc() {
+				_, id, err := key.ParseDeviceSecondIndexKey(iter.Key())
+				if err != nil {
+					return nil, err
+				}
+
+				dataIter := db.NewIter(&pebble.IterOptions{
+					LowerBound: key.NewDeviceColumnKey(id, key.MinColumnKey),
+					UpperBound: key.NewDeviceColumnKey(id, key.MaxColumnKey),
+				})
+				defer dataIter.Close()
+
+				var d Device
+				err = wk.iterDevice(dataIter, func(device Device) bool {
+					d = device
+					return false
+				})
+				if err != nil {
+					return nil, err
+				}
+				if !fnc(d) {
+					break
+				}
+			}
+			allDevices = append(allDevices, devices...)
 		}
-
-		iter := db.NewIter(&pebble.IterOptions{
-			LowerBound: key.NewDeviceSecondIndexKey(key.TableDevice.SecondIndex.CreatedAt, start, 0),
-			UpperBound: key.NewDeviceSecondIndexKey(key.TableDevice.SecondIndex.CreatedAt, end, 0),
-		})
-		defer iter.Close()
-
-		var iterStepFnc func() bool
-		if req.Pre {
-			if !iter.First() {
-				continue
-			}
-			iterStepFnc = iter.Next
-		} else {
-			if !iter.Last() {
-				continue
-			}
-			iterStepFnc = iter.Prev
-		}
-
-		for ; iter.Valid(); iterStepFnc() {
-			_, id, err := key.ParseDeviceSecondIndexKey(iter.Key())
-			if err != nil {
-				return nil, err
-			}
-
-			dataIter := db.NewIter(&pebble.IterOptions{
-				LowerBound: key.NewDeviceColumnKey(id, key.MinColumnKey),
-				UpperBound: key.NewDeviceColumnKey(id, key.MaxColumnKey),
-			})
-			defer dataIter.Close()
-
-			var d Device
-			err = wk.iterDevice(dataIter, func(device Device) bool {
-				d = device
-				return false
-			})
-			if err != nil {
-				return nil, err
-			}
-			if !fnc(d) {
-				break
-			}
-		}
-		allDevices = append(allDevices, devices...)
 	}
 	// 降序排序
 	sort.Slice(allDevices, func(i, j int) bool {

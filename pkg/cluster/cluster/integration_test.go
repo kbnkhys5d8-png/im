@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -344,6 +345,8 @@ func TestEndToEndScenario(t *testing.T) {
 
 	for i := 0; i < nodeCount; i++ {
 		nodes[i] = NewImprovedNode(uint64(i+1), "e2e-test", "127.0.0.1:8080", opts)
+		nodes[i].SetTestMode(true)
+		nodes[i].stopper.RunWorker(nodes[i].processMessages)
 		defer nodes[i].Stop()
 	}
 
@@ -352,7 +355,7 @@ func TestEndToEndScenario(t *testing.T) {
 	defer cancel()
 
 	var wg sync.WaitGroup
-	var totalSent, totalErrors int64
+	var totalSent, totalErrors atomic.Int64
 
 	// 启动多个发送者
 	for i := 0; i < 10; i++ {
@@ -384,9 +387,9 @@ func TestEndToEndScenario(t *testing.T) {
 					}
 
 					if err != nil {
-						totalErrors++
+						totalErrors.Add(1)
 					} else {
-						totalSent++
+						totalSent.Add(1)
 					}
 				}
 			}
@@ -412,15 +415,18 @@ func TestEndToEndScenario(t *testing.T) {
 			stats["queue_total_expanded"].(uint64))
 	}
 
+	sent := totalSent.Load()
+	errors := totalErrors.Load()
+
 	// 验证端到端性能
-	assert.Greater(t, totalSent, int64(1500), "Should send most messages successfully")
-	assert.Less(t, float64(totalErrors)/float64(totalSent+totalErrors), 0.1, "Error rate should be < 10%")
+	assert.Greater(t, sent, int64(1500), "Should send most messages successfully")
+	assert.Less(t, float64(errors)/float64(sent+errors), 0.1, "Error rate should be < 10%")
 	assert.Greater(t, aggregatedStats["total_sent"], uint64(1500), "Aggregated sent count should be high")
 
 	t.Logf("End-to-end results:")
-	t.Logf("  Total sent: %d", totalSent)
-	t.Logf("  Total errors: %d", totalErrors)
-	t.Logf("  Error rate: %.2f%%", float64(totalErrors)/float64(totalSent+totalErrors)*100)
+	t.Logf("  Total sent: %d", sent)
+	t.Logf("  Total errors: %d", errors)
+	t.Logf("  Error rate: %.2f%%", float64(errors)/float64(sent+errors)*100)
 	t.Logf("  Queue expansions: %d", aggregatedStats["queue_expansions"])
 	t.Logf("  Backpressure events: %d", aggregatedStats["total_backpressure"])
 }

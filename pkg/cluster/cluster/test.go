@@ -30,11 +30,23 @@ func newThreeBootstrap(t *testing.T) (*Server, *Server, *Server) {
 	opts1 := newTestOptions(t, 1, map[uint64]string{1: "127.0.0.1:11111", 2: "127.0.0.1:11112", 3: "127.0.0.1:11113"}, clusterconfig.WithPongMaxTick(5), clusterconfig.WithApiServerAddr("http://test1.com"))
 	opts2 := newTestOptions(t, 2, map[uint64]string{1: "127.0.0.1:11111", 2: "127.0.0.1:11112", 3: "127.0.0.1:11113"}, clusterconfig.WithPongMaxTick(5), clusterconfig.WithApiServerAddr("http://test2.com"))
 	opts3 := newTestOptions(t, 3, map[uint64]string{1: "127.0.0.1:11111", 2: "127.0.0.1:11112", 3: "127.0.0.1:11113"}, clusterconfig.WithPongMaxTick(5), clusterconfig.WithApiServerAddr("http://test3.com"))
-	s1 := New(NewOptions(WithAddr("127.0.0.1:11111"), WithConfigOptions(opts1), WithDataDir(fmt.Sprintf("%s/%d", t.TempDir(), 1))))
-	s2 := New(NewOptions(WithAddr("127.0.0.1:11112"), WithConfigOptions(opts2), WithDataDir(fmt.Sprintf("%s/%d", t.TempDir(), 2))))
-	s3 := New(NewOptions(WithAddr("127.0.0.1:11113"), WithConfigOptions(opts3), WithDataDir(fmt.Sprintf("%s/%d", t.TempDir(), 3))))
+	s1 := New(NewOptions(WithAddr("tcp://127.0.0.1:11111"), WithConfigOptions(opts1), WithDataDir(fmt.Sprintf("%s/%d", t.TempDir(), 1))))
+	s2 := New(NewOptions(WithAddr("tcp://127.0.0.1:11112"), WithConfigOptions(opts2), WithDataDir(fmt.Sprintf("%s/%d", t.TempDir(), 2))))
+	s3 := New(NewOptions(WithAddr("tcp://127.0.0.1:11113"), WithConfigOptions(opts3), WithDataDir(fmt.Sprintf("%s/%d", t.TempDir(), 3))))
 
 	return s1, s2, s3
+}
+
+func restartTestServer(stopped *Server) *Server {
+	configOptions := *stopped.opts.ConfigOptions
+	configOptions.Transport = nil
+
+	options := *stopped.opts
+	options.ConfigOptions = &configOptions
+	options.SlotTransport = nil
+	options.ChannelTransport = nil
+
+	return New(&options)
 }
 
 func newTestOptions(t *testing.T, nodeId uint64, initNode map[uint64]string, opt ...clusterconfig.Option) *clusterconfig.Options {

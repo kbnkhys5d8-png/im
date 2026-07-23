@@ -93,27 +93,31 @@ func TestSingleSendMessage(t *testing.T) {
 	cli1 := client.New(s.opts.External.TCPAddr, client.WithUID("test1"))
 	err = cli1.Connect()
 	assert.Nil(t, err)
+	defer cli1.Close()
 
 	// new client 2
 	cli2 := client.New(s.opts.External.TCPAddr, client.WithUID("test2"))
 	err = cli2.Connect()
 	assert.Nil(t, err)
+	defer cli2.Close()
+
+	// cli2 recv
+	recvDone := make(chan struct{}, 1)
+	cli2.SetOnRecv(func(recv *wkproto.RecvPacket) error {
+		assert.Equal(t, "hello", string(recv.Payload))
+		recvDone <- struct{}{}
+		return nil
+	})
 
 	// send message
 	err = cli1.SendMessage(client.NewChannel("test2", 1), []byte("hello"))
 	assert.Nil(t, err)
 
-	var wait sync.WaitGroup
-	wait.Add(1)
-
-	// cli2 recv
-	cli2.SetOnRecv(func(recv *wkproto.RecvPacket) error {
-		assert.Equal(t, "hello", string(recv.Payload))
-		wait.Done()
-		return nil
-	})
-
-	wait.Wait()
+	select {
+	case <-recvDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for the recipient to receive the message")
+	}
 }
 
 // --- New JSON-RPC Test Cases ---
@@ -738,4 +742,3 @@ func TestClusterSaveClusterConfig(t *testing.T) {
 	})
 	assert.Nil(t, err)
 }
-

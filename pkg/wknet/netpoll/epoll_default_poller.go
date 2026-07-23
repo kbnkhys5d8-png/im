@@ -81,11 +81,10 @@ func (p *Poller) Polling(callback func(fd int, event PollEvent) error) error {
 			triggerHup = evt.Events&(unix.EPOLLHUP|unix.EPOLLRDHUP) != 0
 			triggerError = evt.Events&unix.EPOLLERR != 0
 
-			if triggerHup || triggerError {
-				pollEvent = PollEventClose
-			} else if triggerRead {
+			if triggerRead {
 				pollEvent = PollEventRead
-
+			} else if triggerHup || triggerError {
+				pollEvent = PollEventClose
 			}
 			if pollEvent != PollEventUnknown {
 				switch err = callback(int(fd), pollEvent); err {

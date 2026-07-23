@@ -49,6 +49,7 @@ var (
 	ErrCircuitBreakerNotReady       error = fmt.Errorf("circuit breaker not ready")
 	ErrRateLimited                        = fmt.Errorf("rate limited")
 	ErrChanIsFull                         = fmt.Errorf("channel is full")
+	ErrQueueClosed                        = fmt.Errorf("queue is closed")
 )
 
 // // 频道分布式配置

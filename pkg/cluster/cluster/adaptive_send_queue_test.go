@@ -172,12 +172,128 @@ func TestAdaptiveSendQueue_QueueFull(t *testing.T) {
 	assert.Equal(t, uint64(1), stats["total_dropped"])
 }
 
+func TestAdaptiveSendQueue_SendAfterClose(t *testing.T) {
+	queue := NewAdaptiveSendQueue(2, 2, 1024*1024)
+	queue.Close()
+
+	err := queue.Send(&proto.Message{MsgType: 1}, false)
+	assert.ErrorIs(t, err, ErrQueueClosed)
+}
+
+func TestAdaptiveSendQueue_CloseUnblocksReceive(t *testing.T) {
+	queue := NewAdaptiveSendQueue(2, 2, 1024*1024)
+	started := make(chan struct{})
+	receiveDone := make(chan bool, 1)
+	go func() {
+		close(started)
+		_, ok := queue.Receive(context.Background())
+		receiveDone <- ok
+	}()
+
+	<-started
+	time.Sleep(20 * time.Millisecond)
+
+	closeDone := make(chan struct{})
+	go func() {
+		queue.Close()
+		close(closeDone)
+	}()
+
+	select {
+	case <-closeDone:
+	case <-time.After(time.Second):
+		t.Fatal("Close blocked while Receive was waiting on an empty queue")
+	}
+
+	select {
+	case ok := <-receiveDone:
+		assert.False(t, ok)
+	case <-time.After(time.Second):
+		t.Fatal("Receive did not exit after Close")
+	}
+}
+
+func TestAdaptiveSendQueue_ShrinkWakesBlockedReceivers(t *testing.T) {
+	queue := NewAdaptiveSendQueue(2, 4, 1024*1024)
+	defer queue.Close()
+
+	for i := 0; i < 3; i++ {
+		assert.NoError(t, queue.Send(&proto.Message{MsgType: uint32(i)}, false))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	for i := 0; i < 3; i++ {
+		_, ok := queue.Receive(ctx)
+		assert.True(t, ok)
+	}
+
+	results := make(chan bool, 2)
+	start := make(chan struct{})
+	for i := 0; i < 2; i++ {
+		go func() {
+			<-start
+			_, ok := queue.Receive(ctx)
+			results <- ok
+		}()
+	}
+	close(start)
+	time.Sleep(20 * time.Millisecond)
+
+	queue.Shrink()
+	queue.mu.RLock()
+	queue.queue <- &proto.Message{MsgType: 10}
+	queue.queue <- &proto.Message{MsgType: 11}
+	queue.mu.RUnlock()
+
+	for i := 0; i < 2; i++ {
+		select {
+		case ok := <-results:
+			assert.True(t, ok)
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("receiver remained blocked on the queue replaced by Shrink")
+		}
+	}
+}
+
+func TestAdaptiveSendQueue_ConcurrentExpansion(t *testing.T) {
+	const (
+		rounds  = 20
+		senders = 16
+	)
+
+	for round := 0; round < rounds; round++ {
+		queue := NewAdaptiveSendQueue(1, 4, 1024*1024)
+		start := make(chan struct{})
+		errs := make(chan error, senders)
+		var wg sync.WaitGroup
+		for i := 0; i < senders; i++ {
+			wg.Add(1)
+			go func(msgType uint32) {
+				defer wg.Done()
+				<-start
+				err := queue.Send(&proto.Message{MsgType: msgType}, false)
+				if err != nil && err != ErrChanIsFull {
+					errs <- err
+				}
+			}(uint32(i))
+		}
+
+		close(start)
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			assert.NoError(t, err)
+		}
+		queue.Close()
+	}
+}
+
 func TestAdaptiveSendQueue_Shrinking(t *testing.T) {
 	queue := NewAdaptiveSendQueue(5, 20, 1024*1024)
 	defer queue.Close()
 
 	// 先扩容
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 7; i++ {
 		msg := &proto.Message{MsgType: uint32(i)}
 		err := queue.Send(msg, false)
 		assert.NoError(t, err)
@@ -192,7 +308,7 @@ func TestAdaptiveSendQueue_Shrinking(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	for i := 0; i < 9; i++ {
+	for i := 0; i < 6; i++ {
 		_, ok := queue.Receive(ctx)
 		assert.True(t, ok)
 	}

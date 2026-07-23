@@ -86,6 +86,8 @@ func TestImprovedNode_Backpressure(t *testing.T) {
 
 	node := NewImprovedNode(1, "test-uid", "127.0.0.1:8080", opts)
 	defer node.Stop()
+	node.backpressure.slowDownThreshold = 0.2
+	node.backpressure.blockThreshold = 0.3
 
 	// 不启动消息处理，让队列积压
 	// node.Start() // 不调用Start，消息不会被处理
@@ -234,10 +236,10 @@ func TestImprovedNode_BackpressureStrategies(t *testing.T) {
 	defer node.Stop()
 
 	// 测试背压阈值
-	node.backpressure.slowDownThreshold = 0.5 // 50%时减速
+	node.backpressure.slowDownThreshold = 0.1 // 最大容量为40，积压5条后超过10%
 	node.backpressure.blockThreshold = 0.8    // 80%时阻塞
 
-	// 填充队列到50%
+	// 填充到超过减速阈值
 	for i := 0; i < 5; i++ {
 		msg := &proto.Message{MsgType: uint32(i)}
 		err := node.Send(msg)

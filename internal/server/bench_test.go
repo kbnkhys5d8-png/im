@@ -356,10 +356,10 @@ func TestClusterBenchNode2(t *testing.T) {
 
 // clusterPair holds references to the two-node cluster.
 type clusterPair struct {
-	s1       *Server      // in-process node
-	node2cmd *exec.Cmd    // subprocess node
-	addr1    string       // s1 TCP address
-	addr2    string       // s2 TCP address (subprocess)
+	s1       *Server   // in-process node
+	node2cmd *exec.Cmd // subprocess node
+	addr1    string    // s1 TCP address
+	addr2    string    // s2 TCP address (subprocess)
 }
 
 // newBenchCluster creates a 2-node cluster: node 1 in-process, node 2 as subprocess.
@@ -405,6 +405,10 @@ func newBenchCluster(b *testing.B) *clusterPair {
 		envInitNode2+"="+node2Str,
 	)
 	cmd.Stderr = os.Stderr // forward logs
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		b.Fatalf("stdin pipe: %v", err)
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		b.Fatalf("stdout pipe: %v", err)
@@ -417,10 +421,11 @@ func newBenchCluster(b *testing.B) *clusterPair {
 	readyCh := make(chan struct{})
 	go func() {
 		scanner := bufio.NewScanner(stdout)
+		ready := false
 		for scanner.Scan() {
-			if scanner.Text() == "READY" {
+			if !ready && scanner.Text() == "READY" {
 				close(readyCh)
-				return
+				ready = true
 			}
 		}
 	}()
@@ -457,6 +462,7 @@ func newBenchCluster(b *testing.B) *clusterPair {
 
 	b.Cleanup(func() {
 		s1.StopNoErr()
+		stdin.Close()
 		cmd.Process.Kill()
 		cmd.Wait()
 	})

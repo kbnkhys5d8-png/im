@@ -84,10 +84,10 @@ func (p *Poller) Polling(callback func(fd int, event PollEvent) error) error {
 				if evt.Flags&syscall.EV_DELETE > 0 {
 					continue
 				}
-				if triggerHup {
-					pollEvent = PollEventClose
-				} else if triggerRead {
+				if triggerRead {
 					pollEvent = PollEventRead
+				} else if triggerHup {
+					pollEvent = PollEventClose
 				}
 				if pollEvent != PollEventUnknown {
 					switch err = callback(fd, pollEvent); err {

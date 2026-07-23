@@ -30,6 +30,8 @@ type acceptor struct {
 	tcpRealListenAddr net.Addr  // tcp real listen addr
 	wsRealListenAddr  net.Addr  // websocket real listen addr
 
+	runWG sync.WaitGroup
+
 	wklog.Log
 }
 
@@ -67,7 +69,9 @@ func (a *acceptor) start() error {
 	var wg = &sync.WaitGroup{}
 
 	wg.Add(1)
+	a.runWG.Add(1)
 	go func() {
+		defer a.runWG.Done()
 		err := a.initTCPListener(wg)
 		if err != nil {
 			a.Panic("initTCPListener() failed", zap.Error(err))
@@ -76,7 +80,9 @@ func (a *acceptor) start() error {
 
 	if strings.TrimSpace(a.eg.options.WsAddr) != "" {
 		wg.Add(1)
+		a.runWG.Add(1)
 		go func() {
+			defer a.runWG.Done()
 			err := a.initWSListener(wg)
 			if err != nil {
 				a.Panic("initWSListener() failed", zap.Error(err))
@@ -85,7 +91,9 @@ func (a *acceptor) start() error {
 	}
 	if strings.TrimSpace(a.eg.options.WssAddr) != "" {
 		wg.Add(1)
+		a.runWG.Add(1)
 		go func() {
+			defer a.runWG.Done()
 			err := a.initWSSListener(wg)
 			if err != nil {
 				a.Panic("initWSSListener() failed", zap.Error(err))
@@ -143,6 +151,7 @@ func (a *acceptor) Stop() error {
 			a.Warn("reactorSub.Stop() failed", zap.Error(err))
 		}
 	}
+	a.runWG.Wait()
 
 	return nil
 }
@@ -238,15 +247,15 @@ func (a *acceptor) acceptConn(listenFd int, ws bool, wss bool) error {
 			return err
 		}
 	}
-	// add conn to sub reactor
-	err = subReactor.AddConn(conn)
-	if err != nil {
-		a.Warn("subReactor.AddConn() failed", zap.Error(err))
-	}
 	// call on connect
 	err = a.eg.eventHandler.OnConnect(conn)
 	if err != nil {
 		a.Warn("OnConnect() failed", zap.Error(err))
+	}
+	// Register read events only after OnConnect has initialized the connection.
+	err = subReactor.AddConn(conn)
+	if err != nil {
+		a.Warn("subReactor.AddConn() failed", zap.Error(err))
 	}
 
 	return nil

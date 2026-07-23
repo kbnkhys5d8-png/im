@@ -148,6 +148,10 @@ func (c *Client) Send(m *proto.Message) error {
 
 // 批量发送
 func (c *Client) BatchSend(msgs []*proto.Message) error {
+	if c.conn().status.Load() != authed {
+		return errors.New("connect is not connected")
+	}
+
 	// 多条消息时，合并成批量消息发送
 	batchMsg := &proto.BatchMessage{
 		Messages: msgs,

@@ -1,6 +1,7 @@
 package wkserver_test
 
 import (
+	"net"
 	"testing"
 	"time"
 
@@ -12,9 +13,18 @@ import (
 	"go.etcd.io/raft/v3/raftpb"
 )
 
+func freeTCPAddr(t testing.TB) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	assert.NoError(t, err)
+	addr := listener.Addr().String()
+	assert.NoError(t, listener.Close())
+	return "tcp://" + addr
+}
+
 func TestServerRoute(t *testing.T) {
 
-	addr := "tcp://127.0.0.1:10000"
+	addr := freeTCPAddr(t)
 	s := wkserver.New(addr)
 	s.Route("/test", func(c *wkserver.Context) {
 		c.Write([]byte("test2"))
@@ -44,7 +54,7 @@ func TestServerRoute(t *testing.T) {
 }
 
 func TestServerOnMessage(t *testing.T) {
-	addr := "tcp://:10001"
+	addr := freeTCPAddr(t)
 	s := wkserver.New(addr)
 
 	recvMsg := make(chan *proto.Message, 1)
@@ -94,7 +104,7 @@ func TestServerOnMessage(t *testing.T) {
 }
 
 func TestReconnect(t *testing.T) {
-	addr := "tcp://127.0.0.1:10000"
+	addr := freeTCPAddr(t)
 	s := wkserver.New(addr)
 	err := s.Start()
 	assert.NoError(t, err)
@@ -105,15 +115,11 @@ func TestReconnect(t *testing.T) {
 	assert.NoError(t, err)
 	defer cli.Stop()
 
-	time.Sleep(time.Millisecond * 200)
-
-	assert.Equal(t, true, cli.IsAuthed())
+	assert.Eventually(t, cli.IsAuthed, 5*time.Second, 10*time.Millisecond)
 
 	cli.CloseConn()
 
-	assert.Equal(t, false, cli.IsAuthed())
+	assert.False(t, cli.IsAuthed())
 
-	time.Sleep(time.Millisecond * 200)
-
-	assert.Equal(t, true, cli.IsAuthed())
+	assert.Eventually(t, cli.IsAuthed, 5*time.Second, 10*time.Millisecond)
 }

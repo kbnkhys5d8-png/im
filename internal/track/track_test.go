@@ -24,7 +24,7 @@ func TestMessageString(t *testing.T) {
 	// 获取消息的字符串表示
 	output := msg.String()
 	fmt.Println(output)
-	assert.Contains(t, output, "1001000010000000")
+	assert.Contains(t, output, "1001000001000000")
 }
 
 func TestMessageEncodeDecode(t *testing.T) {

@@ -52,7 +52,7 @@ func NewConversationCache(maxCacheSize int) *ConversationCache {
 	return &ConversationCache{
 		lastConversationsCache: lastConversationsCache,
 		maxCacheSize:           maxCacheSize,
-		cacheTTL:               10 * time.Minute, // 缓存2分钟
+		cacheTTL:               10 * time.Minute, // 缓存10分钟
 		Log:                    wklog.NewWKLog("ConversationCache"),
 	}
 }
@@ -166,11 +166,11 @@ func (c *ConversationCache) updateUserConversationsInCache(uid string, updatedCo
 				}
 			}
 
-			// 检查是否有新增的会话（在updatedMap中剩余的）
-			// 将新增的会话添加到缓存中
-			for _, newConv := range updatedMap {
-				newConversations = append(newConversations, newConv)
-				updated = true
+			// 缓存外的会话可能不满足当前查询的类型、时间、排除条件或
+			// limit。无法安全地把它追加到现有分页结果，只能使该查询失效。
+			if len(updatedMap) > 0 {
+				c.lastConversationsCache.Remove(key)
+				continue
 			}
 
 			// 如果有更新，重新缓存

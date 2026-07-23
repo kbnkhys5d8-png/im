@@ -7,6 +7,8 @@ import (
 
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/trace"
+	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
+	"go.uber.org/zap"
 )
 
 func (s *Server) GetSlotId(v string) uint32 {
@@ -113,30 +115,46 @@ func (s *Server) ProposeUntilAppliedTimeoutForLocal(ctx context.Context, slotId 
 }
 
 func (s *Server) MustWaitAllSlotsReady(timeout time.Duration) {
-	tk := time.NewTicker(time.Millisecond * 10)
-	defer tk.Stop()
 	timeoutCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
 	for {
 		select {
-		case <-tk.C:
+		case <-ticker.C:
 			slots := s.opts.Node.Slots()
-			if len(slots) > 0 {
-				notReady := false
-				for _, st := range slots {
-					if st.Leader == 0 {
-						notReady = true
-						break
-					}
-				}
-				if !notReady {
-					return
-				}
+			slotCount := s.opts.Node.SlotCount()
+			if slotCount == 0 {
+				slotCount = s.opts.SlotCount
+			}
+			if len(slots) != int(slotCount) {
+				continue
+			}
 
+			ready := true
+			for _, slotConfig := range slots {
+				if slotConfig.Leader == 0 {
+					ready = false
+					break
+				}
+				isLocal := wkutil.ArrayContainsUint64(slotConfig.Replicas, s.opts.NodeId) ||
+					wkutil.ArrayContainsUint64(slotConfig.Learners, s.opts.NodeId)
+				if !isLocal {
+					continue
+				}
+				slotRaft := s.raftGroup.GetRaft(SlotIdToKey(slotConfig.Id))
+				if slotRaft == nil || slotRaft.LeaderId() == 0 {
+					ready = false
+					break
+				}
+			}
+			if ready {
+				return
 			}
 		case <-timeoutCtx.Done():
-			s.Panic("wait all slots ready timeout")
+			s.Panic("wait all slots ready timeout", zap.Error(timeoutCtx.Err()))
 			return
 		}
 	}

@@ -31,10 +31,10 @@ func TestAddPluginUsers(t *testing.T) {
 	err = d.AddOrUpdatePluginUsers(pluginUsers)
 	assert.NoError(t, err)
 
-	resultUids, err := d.GetPluginUsers(pluginNo)
+	resultUsers, err := d.GetPluginUsers(pluginNo)
 	assert.NoError(t, err)
 
-	assert.ElementsMatch(t, uids, resultUids)
+	assert.ElementsMatch(t, pluginUsers, resultUsers)
 
 }
 
@@ -62,10 +62,10 @@ func TestRemovePluginUser(t *testing.T) {
 	err = d.RemovePluginUser(pluginNo, uid)
 	assert.NoError(t, err)
 
-	resultUids, err := d.GetPluginUsers(pluginNo)
+	resultUsers, err := d.GetPluginUsers(pluginNo)
 	assert.NoError(t, err)
 
-	assert.Len(t, resultUids, 0)
+	assert.Len(t, resultUsers, 0)
 }
 
 func TestGetPluginUsers(t *testing.T) {
@@ -92,10 +92,10 @@ func TestGetPluginUsers(t *testing.T) {
 	err = d.AddOrUpdatePluginUsers(pluginUsers)
 	assert.NoError(t, err)
 
-	resultUids, err := d.GetPluginUsers(pluginNo)
+	resultUsers, err := d.GetPluginUsers(pluginNo)
 	assert.NoError(t, err)
 
-	assert.ElementsMatch(t, uids, resultUids)
+	assert.ElementsMatch(t, pluginUsers, resultUsers)
 }
 
 func TestGetHighestPriorityPluginByUid(t *testing.T) {

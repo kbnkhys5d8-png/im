@@ -2,8 +2,8 @@ package wknet
 
 import (
 	"bufio"
+	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -22,7 +22,6 @@ func TestEngine(t *testing.T) {
 
 	timeoutCtx, cancel := context.WithTimeout(context.Background(), time.Second*5)
 	defer cancel()
-	finishChan := make(chan struct{})
 	clientCount := 100
 	clientMsgCount := 5
 
@@ -30,26 +29,25 @@ func TestEngine(t *testing.T) {
 
 	wg.Add(clientCount * clientMsgCount)
 
-	go func() {
-		<-timeoutCtx.Done()
-		assert.NoError(t, errors.New("timeout"))
-		finishChan <- struct{}{}
-
-	}()
-
+	done := make(chan struct{})
 	go func() {
 		wg.Wait()
-		finishChan <- struct{}{}
+		close(done)
 	}()
 
 	e.OnData(func(conn Conn) error {
 		buffs, err := conn.Peek(-1)
-		conn.Discard(len(buffs))
+		assert.NoError(t, err)
+		lastNewline := bytes.LastIndexByte(buffs, '\n')
+		if lastNewline < 0 {
+			return nil
+		}
 
-		buffStrs := strings.Split(string(buffs), "\n")
-		for i := 0; i < len(buffStrs); i++ {
-			buff := buffStrs[i]
-			assert.NoError(t, err)
+		complete := buffs[:lastNewline+1]
+		_, err = conn.Discard(len(complete))
+		assert.NoError(t, err)
+		buffStrs := strings.Split(strings.TrimSuffix(string(complete), "\n"), "\n")
+		for _, buff := range buffStrs {
 			value := buff
 			values := strings.Split(value, " ")
 			cmd := values[0]
@@ -65,7 +63,7 @@ func TestEngine(t *testing.T) {
 				}
 			} else if cmd == "send" {
 				go func(c Conn, p []string) {
-					assert.Equal(t, param[0], c.UID())
+					assert.Equal(t, p[0], c.UID())
 					wg.Done()
 
 				}(conn, param)
@@ -93,6 +91,9 @@ func TestEngine(t *testing.T) {
 			}
 		}(cli)
 	}
-	// fmt.Println("finishChan wait")
-	<-finishChan
+	select {
+	case <-done:
+	case <-timeoutCtx.Done():
+		t.Fatal("timed out waiting for engine messages")
+	}
 }

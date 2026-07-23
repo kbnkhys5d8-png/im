@@ -1,8 +1,11 @@
 package api
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/options"
 	"github.com/WuKongIM/WuKongIM/internal/plugin"
@@ -18,9 +21,10 @@ import (
 )
 
 type apiServer struct {
-	r    *wkhttp.WKHttp
-	addr string
-	s    *Server
+	r          *wkhttp.WKHttp
+	addr       string
+	s          *Server
+	httpServer *http.Server
 	wklog.Log
 }
 
@@ -66,18 +70,31 @@ func (s *apiServer) start() {
 	s.r.Use(bandwidthMiddleware())
 
 	s.setRoutes()
-	go func() {
-		err := s.r.Run(s.addr) // listen and serve
-		if err != nil {
+	s.httpServer = &http.Server{
+		Addr:    s.addr,
+		Handler: s.r,
+	}
+	go func(server *http.Server) {
+		err := server.ListenAndServe()
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			panic(err)
 		}
-	}()
+	}(s.httpServer)
 	s.Info("ApiServer started", zap.String("addr", s.addr))
 }
 
 // Stop 停止服务
 func (s *apiServer) stop() {
 	s.Debug("stop...")
+	if s.httpServer == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.httpServer.Shutdown(ctx); err != nil {
+		s.Warn("ApiServer shutdown failed", zap.Error(err))
+	}
 }
 
 func (s *apiServer) setRoutes() {

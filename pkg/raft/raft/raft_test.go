@@ -8,6 +8,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/raft/raft"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestElection(t *testing.T) {
@@ -292,41 +293,41 @@ func TestLogConflict2(t *testing.T) {
 }
 
 func TestProposeUntilApplied(t *testing.T) {
-	raft1, raft2, raft3 := newThreeRaft()
+	raft1, raft2, raft3 := newThreeRaft(raft.WithElectionOn(false))
 	err := raft1.Start()
-	assert.Nil(t, err)
+	require.NoError(t, err)
 
 	err = raft2.Start()
-	assert.Nil(t, err)
+	require.NoError(t, err)
 
 	err = raft3.Start()
-	assert.Nil(t, err)
+	require.NoError(t, err)
 
 	defer raft1.Stop()
 	defer raft2.Stop()
 	defer raft3.Stop()
 
-	waitBecomeLeader(raft1, raft2, raft3)
+	raft1.BecomeLeader(1)
+	raft2.BecomeFollower(1, 1)
+	raft3.BecomeFollower(1, 1)
 
-	leader := getLeader(raft1, raft2, raft3)
-
-	_, err = leader.ProposeUntilApplied(1, []byte("test"))
-	assert.Nil(t, err)
+	_, err = raft1.ProposeUntilApplied(1, []byte("test"))
+	require.NoError(t, err)
 
 	// Wait for all nodes to commit and replicate
 	timeoutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	raft1.WaitUtilCommit(timeoutCtx, 1)
-	raft2.WaitUtilCommit(timeoutCtx, 1)
-	raft3.WaitUtilCommit(timeoutCtx, 1)
+	require.NoError(t, raft1.WaitUtilCommit(timeoutCtx, 1))
+	require.NoError(t, raft2.WaitUtilCommit(timeoutCtx, 1))
+	require.NoError(t, raft3.WaitUtilCommit(timeoutCtx, 1))
 
 	node1Logs := raft1.Options().Storage.(*testStorage).logs
 	node2Logs := raft2.Options().Storage.(*testStorage).logs
 	node3Logs := raft3.Options().Storage.(*testStorage).logs
 
-	assert.Equal(t, 1, len(node1Logs))
-	assert.Equal(t, 1, len(node2Logs))
-	assert.Equal(t, 1, len(node3Logs))
+	require.Len(t, node1Logs, 1)
+	require.Len(t, node2Logs, 1)
+	require.Len(t, node3Logs, 1)
 
 	assert.Equal(t, node1Logs[0].Index, node2Logs[0].Index, node3Logs[0].Index)
 	assert.Equal(t, node1Logs[0].Data, node2Logs[0].Data, node3Logs[0].Data)
@@ -467,17 +468,19 @@ func getLeader(rr ...*raft.Raft) *raft.Raft {
 	return nil
 }
 
-func newThreeRaft() (*raft.Raft, *raft.Raft, *raft.Raft) {
+func newThreeRaft(opt ...raft.Option) (*raft.Raft, *raft.Raft, *raft.Raft) {
+	defaultOpts := append([]raft.Option{raft.WithElectionOn(true)}, opt...)
+
 	// node1
-	opts1 := newTestOptions(1, []uint64{1, 2, 3}, raft.WithElectionOn(true))
+	opts1 := newTestOptions(1, []uint64{1, 2, 3}, defaultOpts...)
 	raft1 := raft.New(opts1)
 
 	// node2
-	opts2 := newTestOptions(2, []uint64{1, 2, 3}, raft.WithElectionOn(true))
+	opts2 := newTestOptions(2, []uint64{1, 2, 3}, defaultOpts...)
 	raft2 := raft.New(opts2)
 
 	// node3
-	opts3 := newTestOptions(3, []uint64{1, 2, 3}, raft.WithElectionOn(true))
+	opts3 := newTestOptions(3, []uint64{1, 2, 3}, defaultOpts...)
 	raft3 := raft.New(opts3)
 
 	tt := &testTransport{

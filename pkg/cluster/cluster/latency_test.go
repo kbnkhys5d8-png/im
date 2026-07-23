@@ -26,6 +26,8 @@ func TestProcessBatchLatency(t *testing.T) {
 
 	// 测试单个消息的处理延迟
 	t.Run("SingleMessageLatency", func(t *testing.T) {
+		initialSent := node.GetStats()["perf_total_sent"].(uint64)
+		targetSent := initialSent + 2 // 入队一次，测试模式处理完成再记一次
 		start := time.Now()
 
 		msg := &proto.Message{MsgType: 1}
@@ -43,7 +45,7 @@ func TestProcessBatchLatency(t *testing.T) {
 				t.Fatal("Message processing timeout")
 			case <-ticker.C:
 				stats := node.GetStats()
-				if stats["perf_total_sent"].(uint64) > 0 {
+				if stats["perf_total_sent"].(uint64) >= targetSent {
 					latency := time.Since(start)
 					t.Logf("Single message processing latency: %v", latency)
 
@@ -59,6 +61,8 @@ func TestProcessBatchLatency(t *testing.T) {
 	// 测试批量消息的处理延迟
 	t.Run("BatchMessageLatency", func(t *testing.T) {
 		messageCount := 10
+		initialSent := node.GetStats()["perf_total_sent"].(uint64)
+		targetSent := initialSent + uint64(messageCount*2)
 		start := time.Now()
 
 		// 发送多个消息
@@ -72,9 +76,6 @@ func TestProcessBatchLatency(t *testing.T) {
 		timeout := time.After(time.Second * 3)
 		ticker := time.NewTicker(time.Millisecond * 10)
 		defer ticker.Stop()
-
-		initialSent := node.GetStats()["perf_total_sent"].(uint64)
-		targetSent := initialSent + uint64(messageCount)
 
 		for {
 			select {
@@ -103,6 +104,8 @@ func TestProcessBatchLatency(t *testing.T) {
 		latencies := make([]time.Duration, messageCount)
 
 		for i := 0; i < messageCount; i++ {
+			initialSent := node.GetStats()["perf_total_sent"].(uint64)
+			targetSent := initialSent + 2
 			start := time.Now()
 
 			msg := &proto.Message{MsgType: uint32(i + 200)}
@@ -113,8 +116,6 @@ func TestProcessBatchLatency(t *testing.T) {
 			timeout := time.After(time.Second)
 			ticker := time.NewTicker(time.Millisecond * 5)
 
-			initialSent := node.GetStats()["perf_total_sent"].(uint64)
-
 		waitLoop:
 			for {
 				select {
@@ -123,7 +124,7 @@ func TestProcessBatchLatency(t *testing.T) {
 				case <-ticker.C:
 					stats := node.GetStats()
 					currentSent := stats["perf_total_sent"].(uint64)
-					if currentSent > initialSent {
+					if currentSent >= targetSent {
 						latencies[i] = time.Since(start)
 						break waitLoop
 					}

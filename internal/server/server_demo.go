@@ -1,10 +1,13 @@
 package server
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/wkhttp"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
@@ -15,9 +18,10 @@ import (
 )
 
 type DemoServer struct {
-	r    *wkhttp.WKHttp
-	addr string
-	s    *Server
+	r          *wkhttp.WKHttp
+	addr       string
+	s          *Server
+	httpServer *http.Server
 	wklog.Log
 }
 
@@ -60,12 +64,16 @@ func (s *DemoServer) Start() {
 	s.r.GetGinRoute().StaticFS("/chatdemo", http.FS(st))
 
 	s.setRoutes()
-	go func() {
-		err := s.r.Run(s.addr) // listen and serve
-		if err != nil {
+	s.httpServer = &http.Server{
+		Addr:    s.addr,
+		Handler: s.r,
+	}
+	go func(server *http.Server) {
+		err := server.ListenAndServe()
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			panic(err)
 		}
-	}()
+	}(s.httpServer)
 	s.Info("Demo server started", zap.String("addr", s.addr))
 
 	_, port := parseAddr(s.addr)
@@ -74,6 +82,15 @@ func (s *DemoServer) Start() {
 
 // Stop 停止服务
 func (s *DemoServer) Stop() {
+	if s.httpServer == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.httpServer.Shutdown(ctx); err != nil {
+		s.Warn("Demo server shutdown failed", zap.Error(err))
+	}
 }
 
 func (s *DemoServer) setRoutes() {

@@ -364,7 +364,6 @@ func (d *DefaultConn) SetWriteDeadline(t time.Time) error {
 func (d *DefaultConn) release() {
 
 	d.Debug("release connection")
-	d.fd = NetFd{}
 	d.maxIdle = 0
 	if d.idleTimer != nil {
 		d.idleTimer.Stop()
@@ -638,6 +637,18 @@ type TLSConn struct {
 	tmpInboundBuffer InboundBuffer // inboundBuffer InboundBuffer
 }
 
+type readErrorWithData struct {
+	err error
+}
+
+func (e *readErrorWithData) Error() string {
+	return e.err.Error()
+}
+
+func (e *readErrorWithData) Unwrap() error {
+	return e.err
+}
+
 func newTLSConn(d *DefaultConn) *TLSConn {
 
 	return &TLSConn{
@@ -661,20 +672,25 @@ func (t *TLSConn) ReadToInboundBuffer() (int, error) {
 	}
 	t.d.KeepLastActivity()
 
+	decodedN := 0
 	for {
-		tlsN, err := t.tlsconn.Read(readBuffer) // 这里其实是把tmpInboundBuffer的数据解密后放到readBuffer内了
-		if err != nil {
-			if err == tls.ErrDataNotEnough {
-				return n, nil
-			}
-			return n, err
-		}
-		if tlsN == 0 {
-			break
-		}
+		tlsN, readErr := t.tlsconn.Read(readBuffer) // 这里其实是把tmpInboundBuffer的数据解密后放到readBuffer内了
+		decodedN += tlsN
 		_, err = t.d.inboundBuffer.Write(readBuffer[:tlsN]) // 再将readBuffer的数据放到inboundBuffer内，然后供上层应用读取
 		if err != nil {
 			return n, err
+		}
+		if readErr != nil {
+			if readErr == tls.ErrDataNotEnough {
+				return n, nil
+			}
+			if decodedN > 0 {
+				return n, &readErrorWithData{err: readErr}
+			}
+			return n, readErr
+		}
+		if tlsN == 0 {
+			break
 		}
 	}
 	return n, err

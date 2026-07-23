@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"sync"
 
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/WuKongIM/WuKongIM/pkg/wknet/netpoll"
@@ -26,6 +27,7 @@ type ReactorSub struct {
 	cache      bytes.Buffer // temporary buffer for scattered bytes
 
 	stopped atomic.Bool
+	runWG   sync.WaitGroup
 }
 
 // NewReactorSub instantiates a sub reactor.
@@ -50,14 +52,20 @@ func (r *ReactorSub) AddConn(conn Conn) error {
 
 // Start starts the sub reactor.
 func (r *ReactorSub) Start() error {
-	go r.run()
+	r.runWG.Add(1)
+	go func() {
+		defer r.runWG.Done()
+		r.run()
+	}()
 	return nil
 }
 
 // Stop stops the sub reactor.
 func (r *ReactorSub) Stop() error {
 	r.stopped.Store(true)
-	return r.poller.Close()
+	err := r.poller.Close()
+	r.runWG.Wait()
+	return err
 }
 
 func (r *ReactorSub) AddWrite(conn Conn) error {
@@ -129,6 +137,18 @@ func (r *ReactorSub) read(c Conn) error {
 	var err error
 	var n int
 	if n, err = c.ReadToInboundBuffer(); err != nil {
+		// A TLS read can return valid plaintext followed by a fatal record
+		// error from the same socket read. Deliver the plaintext before
+		// closing the connection for the fatal error.
+		if _, hasNewData := err.(*readErrorWithData); hasNewData {
+			if dataErr := r.eg.eventHandler.OnData(c); dataErr != nil && dataErr != unix.EAGAIN {
+				if err1 := r.CloseConn(c, dataErr); err1 != nil {
+					r.Warn("failed to close conn", zap.Error(err1))
+				}
+				r.Warn("failed to call OnData", zap.Error(dataErr))
+				return nil
+			}
+		}
 		if err == unix.EAGAIN {
 			return nil
 		}

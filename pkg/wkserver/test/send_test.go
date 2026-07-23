@@ -2,6 +2,7 @@ package test
 
 import (
 	"fmt"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -16,9 +17,18 @@ import (
 	"go.uber.org/zap"
 )
 
+func freeTCPAddr(t testing.TB) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	assert.NoError(t, err)
+	addr := listener.Addr().String()
+	assert.NoError(t, listener.Close())
+	return "tcp://" + addr
+}
+
 func TestSendAndRecv(t *testing.T) {
 
-	addr := "tcp://:10001"
+	addr := freeTCPAddr(t)
 
 	s := wkserver.New(addr, wkserver.WithMessagePoolOn(false))
 
@@ -53,7 +63,7 @@ func TestSendAndRecv(t *testing.T) {
 }
 
 func TestRequestResp(t *testing.T) {
-	addr := "tcp://127.0.0.1:10001"
+	addr := freeTCPAddr(t)
 	wklog.Configure(&wklog.Options{
 		Level: zap.InfoLevel,
 	})
@@ -96,7 +106,7 @@ func TestRequestResp(t *testing.T) {
 }
 
 func BenchmarkRequestResp(b *testing.B) {
-	addr := "tcp://127.0.0.1:10001"
+	addr := freeTCPAddr(b)
 	wklog.Configure(&wklog.Options{
 		Level: zap.InfoLevel,
 	})

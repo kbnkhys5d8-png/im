@@ -55,6 +55,8 @@ func TestProposeApiServerAddr(t *testing.T) {
 func TestNodeOffline(t *testing.T) {
 	s1, s2, s3 := newThreeBootstrap(t)
 	start(t, s1, s2, s3)
+	defer s2.Stop()
+	defer s3.Stop()
 
 	// 等待完全启动
 	waitApiServerAddr(s1, s2, s3)
@@ -69,6 +71,8 @@ func TestNodeOffline(t *testing.T) {
 func TestNodeOfflineAndOnline(t *testing.T) {
 	s1, s2, s3 := newThreeBootstrap(t)
 	start(t, s1, s2, s3)
+	defer s2.Stop()
+	defer s3.Stop()
 
 	// 等待完全启动
 	waitApiServerAddr(s1, s2, s3)
@@ -79,6 +83,10 @@ func TestNodeOfflineAndOnline(t *testing.T) {
 	nodeId := s1.GetConfigServer().Options().NodeId
 	// 等待节点1下线
 	waitNodeOffline(nodeId, s2, s3)
+
+	// 使用原数据目录和配置创建新服务实例，模拟进程重启。
+	s1 = restartTestServer(s1)
+	defer s1.Stop()
 
 	// 重新启动节点1
 	err := s1.Start()

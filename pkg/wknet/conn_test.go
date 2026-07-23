@@ -114,15 +114,24 @@ func TestBatchTlsConn(t *testing.T) {
 	msgCount := 100 // 每个客户端发送的消息数量
 
 	finishChan := make(chan struct{})
+	var totalHello atomic.Int64
+	var finishedClients atomic.Int64
 	e.OnData(func(conn Conn) error {
 		buff, err := conn.Peek(-1)
+		assert.NoError(t, err)
 		if len(buff) == 0 {
 			return nil
 		}
-		conn.Discard(len(buff))
 
+		lastNewline := bytes.LastIndexByte(buff, '\n')
+		if lastNewline < 0 {
+			return nil
+		}
+
+		complete := buff[:lastNewline+1]
+		_, err = conn.Discard(len(complete))
 		assert.NoError(t, err)
-		reader := bufio.NewReader(bytes.NewReader(buff))
+		reader := bufio.NewReader(bytes.NewReader(complete))
 
 		for {
 			line, _, err := reader.ReadLine()
@@ -131,6 +140,7 @@ func TestBatchTlsConn(t *testing.T) {
 			}
 			assert.NoError(t, err)
 			if len(line) > 0 && string(line) == "hello" {
+				totalHello.Inc()
 				ctx := conn.Context()
 				if ctx == nil {
 					conn.SetContext(1)
@@ -139,6 +149,7 @@ func TestBatchTlsConn(t *testing.T) {
 				}
 				helloCount := conn.Context().(int)
 				if helloCount == msgCount {
+					finishedClients.Inc()
 					finishChan <- struct{}{}
 				}
 			}
@@ -169,7 +180,17 @@ func TestBatchTlsConn(t *testing.T) {
 
 	close(readyChan)
 
-	<-done
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatalf(
+			"timed out waiting for all TLS clients: finished=%d/%d hello=%d/%d",
+			finishedClients.Load(),
+			cliCount,
+			totalHello.Load(),
+			cliCount*msgCount,
+		)
+	}
 
 }
 
@@ -183,6 +204,7 @@ func testTlsConnSend(msgNum int, addr string, t *testing.T, wg *sync.WaitGroup, 
 	if conn == nil {
 		return
 	}
+	defer conn.Close()
 	<-readyChan
 
 	for i := 0; i < msgNum; i++ {
