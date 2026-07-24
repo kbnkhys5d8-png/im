@@ -324,6 +324,10 @@ type ChannelClusterConfigDB interface {
 	// GetChannelClusterConfigs 获取频道的分布式配置
 	GetChannelClusterConfigs(offsetId uint64, limit int) ([]ChannelClusterConfig, error)
 
+	// GetChannelClusterConfigRevision returns an even, process-local snapshot
+	// revision. Odd values mean a configuration write is in progress.
+	GetChannelClusterConfigRevision() uint64
+
 	// GetChannelClusterConfigCountWithSlotId 获取某个槽的频道的分布式配置数量
 	GetChannelClusterConfigCountWithSlotId(slotId uint32) (int, error)
 

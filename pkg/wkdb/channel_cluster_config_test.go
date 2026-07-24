@@ -219,3 +219,29 @@ func TestGetChannelClusterConfigs(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, 1, len(configs))
 }
+
+func TestChannelClusterConfigRevisionAdvancesAroundCommittedWrites(t *testing.T) {
+	d := newTestDB(t)
+	assert.NoError(t, d.Open())
+	defer func() { assert.NoError(t, d.Close()) }()
+
+	initial := d.GetChannelClusterConfigRevision()
+	assert.NotZero(t, initial)
+	assert.Zero(t, initial%2)
+
+	assert.NoError(t, d.SaveChannelClusterConfig(wkdb.ChannelClusterConfig{
+		ChannelId: "channel-revision", ChannelType: 1,
+		ReplicaMaxCount: 1, Replicas: []uint64{1}, LeaderId: 1, Term: 1, ConfVersion: 1,
+	}))
+	afterSingle := d.GetChannelClusterConfigRevision()
+	assert.Equal(t, initial+2, afterSingle)
+	assert.Zero(t, afterSingle%2)
+
+	assert.NoError(t, d.SaveChannelClusterConfigs([]wkdb.ChannelClusterConfig{{
+		ChannelId: "channel-revision-batch", ChannelType: 1,
+		ReplicaMaxCount: 1, Replicas: []uint64{1}, LeaderId: 1, Term: 1, ConfVersion: 1,
+	}}))
+	afterBatch := d.GetChannelClusterConfigRevision()
+	assert.Equal(t, afterSingle+2, afterBatch)
+	assert.Zero(t, afterBatch%2)
+}

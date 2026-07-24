@@ -19,6 +19,9 @@ const (
 	SearchSourceOfflineBootstrapMarkerName = "search-source-bootstrap-v1.json"
 	searchSourceBootstrapPageSize          = 100
 	searchSourceBootstrapMarkerMaxBytes    = 4096
+	searchSourceRecoveryAuthorizedSuffix   = ".recovery-authorized"
+	searchSourceRecoveryApplyingSuffix     = ".recovery-applying"
+	searchSourceRecoveryConsumedSuffix     = ".recovery-consumed"
 )
 
 var errSearchSourceBootstrapRequired = errors.New("explicit offline search bootstrap is required")
@@ -30,6 +33,7 @@ type searchSourceOfflineBootstrapMarker struct {
 
 type searchSourceBootstrapStore interface {
 	GetChannelClusterConfigs(afterID uint64, limit int) ([]wkdb.ChannelClusterConfig, error)
+	GetChannelClusterConfigRevision() uint64
 	GetAppliedMsgSeq(channelID string, channelType uint8) (uint64, error)
 	GetLastMsgSeq(channelID string, channelType uint8) (uint64, error)
 	UpdateAppliedMsgSeq(channelID string, channelType uint8, applied uint64) error
@@ -60,12 +64,20 @@ func ApplySearchSourceOfflineBootstrapMarker(ctx context.Context, markerPath str
 	if err != nil {
 		return false, err
 	}
-	consumedPath := markerPath + ".consumed"
-	consumed, err := searchSourceBootstrapPathExists(consumedPath)
-	if err != nil {
-		return false, err
+	var consumedPath string
+	for _, candidate := range []string{markerPath + ".consumed", markerPath + searchSourceRecoveryConsumedSuffix} {
+		consumed, err := searchSourceBootstrapPathExists(candidate)
+		if err != nil {
+			return false, err
+		}
+		if consumed {
+			if consumedPath != "" {
+				return false, errors.New("offline search bootstrap has multiple consumed markers")
+			}
+			consumedPath = candidate
+		}
 	}
-	if !consumed {
+	if consumedPath == "" {
 		return false, errSearchSourceBootstrapRequired
 	}
 	if _, err := readSearchSourceBootstrapMarker(consumedPath, defaultSearchSourceNodeID()); err != nil {
@@ -98,6 +110,9 @@ func applySearchSourceOfflineBootstrapMarkerContext(
 	applyingPath := markerPath + ".applying"
 	consumedPath := markerPath + ".consumed"
 	closedPath := markerPath + ".window-closed"
+	recoveryPath := markerPath + searchSourceRecoveryAuthorizedSuffix
+	recoveryApplyingPath := markerPath + searchSourceRecoveryApplyingSuffix
+	recoveryConsumedPath := markerPath + searchSourceRecoveryConsumedSuffix
 	markerExists, err := searchSourceBootstrapPathExists(markerPath)
 	if err != nil {
 		return fmt.Errorf("inspect offline search bootstrap marker: %w", err)
@@ -117,21 +132,48 @@ func applySearchSourceOfflineBootstrapMarkerContext(
 	if err != nil {
 		return fmt.Errorf("inspect closed offline search bootstrap window: %w", err)
 	}
-	if !markerExists && !applyingExists {
-		if consumedExists && closedExists {
-			return errors.New("offline search bootstrap has both consumed and closed markers")
+	recoveryExists, err := searchSourceBootstrapPathExists(recoveryPath)
+	if err != nil {
+		return fmt.Errorf("inspect offline search recovery authorization: %w", err)
+	}
+	recoveryApplyingExists, err := searchSourceBootstrapPathExists(recoveryApplyingPath)
+	if err != nil {
+		return fmt.Errorf("inspect applying offline search recovery: %w", err)
+	}
+	recoveryConsumedExists, err := searchSourceBootstrapPathExists(recoveryConsumedPath)
+	if err != nil {
+		return fmt.Errorf("inspect consumed offline search recovery: %w", err)
+	}
+	recoveryStateExists := recoveryExists || recoveryApplyingExists || recoveryConsumedExists
+	if recoveryStateExists && !closedExists {
+		return errors.New("offline search recovery requires an existing closed-window marker")
+	}
+	if closedExists {
+		if markerExists || applyingExists || consumedExists {
+			return errors.New("offline search bootstrap has conflicting normal and closed-window state")
 		}
+		return applyClosedSearchSourceRecovery(
+			ctx,
+			markerPath,
+			nodeID,
+			roster,
+			authority,
+			store,
+			closedPath,
+			recoveryPath,
+			recoveryApplyingPath,
+			recoveryConsumedPath,
+			recoveryExists,
+			recoveryApplyingExists,
+			recoveryConsumedExists,
+		)
+	}
+	if !markerExists && !applyingExists {
 		if consumedExists {
 			if _, err := readSearchSourceBootstrapMarker(consumedPath, nodeID); err != nil {
 				return fmt.Errorf("validate consumed offline search bootstrap marker: %w", err)
 			}
 			return reconcileConsumedSearchSource(ctx, nodeID, roster, authority, store)
-		}
-		if closedExists {
-			if _, err := readSearchSourceBootstrapMarker(closedPath, nodeID); err != nil {
-				return fmt.Errorf("validate closed offline search bootstrap marker: %w", err)
-			}
-			return errSearchSourceBootstrapRequired
 		}
 		if err := closeSearchSourceBootstrapWindow(closedPath, markerPath, nodeID); err != nil {
 			return err
@@ -180,6 +222,77 @@ func applySearchSourceOfflineBootstrapMarkerContext(
 	return syncSearchSourceBootstrapDir(markerPath)
 }
 
+func applyClosedSearchSourceRecovery(
+	ctx context.Context,
+	markerPath string,
+	nodeID uint64,
+	roster func() ([]uint64, error),
+	authority func(string, uint8) (wkdb.ChannelClusterConfig, error),
+	store searchSourceBootstrapStore,
+	closedPath string,
+	recoveryPath string,
+	recoveryApplyingPath string,
+	recoveryConsumedPath string,
+	recoveryExists bool,
+	recoveryApplyingExists bool,
+	recoveryConsumedExists bool,
+) error {
+	if _, err := readSearchSourceBootstrapMarker(closedPath, nodeID); err != nil {
+		return fmt.Errorf("validate closed offline search bootstrap window: %w", err)
+	}
+	activeStates := 0
+	for _, exists := range []bool{recoveryExists, recoveryApplyingExists, recoveryConsumedExists} {
+		if exists {
+			activeStates++
+		}
+	}
+	if activeStates > 1 {
+		return errors.New("offline search recovery has conflicting state markers")
+	}
+	if recoveryConsumedExists {
+		if _, err := readSearchSourceBootstrapMarker(recoveryConsumedPath, nodeID); err != nil {
+			return fmt.Errorf("validate consumed offline search recovery marker: %w", err)
+		}
+		return reconcileConsumedSearchSource(ctx, nodeID, roster, authority, store)
+	}
+	if !recoveryExists && !recoveryApplyingExists {
+		return errSearchSourceBootstrapRequired
+	}
+	activePath := recoveryApplyingPath
+	if recoveryExists {
+		activePath = recoveryPath
+	}
+	marker, err := readSearchSourceBootstrapMarker(activePath, nodeID)
+	if err != nil {
+		return err
+	}
+	if marker.Version != 1 || marker.NodeID != nodeID {
+		return errors.New("offline search recovery marker does not match protocol or local node")
+	}
+	if recoveryExists {
+		if err := os.Rename(recoveryPath, recoveryApplyingPath); err != nil {
+			return fmt.Errorf("claim offline search recovery marker: %w", err)
+		}
+		if err := syncSearchSourceBootstrapDir(markerPath); err != nil {
+			return err
+		}
+	}
+	if err := runSearchSourceOfflineBootstrap(ctx, nodeID, roster, authority, store); err != nil {
+		return err
+	}
+	consumedExists, err := searchSourceBootstrapPathExists(recoveryConsumedPath)
+	if err != nil {
+		return fmt.Errorf("inspect consumed offline search recovery marker: %w", err)
+	}
+	if consumedExists {
+		return errors.New("offline search recovery consumed marker already exists")
+	}
+	if err := os.Rename(recoveryApplyingPath, recoveryConsumedPath); err != nil {
+		return fmt.Errorf("consume offline search recovery marker: %w", err)
+	}
+	return syncSearchSourceBootstrapDir(markerPath)
+}
+
 // reconcileConsumedSearchSource closes the async-observer crash window only
 // after a previous startup durably consumed the explicit v5 bootstrap marker.
 // A window-closed installation never reaches this path, so an old database is
@@ -191,19 +304,34 @@ func reconcileConsumedSearchSource(
 	authority func(string, uint8) (wkdb.ChannelClusterConfig, error),
 	store searchSourceBootstrapStore,
 ) error {
-	validateRoster := func() error {
-		ids, err := roster()
-		if err != nil || len(ids) != 1 || ids[0] != nodeID {
-			return errors.Join(errSearchSourceRoster, err)
+	expectedRoster, err := loadSearchSourceBootstrapRoster(nodeID, roster)
+	if err != nil {
+		return err
+	}
+	expectedConfigRevision, err := stableSearchSourceConfigRevision(store.GetChannelClusterConfigRevision())
+	if err != nil {
+		return err
+	}
+	validateSnapshot := func() error {
+		current, err := loadSearchSourceBootstrapRoster(nodeID, roster)
+		if err != nil {
+			return err
+		}
+		if !equalSearchSourceRoster(expectedRoster, current) {
+			return errSearchSourceRoster
+		}
+		currentRevision, err := stableSearchSourceConfigRevision(store.GetChannelClusterConfigRevision())
+		if err != nil || currentRevision != expectedConfigRevision {
+			return errSearchSourceFence
 		}
 		return nil
-	}
-	if err := validateRoster(); err != nil {
-		return err
 	}
 	var afterID uint64
 	for {
 		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := validateSnapshot(); err != nil {
 			return err
 		}
 		configs, err := store.GetChannelClusterConfigs(afterID, searchSourceBootstrapPageSize)
@@ -217,15 +345,19 @@ func reconcileConsumedSearchSource(
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			if before.Id <= afterID || !validSearchSourceSingleNodeConfig(before, nodeID) {
+			if before.Id <= afterID || !validSearchSourceClusterConfig(before, expectedRoster) {
 				return errSearchSourceFence
 			}
 			afterID = before.Id
+			if !searchSourceConfigHasReplica(before, nodeID) {
+				continue
+			}
 			authoritativeBefore, err := authority(before.ChannelId, before.ChannelType)
 			if err != nil {
 				return err
 			}
-			if !before.Equal(authoritativeBefore) || !validSearchSourceSingleNodeConfig(authoritativeBefore, nodeID) {
+			if !before.Equal(authoritativeBefore) || !validSearchSourceClusterConfig(authoritativeBefore, expectedRoster) ||
+				!searchSourceConfigHasReplica(authoritativeBefore, nodeID) {
 				return errSearchSourceFence
 			}
 			for {
@@ -264,15 +396,15 @@ func reconcileConsumedSearchSource(
 			if !authoritativeBefore.Equal(authoritativeAfter) {
 				return errSearchSourceFence
 			}
-		}
-		if err := validateRoster(); err != nil {
-			return err
+			if err := validateSnapshot(); err != nil {
+				return err
+			}
 		}
 		if len(configs) < searchSourceBootstrapPageSize {
 			break
 		}
 	}
-	return validateRoster()
+	return validateSnapshot()
 }
 
 func runSearchSourceOfflineBootstrap(
@@ -282,22 +414,34 @@ func runSearchSourceOfflineBootstrap(
 	authority func(string, uint8) (wkdb.ChannelClusterConfig, error),
 	store searchSourceBootstrapStore,
 ) error {
-	validateRoster := func() error {
-		ids, err := roster()
-		if err != nil || len(ids) != 1 || ids[0] != nodeID {
-			return errors.Join(errSearchSourceRoster, err)
+	expectedRoster, err := loadSearchSourceBootstrapRoster(nodeID, roster)
+	if err != nil {
+		return err
+	}
+	expectedConfigRevision, err := stableSearchSourceConfigRevision(store.GetChannelClusterConfigRevision())
+	if err != nil {
+		return err
+	}
+	validateSnapshot := func() error {
+		current, err := loadSearchSourceBootstrapRoster(nodeID, roster)
+		if err != nil {
+			return err
+		}
+		if !equalSearchSourceRoster(expectedRoster, current) {
+			return errSearchSourceRoster
+		}
+		currentRevision, err := stableSearchSourceConfigRevision(store.GetChannelClusterConfigRevision())
+		if err != nil || currentRevision != expectedConfigRevision {
+			return errSearchSourceFence
 		}
 		return nil
-	}
-	if err := validateRoster(); err != nil {
-		return err
 	}
 	var afterID uint64
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := validateRoster(); err != nil {
+		if err := validateSnapshot(); err != nil {
 			return err
 		}
 		configs, err := store.GetChannelClusterConfigs(afterID, searchSourceBootstrapPageSize)
@@ -311,10 +455,13 @@ func runSearchSourceOfflineBootstrap(
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			if before.Id <= afterID || !validSearchSourceSingleNodeConfig(before, nodeID) {
+			if before.Id <= afterID || !validSearchSourceClusterConfig(before, expectedRoster) {
 				return errSearchSourceFence
 			}
 			afterID = before.Id
+			if !searchSourceConfigHasReplica(before, nodeID) {
+				continue
+			}
 			applied, err := store.GetAppliedMsgSeq(before.ChannelId, before.ChannelType)
 			if err != nil {
 				return err
@@ -330,7 +477,8 @@ func runSearchSourceOfflineBootstrap(
 			if err != nil {
 				return err
 			}
-			if !validSearchSourceSingleNodeConfig(authoritativeBefore, nodeID) || !before.Equal(authoritativeBefore) {
+			if !validSearchSourceClusterConfig(authoritativeBefore, expectedRoster) ||
+				!searchSourceConfigHasReplica(authoritativeBefore, nodeID) || !before.Equal(authoritativeBefore) {
 				return errSearchSourceFence
 			}
 			if applied > 0 && applied < physical {
@@ -359,15 +507,32 @@ func runSearchSourceOfflineBootstrap(
 			if !authoritativeBefore.Equal(authoritativeAfter) {
 				return errSearchSourceFence
 			}
-		}
-		if err := validateRoster(); err != nil {
-			return err
+			if err := validateSnapshot(); err != nil {
+				return err
+			}
 		}
 		if len(configs) < searchSourceBootstrapPageSize {
 			break
 		}
 	}
-	return validateRoster()
+	return validateSnapshot()
+}
+
+func loadSearchSourceBootstrapRoster(nodeID uint64, roster func() ([]uint64, error)) ([]uint64, error) {
+	ids, err := roster()
+	if err != nil {
+		return nil, errors.Join(errSearchSourceRoster, err)
+	}
+	return canonicalSearchSourceRoster(nodeID, ids)
+}
+
+func searchSourceConfigHasReplica(cfg wkdb.ChannelClusterConfig, nodeID uint64) bool {
+	for _, replicaID := range cfg.Replicas {
+		if replicaID == nodeID {
+			return true
+		}
+	}
+	return false
 }
 
 func readSearchSourceBootstrapMarker(markerPath string, nodeID uint64) (searchSourceOfflineBootstrapMarker, error) {

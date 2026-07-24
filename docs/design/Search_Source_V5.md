@@ -52,24 +52,39 @@ user, with exactly this shape:
 
 Marker states are durable and mutually exclusive:
 
-- pending marker: explicitly authorizes the first single-node bootstrap;
+- pending marker: explicitly authorizes the first bootstrap for this node;
 - `.applying`: the marker has been claimed and may be resumed after a crash;
 - `.consumed`: bootstrap completed; later startups may reconcile a missed
   observer tail, but only with roster and channel-authority checks before and
   after each update;
 - `.window-closed`: no explicit marker was present on first V5 startup. Search
   remains disabled and physical message tails are never silently adopted.
+- `.recovery-authorized`: an operator-created, node-bound authorization used
+  only while IM is stopped and the original `.window-closed` remains present;
+  IM atomically claims it as `.recovery-applying`.
+- `.recovery-consumed`: the explicitly authorized closed-window reconciliation
+  completed. The original `.window-closed` remains as audit evidence; a failed
+  recovery retains `.recovery-applying` and never silently retries a different
+  node or data directory.
 
 The first bootstrap advances only an uninitialized zero watermark. A nonzero
 watermark behind the physical tail is ambiguous, so bootstrap retains
 `.applying`, disables search, and requires operator investigation; it is never
 converted into a future consumed-marker recovery tail.
 
-Both bootstrap and consumed-marker reconciliation require an authoritative
-single-node roster. A topology or authority change fails closed. Multi-node
-bootstrap requires a separate coordinated protocol and is intentionally not
-implemented by this version. Multi-node IM itself still starts and operates;
-only these local search-source routes remain unavailable.
+Bootstrap and consumed-marker reconciliation require the same canonical,
+non-empty authoritative roster before and after every page. Each node advances
+only channels for which it is a replica; it never copies another node's data or
+rewrites a nonzero partial watermark. The local committed channel-config table
+is protected by an even/odd process-local revision seqlock. Inventory captures
+one stable revision and fails closed if any replicated configuration write or
+roster change occurs before the page completes. Each node returns only channels
+for which it is the current leader. Message requests bind the inventory roster
+and revision and recheck both after normal and `not_owner` responses.
+
+The generic Docker install/cutover scripts remain single-node operational
+tools. Three-node production rollout uses a separately reviewed one-time
+procedure; runtime protocol support does not make those scripts multi-node.
 
 ## Local search-plugin security
 

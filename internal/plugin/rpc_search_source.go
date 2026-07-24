@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/WuKongIM/WuKongIM/internal/options"
@@ -24,7 +25,6 @@ const (
 	searchSourceMessageResponseBytes = 4 * 1024 * 1024
 	searchSourceResponseReserveBytes = 64
 	searchSourceMaxNextSeq           = wkdb.MaxMessageSequence + 1
-	searchSourceChannelReadAttempts  = 3
 
 	searchSourceErrorKindChannelRetry = "channel_retry"
 	searchSourceErrorCodeApplyPending = "apply_pending"
@@ -32,7 +32,7 @@ const (
 
 var (
 	errSearchSourceVersion     = errors.New("search source protocol version is invalid")
-	errSearchSourceRoster      = errors.New("search source requires authoritative local single-node roster")
+	errSearchSourceRoster      = errors.New("search source requires an authoritative stable cluster roster")
 	errSearchSourceChannelID   = errors.New("channel_id is required")
 	errSearchSourceChannelType = errors.New("channel_type is invalid")
 	errSearchSourceLimit       = errors.New("search source limit is invalid")
@@ -43,6 +43,7 @@ var (
 
 type searchSourceStore interface {
 	GetChannelClusterConfigs(afterID uint64, limit int) ([]wkdb.ChannelClusterConfig, error)
+	GetChannelClusterConfigRevision() uint64
 	GetAppliedMsgSeq(channelID string, channelType uint8) (uint64, error)
 	GetLastMsgSeq(channelID string, channelType uint8) (uint64, error)
 	LoadNextRangeSearchSourceMessages(channelID string, channelType uint8, start, end uint64, limit int, limitSize uint64) ([]wkdb.SearchSourceMessage, error)
@@ -57,6 +58,13 @@ func (liveSearchSourceStore) GetChannelClusterConfigs(afterID uint64, limit int)
 		return nil, errors.New("store is unavailable")
 	}
 	return service.Store.DB().GetChannelClusterConfigs(afterID, limit)
+}
+
+func (liveSearchSourceStore) GetChannelClusterConfigRevision() uint64 {
+	if service.Store == nil {
+		return 0
+	}
+	return service.Store.DB().GetChannelClusterConfigRevision()
 }
 
 func (liveSearchSourceStore) GetAppliedMsgSeq(channelID string, channelType uint8) (uint64, error) {
@@ -129,19 +137,22 @@ type searchSourceChannelPageResponse struct {
 	Version        int                   `json:"version"`
 	NodeID         uint64                `json:"node_id"`
 	ClusterNodeIDs []uint64              `json:"cluster_node_ids"`
+	ConfigRevision uint64                `json:"config_revision"`
 	ScannedTo      uint64                `json:"scanned_to"`
 	Channels       []searchSourceChannel `json:"channels"`
 }
 
 type searchSourceMessageRequest struct {
-	Version               int    `json:"version"`
-	ChannelID             string `json:"channel_id"`
-	ChannelType           uint8  `json:"channel_type"`
-	ExpectedLeaderID      uint64 `json:"expected_leader_id"`
-	ExpectedTerm          uint32 `json:"expected_term"`
-	ExpectedConfigVersion uint64 `json:"expected_config_version"`
-	NextSeq               uint64 `json:"next_seq"`
-	Limit                 int    `json:"limit"`
+	Version                int      `json:"version"`
+	ChannelID              string   `json:"channel_id"`
+	ChannelType            uint8    `json:"channel_type"`
+	ExpectedLeaderID       uint64   `json:"expected_leader_id"`
+	ExpectedTerm           uint32   `json:"expected_term"`
+	ExpectedConfigVersion  uint64   `json:"expected_config_version"`
+	ExpectedClusterNodeIDs []uint64 `json:"expected_cluster_node_ids"`
+	ExpectedConfigRevision uint64   `json:"expected_config_revision"`
+	NextSeq                uint64   `json:"next_seq"`
+	Limit                  int      `json:"limit"`
 }
 
 type searchSourceMessage struct {
@@ -166,6 +177,7 @@ type searchSourceMessageResponse struct {
 	Version                  int                   `json:"version"`
 	NodeID                   uint64                `json:"node_id"`
 	ClusterNodeIDs           []uint64              `json:"cluster_node_ids"`
+	ConfigRevision           uint64                `json:"config_revision"`
 	ChannelID                string                `json:"channel_id"`
 	ChannelType              uint8                 `json:"channel_type"`
 	LeaderID                 uint64                `json:"leader_id"`
@@ -261,29 +273,50 @@ func (a *rpc) searchSourceChannels(req searchSourceChannelPageRequest) (searchSo
 	if err != nil {
 		return searchSourceChannelPageResponse{}, err
 	}
+	configRevision, err := stableSearchSourceConfigRevision(a.searchSourceStore.GetChannelClusterConfigRevision())
+	if err != nil {
+		return searchSourceChannelPageResponse{}, err
+	}
 	resp := searchSourceChannelPageResponse{
 		Version: searchSourceProtocolVersion, NodeID: nodeID, ClusterNodeIDs: roster,
-		ScannedTo: req.AfterID, Channels: make([]searchSourceChannel, 0),
+		ConfigRevision: configRevision, ScannedTo: req.AfterID, Channels: make([]searchSourceChannel, 0),
 	}
 	configs, err := a.searchSourceStore.GetChannelClusterConfigs(req.AfterID, limit)
 	if err != nil {
 		return searchSourceChannelPageResponse{}, err
 	}
 	for _, candidate := range configs {
-		if candidate.Id <= resp.ScannedTo || !validSearchSourceSingleNodeConfig(candidate, nodeID) {
+		if candidate.Id <= resp.ScannedTo || !validSearchSourceClusterConfig(candidate, roster) {
 			return searchSourceChannelPageResponse{}, errSearchSourceFence
 		}
 		resp.ScannedTo = candidate.Id
-		channel, err := a.readStableSearchSourceChannel(candidate, nodeID)
+		if candidate.LeaderId != nodeID {
+			continue
+		}
+		channel, err := a.readStableSearchSourceChannel(candidate, nodeID, roster)
 		if err != nil {
 			return searchSourceChannelPageResponse{}, err
 		}
 		resp.Channels = append(resp.Channels, channel)
 	}
-	if _, _, err := a.validateSearchSourceRoster(); err != nil {
+	if finalRevision, err := stableSearchSourceConfigRevision(a.searchSourceStore.GetChannelClusterConfigRevision()); err != nil {
 		return searchSourceChannelPageResponse{}, err
+	} else if finalRevision != configRevision {
+		return searchSourceChannelPageResponse{}, errSearchSourceFence
+	}
+	if _, finalRoster, err := a.validateSearchSourceRoster(); err != nil {
+		return searchSourceChannelPageResponse{}, err
+	} else if !equalSearchSourceRoster(roster, finalRoster) {
+		return searchSourceChannelPageResponse{}, errSearchSourceRoster
 	}
 	return resp, nil
+}
+
+func stableSearchSourceConfigRevision(revision uint64) (uint64, error) {
+	if revision == 0 || revision%2 != 0 {
+		return 0, errSearchSourceFence
+	}
+	return revision, nil
 }
 
 func (a *rpc) searchSourceMessages(req searchSourceMessageRequest) (searchSourceMessageResponse, error) {
@@ -303,9 +336,19 @@ func (a *rpc) searchSourceMessages(req searchSourceMessageRequest) (searchSource
 	if err != nil {
 		return searchSourceMessageResponse{}, err
 	}
+	expectedRoster, err := canonicalSearchSourceRoster(nodeID, req.ExpectedClusterNodeIDs)
+	if err != nil || !equalSearchSourceRoster(req.ExpectedClusterNodeIDs, expectedRoster) ||
+		!equalSearchSourceRoster(roster, expectedRoster) {
+		return searchSourceMessageResponse{}, errSearchSourceRoster
+	}
+	configRevision, err := stableSearchSourceConfigRevision(a.searchSourceStore.GetChannelClusterConfigRevision())
+	if err != nil || req.ExpectedConfigRevision != configRevision {
+		return searchSourceMessageResponse{}, errSearchSourceFence
+	}
 	resp := searchSourceMessageResponse{
 		Version: searchSourceProtocolVersion, NodeID: nodeID, ClusterNodeIDs: roster,
-		ChannelID: req.ChannelID, ChannelType: req.ChannelType,
+		ConfigRevision: configRevision,
+		ChannelID:      req.ChannelID, ChannelType: req.ChannelType,
 		LeaderID: req.ExpectedLeaderID, Term: req.ExpectedTerm, ConfigVersion: req.ExpectedConfigVersion,
 		NextSeq: req.NextSeq, Messages: make([]searchSourceMessage, 0),
 	}
@@ -313,8 +356,11 @@ func (a *rpc) searchSourceMessages(req searchSourceMessageRequest) (searchSource
 	if err != nil {
 		return searchSourceMessageResponse{}, err
 	}
-	if !searchSourceOwns(before, nodeID, req) {
-		return searchSourceNotOwner(resp, before), nil
+	if !validSearchSourceClusterConfig(before, roster) {
+		return searchSourceMessageResponse{}, errSearchSourceFence
+	}
+	if !searchSourceOwns(before, nodeID, roster, req) {
+		return a.finalizeSearchSourceMessageResponse(searchSourceNotOwner(resp, before), roster, configRevision)
 	}
 	applied, physical, err := a.searchSourceTail(req.ChannelID, req.ChannelType)
 	if err != nil {
@@ -339,11 +385,11 @@ func (a *rpc) searchSourceMessages(req searchSourceMessageRequest) (searchSource
 	if err != nil {
 		return searchSourceMessageResponse{}, err
 	}
-	if !searchSourceOwns(after, nodeID, req) || !before.Equal(after) {
-		return searchSourceNotOwner(resp, after), nil
+	if !validSearchSourceClusterConfig(after, roster) {
+		return searchSourceMessageResponse{}, errSearchSourceFence
 	}
-	if _, _, err := a.validateSearchSourceRoster(); err != nil {
-		return searchSourceMessageResponse{}, err
+	if !searchSourceOwns(after, nodeID, roster, req) || !before.Equal(after) {
+		return a.finalizeSearchSourceMessageResponse(searchSourceNotOwner(resp, after), roster, configRevision)
 	}
 	if resp.ApplyPending {
 		resp.Retryable = true
@@ -362,6 +408,25 @@ func (a *rpc) searchSourceMessages(req searchSourceMessageRequest) (searchSource
 		resp.NextSeq = resp.Messages[len(resp.Messages)-1].MessageSeq + 1
 	}
 	resp.CaughtUp = resp.NextSeq > applied
+	return a.finalizeSearchSourceMessageResponse(resp, roster, configRevision)
+}
+
+func (a *rpc) finalizeSearchSourceMessageResponse(
+	resp searchSourceMessageResponse,
+	expectedRoster []uint64,
+	expectedConfigRevision uint64,
+) (searchSourceMessageResponse, error) {
+	finalRevision, err := stableSearchSourceConfigRevision(a.searchSourceStore.GetChannelClusterConfigRevision())
+	if err != nil || finalRevision != expectedConfigRevision {
+		return searchSourceMessageResponse{}, errSearchSourceFence
+	}
+	_, finalRoster, err := a.validateSearchSourceRoster()
+	if err != nil {
+		return searchSourceMessageResponse{}, err
+	}
+	if !equalSearchSourceRoster(expectedRoster, finalRoster) {
+		return searchSourceMessageResponse{}, errSearchSourceRoster
+	}
 	return resp, nil
 }
 
@@ -371,10 +436,35 @@ func (a *rpc) validateSearchSourceRoster() (uint64, []uint64, error) {
 		return 0, nil, errSearchSourceRoster
 	}
 	ids, err := a.searchSourceRoster()
-	if err != nil || len(ids) != 1 || ids[0] != nodeID {
+	if err != nil {
 		return 0, nil, errors.Join(errSearchSourceRoster, err)
 	}
-	return nodeID, []uint64{nodeID}, nil
+	roster, err := canonicalSearchSourceRoster(nodeID, ids)
+	if err != nil {
+		return 0, nil, err
+	}
+	return nodeID, roster, nil
+}
+
+func canonicalSearchSourceRoster(nodeID uint64, ids []uint64) ([]uint64, error) {
+	if nodeID == 0 || len(ids) == 0 {
+		return nil, errSearchSourceRoster
+	}
+	roster := append([]uint64(nil), ids...)
+	sort.Slice(roster, func(i, j int) bool { return roster[i] < roster[j] })
+	localFound := false
+	for index, id := range roster {
+		if id == 0 || (index > 0 && roster[index-1] == id) {
+			return nil, errSearchSourceRoster
+		}
+		if id == nodeID {
+			localFound = true
+		}
+	}
+	if !localFound {
+		return nil, errSearchSourceRoster
+	}
+	return roster, nil
 }
 
 func (a *rpc) searchSourceTail(channelID string, channelType uint8) (uint64, uint64, error) {
@@ -392,45 +482,72 @@ func (a *rpc) searchSourceTail(channelID string, channelType uint8) (uint64, uin
 	return applied, physical, nil
 }
 
-func (a *rpc) readStableSearchSourceChannel(candidate wkdb.ChannelClusterConfig, nodeID uint64) (searchSourceChannel, error) {
-	configID, channelID, channelType := candidate.Id, candidate.ChannelId, candidate.ChannelType
-	for attempt := 0; attempt < searchSourceChannelReadAttempts; attempt++ {
-		applied, physical, err := a.searchSourceTail(channelID, channelType)
-		if err != nil {
-			return searchSourceChannel{}, err
-		}
-		current, err := a.searchSourceAuthority(channelID, channelType)
-		if err != nil {
-			return searchSourceChannel{}, err
-		}
-		if !validSearchSourceSingleNodeConfig(current, nodeID) || current.Id != configID ||
-			current.ChannelId != channelID || current.ChannelType != channelType {
-			return searchSourceChannel{}, errSearchSourceFence
-		}
-		if candidate.Equal(current) {
-			return searchSourceChannel{
-				ConfigID: current.Id, ChannelID: current.ChannelId, ChannelType: current.ChannelType,
-				LeaderID: current.LeaderId, Term: current.Term, ConfigVersion: current.ConfVersion,
-				LastMessageSeq: applied, AppliedMessageSeq: applied, PhysicalMessageSeq: physical,
-				ApplyPending: physical > applied, OfflineBootstrapRequired: applied == 0 && physical > 0,
-			}, nil
-		}
-		candidate = current
+func (a *rpc) readStableSearchSourceChannel(candidate wkdb.ChannelClusterConfig, nodeID uint64, roster []uint64) (searchSourceChannel, error) {
+	if !validSearchSourceClusterConfig(candidate, roster) || candidate.LeaderId != nodeID {
+		return searchSourceChannel{}, errSearchSourceFence
 	}
-	return searchSourceChannel{}, errSearchSourceFence
+	applied, physical, err := a.searchSourceTail(candidate.ChannelId, candidate.ChannelType)
+	if err != nil {
+		return searchSourceChannel{}, err
+	}
+	return searchSourceChannel{
+		ConfigID: candidate.Id, ChannelID: candidate.ChannelId, ChannelType: candidate.ChannelType,
+		LeaderID: candidate.LeaderId, Term: candidate.Term, ConfigVersion: candidate.ConfVersion,
+		LastMessageSeq: applied, AppliedMessageSeq: applied, PhysicalMessageSeq: physical,
+		ApplyPending: physical > applied, OfflineBootstrapRequired: applied == 0 && physical > 0,
+	}, nil
+}
+
+func validSearchSourceClusterConfig(cfg wkdb.ChannelClusterConfig, roster []uint64) bool {
+	if cfg.Id == 0 || strings.TrimSpace(cfg.ChannelId) == "" || cfg.ChannelType == 0 ||
+		cfg.Status != wkdb.ChannelClusterStatusNormal || cfg.LeaderId == 0 ||
+		cfg.ReplicaMaxCount == 0 || int(cfg.ReplicaMaxCount) != len(cfg.Replicas) ||
+		len(cfg.Replicas) == 0 || len(cfg.Replicas) > len(roster) || len(cfg.Learners) != 0 ||
+		cfg.MigrateFrom != 0 || cfg.MigrateTo != 0 || cfg.Term == 0 || cfg.ConfVersion == 0 {
+		return false
+	}
+	seen := make(map[uint64]struct{}, len(cfg.Replicas))
+	leaderFound := false
+	for _, replicaID := range cfg.Replicas {
+		if replicaID == 0 || !searchSourceRosterContains(roster, replicaID) {
+			return false
+		}
+		if _, duplicate := seen[replicaID]; duplicate {
+			return false
+		}
+		seen[replicaID] = struct{}{}
+		if replicaID == cfg.LeaderId {
+			leaderFound = true
+		}
+	}
+	return leaderFound
 }
 
 func validSearchSourceSingleNodeConfig(cfg wkdb.ChannelClusterConfig, nodeID uint64) bool {
-	return cfg.Id > 0 && strings.TrimSpace(cfg.ChannelId) != "" && cfg.ChannelType > 0 &&
-		cfg.Status == wkdb.ChannelClusterStatusNormal && cfg.LeaderId == nodeID &&
-		len(cfg.Replicas) == 1 && cfg.Replicas[0] == nodeID && len(cfg.Learners) == 0 &&
-		cfg.MigrateFrom == 0 && cfg.MigrateTo == 0 && cfg.Term > 0 && cfg.ConfVersion > 0
+	return validSearchSourceClusterConfig(cfg, []uint64{nodeID})
 }
 
-func searchSourceOwns(cfg wkdb.ChannelClusterConfig, nodeID uint64, req searchSourceMessageRequest) bool {
-	return validSearchSourceSingleNodeConfig(cfg, nodeID) && cfg.ChannelId == req.ChannelID &&
+func searchSourceOwns(cfg wkdb.ChannelClusterConfig, nodeID uint64, roster []uint64, req searchSourceMessageRequest) bool {
+	return validSearchSourceClusterConfig(cfg, roster) && cfg.LeaderId == nodeID && cfg.ChannelId == req.ChannelID &&
 		cfg.ChannelType == req.ChannelType && cfg.LeaderId == req.ExpectedLeaderID &&
 		cfg.Term == req.ExpectedTerm && cfg.ConfVersion == req.ExpectedConfigVersion
+}
+
+func searchSourceRosterContains(roster []uint64, nodeID uint64) bool {
+	index := sort.Search(len(roster), func(i int) bool { return roster[i] >= nodeID })
+	return index < len(roster) && roster[index] == nodeID
+}
+
+func equalSearchSourceRoster(left, right []uint64) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func searchSourceNotOwner(resp searchSourceMessageResponse, cfg wkdb.ChannelClusterConfig) searchSourceMessageResponse {

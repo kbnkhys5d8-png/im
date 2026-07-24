@@ -13,6 +13,8 @@ import (
 func (wk *wukongDB) SaveChannelClusterConfig(channelClusterConfig ChannelClusterConfig) error {
 
 	wk.metrics.SaveChannelClusterConfigAdd(1)
+	wk.beginChannelClusterConfigWrite()
+	defer wk.endChannelClusterConfigWrite()
 
 	if wk.opts.EnableCost {
 		start := time.Now()
@@ -72,6 +74,11 @@ func (wk *wukongDB) SaveChannelClusterConfig(channelClusterConfig ChannelCluster
 }
 
 func (wk *wukongDB) SaveChannelClusterConfigs(channelClusterConfigs []ChannelClusterConfig) error {
+	if len(channelClusterConfigs) == 0 {
+		return nil
+	}
+	wk.beginChannelClusterConfigWrite()
+	defer wk.endChannelClusterConfigWrite()
 
 	if wk.opts.EnableCost {
 		start := time.Now()
@@ -135,6 +142,20 @@ func (wk *wukongDB) SaveChannelClusterConfigs(channelClusterConfigs []ChannelClu
 	wk.clusterConfigCache.BatchSetChannelClusterConfigs(normalizedConfigs)
 
 	return nil
+}
+
+func (wk *wukongDB) beginChannelClusterConfigWrite() {
+	wk.channelClusterConfigWriteMu.Lock()
+	wk.channelClusterConfigRevision.Add(1)
+}
+
+func (wk *wukongDB) endChannelClusterConfigWrite() {
+	wk.channelClusterConfigRevision.Add(1)
+	wk.channelClusterConfigWriteMu.Unlock()
+}
+
+func (wk *wukongDB) GetChannelClusterConfigRevision() uint64 {
+	return wk.channelClusterConfigRevision.Load()
 }
 
 func (wk *wukongDB) GetChannelClusterConfig(channelId string, channelType uint8) (ChannelClusterConfig, error) {

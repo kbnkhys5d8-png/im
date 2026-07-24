@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -13,10 +14,10 @@ import (
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 )
 
-func TestSearchSourceChannelsChecksSingleNodeRosterBeforeStore(t *testing.T) {
+func TestSearchSourceChannelsChecksMalformedRosterBeforeStore(t *testing.T) {
 	store := &fakeSearchSourceStore{}
 	rpc := testSearchSourceRPC(store)
-	rpc.searchSourceRoster = func() ([]uint64, error) { return []uint64{1, 2}, nil }
+	rpc.searchSourceRoster = func() ([]uint64, error) { return []uint64{2}, nil }
 
 	_, err := rpc.searchSourceChannels(searchSourceChannelPageRequest{Version: 5, Limit: 10})
 	if !errors.Is(err, errSearchSourceRoster) {
@@ -27,10 +28,10 @@ func TestSearchSourceChannelsChecksSingleNodeRosterBeforeStore(t *testing.T) {
 	}
 }
 
-func TestSearchSourceMessagesChecksSingleNodeRosterBeforeAuthorityOrStore(t *testing.T) {
+func TestSearchSourceMessagesChecksMalformedRosterBeforeAuthorityOrStore(t *testing.T) {
 	store := &fakeSearchSourceStore{}
 	rpc := testSearchSourceRPC(store)
-	rpc.searchSourceRoster = func() ([]uint64, error) { return []uint64{1, 2}, nil }
+	rpc.searchSourceRoster = func() ([]uint64, error) { return []uint64{2}, nil }
 	authorityCalls := 0
 	rpc.searchSourceAuthority = func(string, uint8) (wkdb.ChannelClusterConfig, error) {
 		authorityCalls++
@@ -38,7 +39,7 @@ func TestSearchSourceMessagesChecksSingleNodeRosterBeforeAuthorityOrStore(t *tes
 	}
 	_, err := rpc.searchSourceMessages(searchSourceMessageRequest{
 		Version: 5, ChannelID: "channel", ChannelType: 2,
-		ExpectedLeaderID: 1, ExpectedTerm: 2, ExpectedConfigVersion: 3,
+		ExpectedLeaderID: 1, ExpectedTerm: 2, ExpectedConfigVersion: 3, ExpectedClusterNodeIDs: []uint64{1}, ExpectedConfigRevision: 2,
 		NextSeq: 1, Limit: 10,
 	})
 	if !errors.Is(err, errSearchSourceRoster) {
@@ -46,6 +47,187 @@ func TestSearchSourceMessagesChecksSingleNodeRosterBeforeAuthorityOrStore(t *tes
 	}
 	if authorityCalls != 0 || len(store.calls) != 0 {
 		t.Fatalf("authority/store read before roster failed: authority=%d store=%v", authorityCalls, store.calls)
+	}
+}
+
+func TestSearchSourceChannelsAcceptsStableThreeNodeRosterAndReturnsOnlyLocalLeaders(t *testing.T) {
+	remote := validThreeNodeSearchSourceConfig(9, "remote", 1)
+	local := validThreeNodeSearchSourceConfig(10, "local", 2)
+	store := &fakeSearchSourceStore{
+		configs:  []wkdb.ChannelClusterConfig{remote, local},
+		applied:  3,
+		physical: 3,
+	}
+	rpc := testSearchSourceRPC(store)
+	rpc.searchSourceNodeID = func() uint64 { return 2 }
+	rpc.searchSourceRoster = func() ([]uint64, error) { return []uint64{3, 1, 2}, nil }
+	rpc.searchSourceAuthority = func(channelID string, _ uint8) (wkdb.ChannelClusterConfig, error) {
+		if channelID == local.ChannelId {
+			return local, nil
+		}
+		return remote, nil
+	}
+
+	resp, err := rpc.searchSourceChannels(searchSourceChannelPageRequest{Version: 5, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.NodeID != 2 || !reflect.DeepEqual(resp.ClusterNodeIDs, []uint64{1, 2, 3}) {
+		t.Fatalf("topology response = %+v", resp)
+	}
+	if resp.ScannedTo != local.Id || len(resp.Channels) != 1 || resp.Channels[0].ChannelID != local.ChannelId {
+		t.Fatalf("local inventory response = %+v", resp)
+	}
+}
+
+func TestSearchSourceChannelsDoesNotCallRemoteAuthorityForFullPage(t *testing.T) {
+	configs := make([]wkdb.ChannelClusterConfig, 500)
+	for index := range configs {
+		configs[index] = validThreeNodeSearchSourceConfig(uint64(index+1), fmt.Sprintf("remote-%d", index), 1)
+	}
+	store := &fakeSearchSourceStore{configs: configs}
+	rpc := testSearchSourceRPC(store)
+	rpc.searchSourceNodeID = func() uint64 { return 2 }
+	rpc.searchSourceRoster = func() ([]uint64, error) { return []uint64{1, 2, 3}, nil }
+	authorityCalls := 0
+	rpc.searchSourceAuthority = func(string, uint8) (wkdb.ChannelClusterConfig, error) {
+		authorityCalls++
+		return wkdb.ChannelClusterConfig{}, errors.New("remote authority must not be called by inventory")
+	}
+
+	resp, err := rpc.searchSourceChannels(searchSourceChannelPageRequest{Version: 5, Limit: 500})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if authorityCalls != 0 || resp.ScannedTo != 500 || len(resp.Channels) != 0 {
+		t.Fatalf("authority=%d scanned_to=%d channels=%d", authorityCalls, resp.ScannedTo, len(resp.Channels))
+	}
+}
+
+func TestSearchSourceMessagesAcceptsStableThreeNodeRosterForLocalLeader(t *testing.T) {
+	cfg := validThreeNodeSearchSourceConfig(9, "channel", 2)
+	store := &fakeSearchSourceStore{}
+	rpc := testSearchSourceRPC(store)
+	rpc.searchSourceNodeID = func() uint64 { return 2 }
+	rpc.searchSourceRoster = func() ([]uint64, error) { return []uint64{1, 2, 3}, nil }
+	rpc.searchSourceAuthority = func(string, uint8) (wkdb.ChannelClusterConfig, error) { return cfg, nil }
+
+	resp, err := rpc.searchSourceMessages(searchSourceMessageRequest{
+		Version: 5, ChannelID: "channel", ChannelType: 2,
+		ExpectedLeaderID: 2, ExpectedTerm: 2, ExpectedConfigVersion: 3, ExpectedClusterNodeIDs: []uint64{1, 2, 3}, ExpectedConfigRevision: 2,
+		NextSeq: 1, Limit: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.NodeID != 2 || !reflect.DeepEqual(resp.ClusterNodeIDs, []uint64{1, 2, 3}) || !resp.CaughtUp {
+		t.Fatalf("message topology response = %+v", resp)
+	}
+}
+
+func TestSearchSourceMessagesNotOwnerRechecksRosterBeforeReturning(t *testing.T) {
+	cfg := validThreeNodeSearchSourceConfig(9, "channel", 1)
+	store := &fakeSearchSourceStore{}
+	rpc := testSearchSourceRPC(store)
+	rpc.searchSourceNodeID = func() uint64 { return 2 }
+	rosterCalls := 0
+	rpc.searchSourceRoster = func() ([]uint64, error) {
+		rosterCalls++
+		if rosterCalls == 1 {
+			return []uint64{1, 2, 3}, nil
+		}
+		return []uint64{1, 2, 4}, nil
+	}
+	rpc.searchSourceAuthority = func(string, uint8) (wkdb.ChannelClusterConfig, error) { return cfg, nil }
+
+	_, err := rpc.searchSourceMessages(searchSourceMessageRequest{
+		Version: 5, ChannelID: "channel", ChannelType: 2,
+		ExpectedLeaderID: 2, ExpectedTerm: 2, ExpectedConfigVersion: 3,
+		ExpectedClusterNodeIDs: []uint64{1, 2, 3}, ExpectedConfigRevision: 2,
+		NextSeq: 1, Limit: 10,
+	})
+	if !errors.Is(err, errSearchSourceRoster) {
+		t.Fatalf("not-owner roster change error = %v, want roster fence", err)
+	}
+}
+
+func TestSearchSourceMessagesLateNotOwnerRechecksRosterBeforeReturning(t *testing.T) {
+	before := validThreeNodeSearchSourceConfig(9, "channel", 2)
+	after := before
+	after.LeaderId = 1
+	after.Term++
+	after.ConfVersion++
+	store := &fakeSearchSourceStore{
+		applied:  1,
+		physical: 1,
+		messages: []wkdb.SearchSourceMessage{{Message: wkdb.Message{RecvPacket: wkproto.RecvPacket{
+			MessageSeq:  1,
+			MessageID:   1,
+			ChannelID:   "channel",
+			ChannelType: 2,
+		}}}},
+	}
+	rpc := testSearchSourceRPC(store)
+	rpc.searchSourceNodeID = func() uint64 { return 2 }
+	rosterCalls := 0
+	rpc.searchSourceRoster = func() ([]uint64, error) {
+		rosterCalls++
+		if rosterCalls == 1 {
+			return []uint64{1, 2, 3}, nil
+		}
+		return []uint64{1, 2, 4}, nil
+	}
+	authorityCalls := 0
+	rpc.searchSourceAuthority = func(string, uint8) (wkdb.ChannelClusterConfig, error) {
+		authorityCalls++
+		if authorityCalls == 1 {
+			return before, nil
+		}
+		return after, nil
+	}
+
+	_, err := rpc.searchSourceMessages(searchSourceMessageRequest{
+		Version: 5, ChannelID: "channel", ChannelType: 2,
+		ExpectedLeaderID: 2, ExpectedTerm: 2, ExpectedConfigVersion: 3,
+		ExpectedClusterNodeIDs: []uint64{1, 2, 3}, ExpectedConfigRevision: 2,
+		NextSeq: 1, Limit: 10,
+	})
+	if !errors.Is(err, errSearchSourceRoster) {
+		t.Fatalf("late not-owner roster change error = %v, want roster fence", err)
+	}
+}
+
+func TestSearchSourceChannelsRejectsRosterChangeDuringRead(t *testing.T) {
+	cfg := validThreeNodeSearchSourceConfig(9, "channel", 1)
+	store := &fakeSearchSourceStore{configs: []wkdb.ChannelClusterConfig{cfg}}
+	rpc := testSearchSourceRPC(store)
+	rosterCalls := 0
+	rpc.searchSourceRoster = func() ([]uint64, error) {
+		rosterCalls++
+		if rosterCalls == 1 {
+			return []uint64{1, 2, 3}, nil
+		}
+		return []uint64{1, 2, 4}, nil
+	}
+	rpc.searchSourceAuthority = func(string, uint8) (wkdb.ChannelClusterConfig, error) { return cfg, nil }
+
+	if _, err := rpc.searchSourceChannels(searchSourceChannelPageRequest{Version: 5, Limit: 10}); !errors.Is(err, errSearchSourceRoster) {
+		t.Fatalf("error = %v, want roster fence", err)
+	}
+}
+
+func TestSearchSourceChannelsRejectsConfigRevisionChangeDuringRead(t *testing.T) {
+	cfg := validThreeNodeSearchSourceConfig(9, "channel", 1)
+	store := &fakeSearchSourceStore{
+		configs:         []wkdb.ChannelClusterConfig{cfg},
+		configRevisions: []uint64{2, 4},
+	}
+	rpc := testSearchSourceRPC(store)
+	rpc.searchSourceRoster = func() ([]uint64, error) { return []uint64{1, 2, 3}, nil }
+	rpc.searchSourceAuthority = func(string, uint8) (wkdb.ChannelClusterConfig, error) { return cfg, nil }
+
+	if _, err := rpc.searchSourceChannels(searchSourceChannelPageRequest{Version: 5, Limit: 10}); !errors.Is(err, errSearchSourceFence) {
+		t.Fatalf("error = %v, want config revision fence", err)
 	}
 }
 
@@ -59,7 +241,7 @@ func TestSearchSourceBootstrapFailureDisablesBothSourceMethodsBeforeDBReads(t *t
 	}
 	if _, err := rpc.searchSourceMessages(searchSourceMessageRequest{
 		Version: 5, ChannelID: "channel", ChannelType: 2,
-		ExpectedLeaderID: 1, ExpectedTerm: 2, ExpectedConfigVersion: 3,
+		ExpectedLeaderID: 1, ExpectedTerm: 2, ExpectedConfigVersion: 3, ExpectedClusterNodeIDs: []uint64{1}, ExpectedConfigRevision: 2,
 		NextSeq: 1, Limit: 10,
 	}); !errors.Is(err, errSearchSourceUnavailable) {
 		t.Fatalf("message source error = %v, want unavailable", err)
@@ -98,61 +280,6 @@ func TestSearchSourceChannelsReturnsV5TopologyAndWatermarks(t *testing.T) {
 	}
 }
 
-func TestSearchSourceChannelsRetriesTransientConfigurationChange(t *testing.T) {
-	before := validSearchSourceConfig()
-	after := before
-	after.Term++
-	after.ConfVersion++
-	store := &fakeSearchSourceStore{
-		configs:  []wkdb.ChannelClusterConfig{before},
-		applied:  1,
-		physical: 1,
-	}
-	rpc := testSearchSourceRPC(store)
-	authorityCalls := 0
-	rpc.searchSourceAuthority = func(string, uint8) (wkdb.ChannelClusterConfig, error) {
-		authorityCalls++
-		return after, nil
-	}
-
-	resp, err := rpc.searchSourceChannels(searchSourceChannelPageRequest{Version: 5, Limit: 10})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if authorityCalls != 2 {
-		t.Fatalf("authority reads = %d, want one retry", authorityCalls)
-	}
-	if len(resp.Channels) != 1 || resp.Channels[0].Term != after.Term || resp.Channels[0].ConfigVersion != after.ConfVersion {
-		t.Fatalf("inventory response = %+v, want stable updated generation", resp)
-	}
-}
-
-func TestSearchSourceChannelsBoundsContinuousConfigurationChanges(t *testing.T) {
-	before := validSearchSourceConfig()
-	store := &fakeSearchSourceStore{
-		configs:  []wkdb.ChannelClusterConfig{before},
-		applied:  1,
-		physical: 1,
-	}
-	rpc := testSearchSourceRPC(store)
-	authorityCalls := 0
-	rpc.searchSourceAuthority = func(string, uint8) (wkdb.ChannelClusterConfig, error) {
-		authorityCalls++
-		changed := before
-		changed.Term += uint32(authorityCalls)
-		changed.ConfVersion += uint64(authorityCalls)
-		return changed, nil
-	}
-
-	_, err := rpc.searchSourceChannels(searchSourceChannelPageRequest{Version: 5, Limit: 10})
-	if !errors.Is(err, errSearchSourceFence) {
-		t.Fatalf("error = %v, want bounded fail-closed fence", err)
-	}
-	if authorityCalls != 3 {
-		t.Fatalf("authority reads = %d, want three bounded attempts", authorityCalls)
-	}
-}
-
 func TestSearchSourceMessagesV5ExplicitlyEncodesSearchPolicyFields(t *testing.T) {
 	cfg := validSearchSourceConfig()
 	store := &fakeSearchSourceStore{
@@ -168,7 +295,7 @@ func TestSearchSourceMessagesV5ExplicitlyEncodesSearchPolicyFields(t *testing.T)
 
 	resp, err := rpc.searchSourceMessages(searchSourceMessageRequest{
 		Version: 5, ChannelID: "channel", ChannelType: 2,
-		ExpectedLeaderID: 1, ExpectedTerm: 2, ExpectedConfigVersion: 3,
+		ExpectedLeaderID: 1, ExpectedTerm: 2, ExpectedConfigVersion: 3, ExpectedClusterNodeIDs: []uint64{1}, ExpectedConfigRevision: 2,
 		NextSeq: 1, Limit: 10,
 	})
 	if err != nil {
@@ -209,7 +336,7 @@ func TestSearchSourceMessagesRejectsPhysicallyStoredNoPersistMessage(t *testing.
 
 	_, err := rpc.searchSourceMessages(searchSourceMessageRequest{
 		Version: 5, ChannelID: "channel", ChannelType: 2,
-		ExpectedLeaderID: 1, ExpectedTerm: 2, ExpectedConfigVersion: 3,
+		ExpectedLeaderID: 1, ExpectedTerm: 2, ExpectedConfigVersion: 3, ExpectedClusterNodeIDs: []uint64{1}, ExpectedConfigRevision: 2,
 		NextSeq: 1, Limit: 10,
 	})
 	if err == nil {
@@ -225,7 +352,7 @@ func TestSearchSourceMessagesNeverPromotesPhysicalTailToApplied(t *testing.T) {
 
 	resp, err := rpc.searchSourceMessages(searchSourceMessageRequest{
 		Version: 5, ChannelID: "channel", ChannelType: 2,
-		ExpectedLeaderID: 1, ExpectedTerm: 2, ExpectedConfigVersion: 3,
+		ExpectedLeaderID: 1, ExpectedTerm: 2, ExpectedConfigVersion: 3, ExpectedClusterNodeIDs: []uint64{1}, ExpectedConfigRevision: 2,
 		NextSeq: 1, Limit: 10,
 	})
 	if err != nil {
@@ -258,7 +385,7 @@ func TestSearchSourceMessagesFencesApplyPendingResponse(t *testing.T) {
 	}
 	resp, err := rpc.searchSourceMessages(searchSourceMessageRequest{
 		Version: 5, ChannelID: "channel", ChannelType: 2,
-		ExpectedLeaderID: 1, ExpectedTerm: 2, ExpectedConfigVersion: 3,
+		ExpectedLeaderID: 1, ExpectedTerm: 2, ExpectedConfigVersion: 3, ExpectedClusterNodeIDs: []uint64{1}, ExpectedConfigRevision: 2,
 		NextSeq: 1, Limit: 10,
 	})
 	if err != nil {
@@ -290,7 +417,7 @@ func TestSearchSourceMessagesFailsClosedWhenGenerationChanges(t *testing.T) {
 
 	resp, err := rpc.searchSourceMessages(searchSourceMessageRequest{
 		Version: 5, ChannelID: "channel", ChannelType: 2,
-		ExpectedLeaderID: 1, ExpectedTerm: 2, ExpectedConfigVersion: 3,
+		ExpectedLeaderID: 1, ExpectedTerm: 2, ExpectedConfigVersion: 3, ExpectedClusterNodeIDs: []uint64{1}, ExpectedConfigRevision: 2,
 		NextSeq: 2, Limit: 10,
 	})
 	if err != nil {
@@ -357,6 +484,31 @@ func TestOfflineSearchBootstrapConsumesMarkerAndAdvancesOnlyZeroWatermark(t *tes
 	}
 }
 
+func TestOfflineSearchBootstrapInitializesLocalReplicaOnThreeNodeRoster(t *testing.T) {
+	markerPath := filepath.Join(t.TempDir(), SearchSourceOfflineBootstrapMarkerName)
+	writeSearchSourceBootstrapMarker(t, markerPath, `{"version":1,"node_id":2}`)
+	cfg := validThreeNodeSearchSourceConfig(9, "channel", 1)
+	store := &fakeSearchSourceBootstrapStore{
+		configs:  []wkdb.ChannelClusterConfig{cfg},
+		applied:  0,
+		physical: 4,
+	}
+
+	err := applySearchSourceOfflineBootstrapMarker(
+		markerPath,
+		2,
+		func() ([]uint64, error) { return []uint64{3, 1, 2}, nil },
+		func(string, uint8) (wkdb.ChannelClusterConfig, error) { return cfg, nil },
+		store,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.applied != 4 || store.updates != 1 {
+		t.Fatalf("three-node replica bootstrap applied=%d updates=%d, want 4/1", store.applied, store.updates)
+	}
+}
+
 func TestConsumedOfflineSearchBootstrapRecoversAsyncObserverCrashWindow(t *testing.T) {
 	markerPath := filepath.Join(t.TempDir(), SearchSourceOfflineBootstrapMarkerName)
 	writeSearchSourceBootstrapMarker(t, markerPath+".consumed", `{"version":1,"node_id":1}`)
@@ -389,6 +541,97 @@ func TestWindowClosedOfflineSearchBootstrapNeverReconcilesPhysicalTail(t *testin
 	}
 	if store.reads != 0 || store.updates != 0 {
 		t.Fatalf("window-closed state reconciled old data: reads=%d updates=%d", store.reads, store.updates)
+	}
+}
+
+func TestWindowClosedOfflineSearchBootstrapConsumesExplicitRecoveryAuthorization(t *testing.T) {
+	markerPath := filepath.Join(t.TempDir(), SearchSourceOfflineBootstrapMarkerName)
+	writeSearchSourceBootstrapMarker(t, markerPath+".window-closed", `{"version":1,"node_id":2}`)
+	writeSearchSourceBootstrapMarker(t, markerPath+".recovery-authorized", `{"version":1,"node_id":2}`)
+	cfg := validThreeNodeSearchSourceConfig(9, "channel", 1)
+	store := &fakeSearchSourceBootstrapStore{
+		configs:  []wkdb.ChannelClusterConfig{cfg},
+		physical: 4,
+	}
+	roster := func() ([]uint64, error) { return []uint64{3, 1, 2}, nil }
+	authority := func(string, uint8) (wkdb.ChannelClusterConfig, error) { return cfg, nil }
+
+	if err := applySearchSourceOfflineBootstrapMarker(markerPath, 2, roster, authority, store); err != nil {
+		t.Fatal(err)
+	}
+	if store.applied != 4 || store.updates != 1 {
+		t.Fatalf("recovery applied=%d updates=%d, want 4/1", store.applied, store.updates)
+	}
+	if _, err := os.Stat(markerPath + ".window-closed"); err != nil {
+		t.Fatalf("recovery removed the original closed-window evidence: %v", err)
+	}
+	if _, err := os.Stat(markerPath + ".recovery-consumed"); err != nil {
+		t.Fatalf("recovery consumed marker missing: %v", err)
+	}
+	if _, err := os.Stat(markerPath + ".recovery-authorized"); !os.IsNotExist(err) {
+		t.Fatalf("recovery authorization was not consumed: %v", err)
+	}
+	if err := applySearchSourceOfflineBootstrapMarker(markerPath, 2, roster, authority, store); err != nil {
+		t.Fatalf("consumed recovery did not reconcile idempotently: %v", err)
+	}
+	if store.updates != 1 {
+		t.Fatalf("consumed recovery rewrote watermarks: updates=%d", store.updates)
+	}
+}
+
+func TestOfflineSearchBootstrapRejectsRecoveryAuthorizationWithoutClosedWindow(t *testing.T) {
+	markerPath := filepath.Join(t.TempDir(), SearchSourceOfflineBootstrapMarkerName)
+	writeSearchSourceBootstrapMarker(t, markerPath+".recovery-authorized", `{"version":1,"node_id":1}`)
+	store := &fakeSearchSourceBootstrapStore{}
+	err := applySearchSourceOfflineBootstrapMarker(
+		markerPath,
+		1,
+		func() ([]uint64, error) { return []uint64{1}, nil },
+		func(string, uint8) (wkdb.ChannelClusterConfig, error) { return validSearchSourceConfig(), nil },
+		store,
+	)
+	if err == nil {
+		t.Fatal("recovery authorization without a closed window was accepted")
+	}
+	if store.reads != 0 || store.updates != 0 {
+		t.Fatalf("invalid recovery authorization read=%d update=%d", store.reads, store.updates)
+	}
+	if _, err := os.Stat(markerPath + ".recovery-authorized"); err != nil {
+		t.Fatalf("invalid recovery authorization was mutated: %v", err)
+	}
+	if _, err := os.Stat(markerPath + ".window-closed"); !os.IsNotExist(err) {
+		t.Fatalf("invalid recovery authorization changed the closed-window state: %v", err)
+	}
+}
+
+func TestWindowClosedOfflineSearchRecoveryKeepsApplyingMarkerOnPartialWatermark(t *testing.T) {
+	markerPath := filepath.Join(t.TempDir(), SearchSourceOfflineBootstrapMarkerName)
+	writeSearchSourceBootstrapMarker(t, markerPath+".window-closed", `{"version":1,"node_id":1}`)
+	writeSearchSourceBootstrapMarker(t, markerPath+".recovery-authorized", `{"version":1,"node_id":1}`)
+	cfg := validSearchSourceConfig()
+	store := &fakeSearchSourceBootstrapStore{
+		configs:  []wkdb.ChannelClusterConfig{cfg},
+		applied:  1,
+		physical: 5,
+	}
+	err := applySearchSourceOfflineBootstrapMarker(
+		markerPath,
+		1,
+		func() ([]uint64, error) { return []uint64{1}, nil },
+		func(string, uint8) (wkdb.ChannelClusterConfig, error) { return cfg, nil },
+		store,
+	)
+	if err == nil {
+		t.Fatal("partial watermark unexpectedly completed closed-window recovery")
+	}
+	if store.applied != 1 || store.updates != 0 {
+		t.Fatalf("partial recovery watermark changed: applied=%d updates=%d", store.applied, store.updates)
+	}
+	if _, err := os.Stat(markerPath + ".recovery-applying"); err != nil {
+		t.Fatalf("failed recovery did not retain its applying marker: %v", err)
+	}
+	if _, err := os.Stat(markerPath + ".window-closed"); err != nil {
+		t.Fatalf("failed recovery removed the original closed-window evidence: %v", err)
 	}
 }
 
@@ -522,6 +765,33 @@ func TestOfflineSearchBootstrapFencesRosterAfterEachPage(t *testing.T) {
 	}
 }
 
+func TestOfflineSearchBootstrapFencesConfigRevisionBeforeConsumingMarker(t *testing.T) {
+	markerPath := filepath.Join(t.TempDir(), SearchSourceOfflineBootstrapMarkerName)
+	writeSearchSourceBootstrapMarker(t, markerPath, `{"version":1,"node_id":1}`)
+	cfg := validSearchSourceConfig()
+	store := &fakeSearchSourceBootstrapStore{
+		configs:         []wkdb.ChannelClusterConfig{cfg},
+		physical:        2,
+		configRevisions: []uint64{2, 2, 4},
+	}
+	err := applySearchSourceOfflineBootstrapMarker(
+		markerPath,
+		1,
+		func() ([]uint64, error) { return []uint64{1}, nil },
+		func(string, uint8) (wkdb.ChannelClusterConfig, error) { return cfg, nil },
+		store,
+	)
+	if !errors.Is(err, errSearchSourceFence) {
+		t.Fatalf("error = %v, want config revision fence", err)
+	}
+	if _, err := os.Stat(markerPath + ".applying"); err != nil {
+		t.Fatalf("fenced bootstrap did not retain applying marker: %v", err)
+	}
+	if _, err := os.Stat(markerPath + ".consumed"); !os.IsNotExist(err) {
+		t.Fatalf("fenced bootstrap consumed its marker: %v", err)
+	}
+}
+
 func TestOfflineSearchBootstrapRejectsInvalidMarkerWithoutWriting(t *testing.T) {
 	markerPath := filepath.Join(t.TempDir(), SearchSourceOfflineBootstrapMarkerName)
 	writeSearchSourceBootstrapMarker(t, markerPath, `{"version":1,"node_id":2}`)
@@ -606,23 +876,56 @@ func validSearchSourceConfig() wkdb.ChannelClusterConfig {
 	}
 }
 
+func validThreeNodeSearchSourceConfig(id uint64, channelID string, leaderID uint64) wkdb.ChannelClusterConfig {
+	return wkdb.ChannelClusterConfig{
+		Id: id, ChannelId: channelID, ChannelType: 2, ReplicaMaxCount: 3,
+		Replicas: []uint64{1, 2, 3}, LeaderId: leaderID, Term: 2, ConfVersion: 3,
+		Status: wkdb.ChannelClusterStatusNormal,
+	}
+}
+
 type fakeSearchSourceStore struct {
-	configs   []wkdb.ChannelClusterConfig
-	applied   uint64
-	physical  uint64
-	messages  []wkdb.SearchSourceMessage
-	calls     []string
-	loadCalls int
+	configs          []wkdb.ChannelClusterConfig
+	configRevision   uint64
+	configRevisions  []uint64
+	applied          uint64
+	physical         uint64
+	messages         []wkdb.SearchSourceMessage
+	calls            []string
+	loadCalls        int
+	revisionReadCall int
 }
 
 type fakeSearchSourceBootstrapStore struct {
-	configs      []wkdb.ChannelClusterConfig
-	applied      uint64
-	physical     uint64
-	reads        int
-	updates      int
-	limits       []int
-	onGetConfigs func()
+	configs          []wkdb.ChannelClusterConfig
+	configRevision   uint64
+	configRevisions  []uint64
+	applied          uint64
+	physical         uint64
+	reads            int
+	updates          int
+	limits           []int
+	onGetConfigs     func()
+	revisionReadCall int
+}
+
+func nextFakeSearchSourceConfigRevision(configured uint64, revisions []uint64, call *int) uint64 {
+	if len(revisions) > 0 {
+		index := *call
+		if index >= len(revisions) {
+			index = len(revisions) - 1
+		}
+		*call++
+		return revisions[index]
+	}
+	if configured == 0 {
+		return 2
+	}
+	return configured
+}
+
+func (f *fakeSearchSourceBootstrapStore) GetChannelClusterConfigRevision() uint64 {
+	return nextFakeSearchSourceConfigRevision(f.configRevision, f.configRevisions, &f.revisionReadCall)
 }
 
 func (f *fakeSearchSourceBootstrapStore) GetChannelClusterConfigs(_ uint64, limit int) ([]wkdb.ChannelClusterConfig, error) {
@@ -654,6 +957,10 @@ func (f *fakeSearchSourceBootstrapStore) UpdateAppliedMsgSeq(_ string, _ uint8, 
 func (f *fakeSearchSourceStore) GetChannelClusterConfigs(uint64, int) ([]wkdb.ChannelClusterConfig, error) {
 	f.calls = append(f.calls, "configs")
 	return f.configs, nil
+}
+
+func (f *fakeSearchSourceStore) GetChannelClusterConfigRevision() uint64 {
+	return nextFakeSearchSourceConfigRevision(f.configRevision, f.configRevisions, &f.revisionReadCall)
 }
 
 func (f *fakeSearchSourceStore) GetAppliedMsgSeq(string, uint8) (uint64, error) {

@@ -7,6 +7,8 @@ import (
 	"hash"
 	"hash/fnv"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/trace"
@@ -38,15 +40,17 @@ type wukongDB struct {
 
 	metrics trace.IDBMetrics
 
-	channelSeqCache     *channelSeqCache
-	conversationCache   *ConversationCache
-	channelInfoCache    *ChannelInfoCache
-	permissionCache     *PermissionCache           // 统一的权限缓存（替代 denylistCache, subscriberCache, allowlistCache）
-	clusterConfigCache  *ChannelClusterConfigCache // 频道集群配置缓存
-	deviceCache         *DeviceCache               // 设备缓存
-	userLastMsgSeqCache *userLastMsgSeqCache       // 用户在频道内发送的最后一条消息序号缓存
-	cacheManager        *CacheManager              // 缓存管理器
-	performanceMonitor  *PerformanceMonitor        // 性能监控器
+	channelSeqCache              *channelSeqCache
+	conversationCache            *ConversationCache
+	channelInfoCache             *ChannelInfoCache
+	permissionCache              *PermissionCache           // 统一的权限缓存（替代 denylistCache, subscriberCache, allowlistCache）
+	clusterConfigCache           *ChannelClusterConfigCache // 频道集群配置缓存
+	channelClusterConfigWriteMu  sync.Mutex
+	channelClusterConfigRevision atomic.Uint64
+	deviceCache                  *DeviceCache         // 设备缓存
+	userLastMsgSeqCache          *userLastMsgSeqCache // 用户在频道内发送的最后一条消息序号缓存
+	cacheManager                 *CacheManager        // 缓存管理器
+	performanceMonitor           *PerformanceMonitor  // 性能监控器
 
 	h hash.Hash32
 }
@@ -102,6 +106,7 @@ func NewWukongDB(opts *Options) DB {
 		wk.clusterConfigCache,
 		wk.deviceCache,
 	)
+	wk.channelClusterConfigRevision.Store(2)
 
 	return wk
 }
