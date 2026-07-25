@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/service"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
@@ -19,6 +20,7 @@ const (
 	SearchSourceOfflineBootstrapMarkerName = "search-source-bootstrap-v1.json"
 	searchSourceBootstrapPageSize          = 100
 	searchSourceBootstrapMarkerMaxBytes    = 4096
+	searchSourceAuthorityRetryInterval     = 50 * time.Millisecond
 	searchSourceRecoveryAuthorizedSuffix   = ".recovery-authorized"
 	searchSourceRecoveryApplyingSuffix     = ".recovery-applying"
 	searchSourceRecoveryConsumedSuffix     = ".recovery-consumed"
@@ -352,7 +354,12 @@ func reconcileConsumedSearchSource(
 			if !searchSourceConfigHasReplica(before, nodeID) {
 				continue
 			}
-			authoritativeBefore, err := authority(before.ChannelId, before.ChannelType)
+			authoritativeBefore, err := loadSearchSourceAuthority(
+				ctx,
+				authority,
+				before.ChannelId,
+				before.ChannelType,
+			)
 			if err != nil {
 				return err
 			}
@@ -389,7 +396,12 @@ func reconcileConsumedSearchSource(
 					return fmt.Errorf("consumed search watermark was not durable: got=%d want-at-least=%d", confirmed, physical)
 				}
 			}
-			authoritativeAfter, err := authority(before.ChannelId, before.ChannelType)
+			authoritativeAfter, err := loadSearchSourceAuthority(
+				ctx,
+				authority,
+				before.ChannelId,
+				before.ChannelType,
+			)
 			if err != nil {
 				return err
 			}
@@ -473,7 +485,12 @@ func runSearchSourceOfflineBootstrap(
 			if applied > physical || physical > wkdb.MaxMessageSequence {
 				return fmt.Errorf("invalid offline bootstrap watermarks: applied=%d physical=%d", applied, physical)
 			}
-			authoritativeBefore, err := authority(before.ChannelId, before.ChannelType)
+			authoritativeBefore, err := loadSearchSourceAuthority(
+				ctx,
+				authority,
+				before.ChannelId,
+				before.ChannelType,
+			)
 			if err != nil {
 				return err
 			}
@@ -500,7 +517,12 @@ func runSearchSourceOfflineBootstrap(
 					return fmt.Errorf("offline search applied watermark was not durable: got=%d want=%d", confirmed, physical)
 				}
 			}
-			authoritativeAfter, err := authority(before.ChannelId, before.ChannelType)
+			authoritativeAfter, err := loadSearchSourceAuthority(
+				ctx,
+				authority,
+				before.ChannelId,
+				before.ChannelType,
+			)
 			if err != nil {
 				return err
 			}
@@ -516,6 +538,41 @@ func runSearchSourceOfflineBootstrap(
 		}
 	}
 	return validateSnapshot()
+}
+
+func loadSearchSourceAuthority(
+	ctx context.Context,
+	authority func(string, uint8) (wkdb.ChannelClusterConfig, error),
+	channelID string,
+	channelType uint8,
+) (wkdb.ChannelClusterConfig, error) {
+	for {
+		config, err := authority(channelID, channelType)
+		if err == nil {
+			return config, nil
+		}
+		if !isSearchSourceAuthorityStartupError(err) {
+			return wkdb.EmptyChannelClusterConfig, err
+		}
+		select {
+		case <-ctx.Done():
+			return wkdb.EmptyChannelClusterConfig, fmt.Errorf(
+				"wait for authoritative search source config: %w",
+				errors.Join(err, ctx.Err()),
+			)
+		case <-time.After(searchSourceAuthorityRetryInterval):
+		}
+	}
+}
+
+func isSearchSourceAuthorityStartupError(err error) bool {
+	for current := err; current != nil; current = errors.Unwrap(current) {
+		switch current.Error() {
+		case "connect not authed", "conn is nil":
+			return true
+		}
+	}
+	return false
 }
 
 func loadSearchSourceBootstrapRoster(nodeID uint64, roster func() ([]uint64, error)) ([]uint64, error) {

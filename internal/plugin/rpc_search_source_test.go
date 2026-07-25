@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
@@ -576,6 +577,48 @@ func TestWindowClosedOfflineSearchBootstrapConsumesExplicitRecoveryAuthorization
 	}
 	if store.updates != 1 {
 		t.Fatalf("consumed recovery rewrote watermarks: updates=%d", store.updates)
+	}
+}
+
+func TestWindowClosedOfflineSearchBootstrapWaitsForAuthorityAuthentication(t *testing.T) {
+	markerPath := filepath.Join(t.TempDir(), SearchSourceOfflineBootstrapMarkerName)
+	writeSearchSourceBootstrapMarker(t, markerPath+".window-closed", `{"version":1,"node_id":2}`)
+	writeSearchSourceBootstrapMarker(t, markerPath+".recovery-authorized", `{"version":1,"node_id":2}`)
+	cfg := validThreeNodeSearchSourceConfig(9, "channel", 1)
+	store := &fakeSearchSourceBootstrapStore{
+		configs:  []wkdb.ChannelClusterConfig{cfg},
+		physical: 4,
+	}
+	authorityCalls := 0
+	authority := func(string, uint8) (wkdb.ChannelClusterConfig, error) {
+		authorityCalls++
+		if authorityCalls == 1 {
+			return wkdb.EmptyChannelClusterConfig, errors.New("connect not authed")
+		}
+		return cfg, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err := applySearchSourceOfflineBootstrapMarkerContext(
+		ctx,
+		markerPath,
+		2,
+		func() ([]uint64, error) { return []uint64{3, 1, 2}, nil },
+		authority,
+		store,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if authorityCalls != 3 {
+		t.Fatalf("authority calls = %d, want initial retry plus before/after validation", authorityCalls)
+	}
+	if store.applied != 4 || store.updates != 1 {
+		t.Fatalf("recovery applied=%d updates=%d, want 4/1", store.applied, store.updates)
+	}
+	if _, err := os.Stat(markerPath + ".recovery-consumed"); err != nil {
+		t.Fatalf("recovery consumed marker missing: %v", err)
 	}
 }
 
