@@ -55,7 +55,7 @@ func (liveSearchSourceBootstrapStore) UpdateAppliedMsgSeq(channelID string, chan
 // starts. Absence of an explicitly supplied marker closes the one-time window
 // and keeps search fail-closed, but never prevents ordinary IM startup.
 func ApplySearchSourceOfflineBootstrapMarker(ctx context.Context, markerPath string) (bool, error) {
-	err := applySearchSourceOfflineBootstrapMarkerContext(
+	err := applySearchSourceOfflineBootstrapMarkerUntilStable(
 		ctx,
 		markerPath,
 		defaultSearchSourceNodeID(),
@@ -96,6 +96,30 @@ func applySearchSourceOfflineBootstrapMarker(
 	store searchSourceBootstrapStore,
 ) error {
 	return applySearchSourceOfflineBootstrapMarkerContext(context.Background(), markerPath, nodeID, roster, authority, store)
+}
+
+func applySearchSourceOfflineBootstrapMarkerUntilStable(
+	ctx context.Context,
+	markerPath string,
+	nodeID uint64,
+	roster func() ([]uint64, error),
+	authority func(string, uint8) (wkdb.ChannelClusterConfig, error),
+	store searchSourceBootstrapStore,
+) error {
+	for {
+		err := applySearchSourceOfflineBootstrapMarkerContext(ctx, markerPath, nodeID, roster, authority, store)
+		if !errors.Is(err, errSearchSourceFence) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf(
+				"wait for stable search source configuration: %w",
+				errors.Join(err, ctx.Err()),
+			)
+		case <-time.After(searchSourceAuthorityRetryInterval):
+		}
+	}
 }
 
 func applySearchSourceOfflineBootstrapMarkerContext(

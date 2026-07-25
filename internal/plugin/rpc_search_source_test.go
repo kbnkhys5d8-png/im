@@ -622,6 +622,69 @@ func TestWindowClosedOfflineSearchBootstrapWaitsForAuthorityAuthentication(t *te
 	}
 }
 
+func TestWindowClosedOfflineSearchBootstrapRetriesConfigFenceUntilStable(t *testing.T) {
+	markerPath := filepath.Join(t.TempDir(), SearchSourceOfflineBootstrapMarkerName)
+	writeSearchSourceBootstrapMarker(t, markerPath+".window-closed", `{"version":1,"node_id":2}`)
+	writeSearchSourceBootstrapMarker(t, markerPath+".recovery-authorized", `{"version":1,"node_id":2}`)
+	cfg := validThreeNodeSearchSourceConfig(9, "channel", 1)
+	store := &fakeSearchSourceBootstrapStore{
+		configs:         []wkdb.ChannelClusterConfig{cfg},
+		configRevisions: []uint64{2, 4, 4},
+		physical:        4,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err := applySearchSourceOfflineBootstrapMarkerUntilStable(
+		ctx,
+		markerPath,
+		2,
+		func() ([]uint64, error) { return []uint64{3, 1, 2}, nil },
+		func(string, uint8) (wkdb.ChannelClusterConfig, error) { return cfg, nil },
+		store,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.applied != 4 || store.updates != 1 {
+		t.Fatalf("recovery applied=%d updates=%d, want 4/1", store.applied, store.updates)
+	}
+	if store.revisionReadCall < 3 {
+		t.Fatalf("config revision reads = %d, want a retry after the fence", store.revisionReadCall)
+	}
+	if _, err := os.Stat(markerPath + ".recovery-consumed"); err != nil {
+		t.Fatalf("recovery consumed marker missing: %v", err)
+	}
+}
+
+func TestWindowClosedOfflineSearchBootstrapConfigFenceRetryIsContextBounded(t *testing.T) {
+	markerPath := filepath.Join(t.TempDir(), SearchSourceOfflineBootstrapMarkerName)
+	writeSearchSourceBootstrapMarker(t, markerPath+".window-closed", `{"version":1,"node_id":2}`)
+	writeSearchSourceBootstrapMarker(t, markerPath+".recovery-authorized", `{"version":1,"node_id":2}`)
+	cfg := validThreeNodeSearchSourceConfig(9, "channel", 1)
+	store := &fakeSearchSourceBootstrapStore{
+		configs:         []wkdb.ChannelClusterConfig{cfg},
+		configRevisions: []uint64{2, 4},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	err := applySearchSourceOfflineBootstrapMarkerUntilStable(
+		ctx,
+		markerPath,
+		2,
+		func() ([]uint64, error) { return []uint64{3, 1, 2}, nil },
+		func(string, uint8) (wkdb.ChannelClusterConfig, error) { return cfg, nil },
+		store,
+	)
+	if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, errSearchSourceFence) {
+		t.Fatalf("error = %v, want bounded config fence deadline", err)
+	}
+	if _, err := os.Stat(markerPath + ".recovery-applying"); err != nil {
+		t.Fatalf("bounded retry did not retain resumable recovery state: %v", err)
+	}
+}
+
 func TestOfflineSearchBootstrapRejectsRecoveryAuthorizationWithoutClosedWindow(t *testing.T) {
 	markerPath := filepath.Join(t.TempDir(), SearchSourceOfflineBootstrapMarkerName)
 	writeSearchSourceBootstrapMarker(t, markerPath+".recovery-authorized", `{"version":1,"node_id":1}`)
