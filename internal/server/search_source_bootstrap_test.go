@@ -8,8 +8,8 @@ import (
 )
 
 func TestSearchSourceBootstrapStartupTimeoutCoversRollingRebalance(t *testing.T) {
-	if searchSourceBootstrapStartupTimeout < 2*time.Minute {
-		t.Fatalf("startup timeout = %v, want at least two minutes for rolling cluster convergence", searchSourceBootstrapStartupTimeout)
+	if searchSourceBootstrapStartupTimeout < 5*time.Minute {
+		t.Fatalf("startup timeout = %v, want at least five minutes for rolling cluster convergence", searchSourceBootstrapStartupTimeout)
 	}
 }
 
