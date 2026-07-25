@@ -86,7 +86,7 @@ type Server struct {
 	pluginServer *plugin.Server
 }
 
-const searchSourceBootstrapStartupTimeout = 30 * time.Second
+const searchSourceBootstrapStartupTimeout = 2 * time.Minute
 
 func New(opts *options.Options) *Server {
 	now := time.Now().UTC()
