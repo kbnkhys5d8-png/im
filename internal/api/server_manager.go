@@ -66,10 +66,7 @@ func (m *managerServer) start() {
 
 	m.setRoutes()
 
-	m.httpServer = &http.Server{
-		Addr:    m.addr,
-		Handler: m.r,
-	}
+	m.httpServer = newHTTPServer(m.addr, m.r)
 	go func(server *http.Server) {
 		err := server.ListenAndServe()
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {

@@ -36,8 +36,8 @@ func (h *Handler) permission(ctx *eventbus.ChannelContext) {
 	// --------------- 判断发送者权限 ----------------
 	for _, event := range events {
 		senderInfo := service.SenderInfo{
-			UID:      event.Conn.Uid,
-			DeviceID: event.Conn.DeviceId,
+			UID:             event.Conn.Uid,
+			TrustedInternal: trustedInternalConnection(event.Conn),
 		}
 		reasonCode, err = service.Permission.HasPermissionForSender(channelId, channelType, senderInfo)
 		if err != nil {

@@ -281,6 +281,7 @@ func sendMessageToChannel(req messageSendReq, channelId string, channelType uint
 		Conn: &eventbus.Conn{
 			Uid:      req.FromUID,
 			DeviceId: options.G.SystemDeviceId,
+			Internal: true,
 		},
 		Type:      eventbus.EventChannelOnSend,
 		Frame:     sendPacket,
@@ -1143,6 +1144,7 @@ func (m *message) sendEvent(req *eventAppendReq, fakeChannelID string, eventKey 
 		Conn: &eventbus.Conn{
 			Uid:      req.FromUID,
 			DeviceId: options.G.SystemDeviceId,
+			Internal: true,
 		},
 		Type:      eventbus.EventChannelDistribute,
 		Frame:     event,

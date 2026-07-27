@@ -31,8 +31,8 @@ func NewPermissionService(client RPCClient) *PermissionService {
 
 // SenderInfo 发送者信息，用于权限检查
 type SenderInfo struct {
-	UID      string // 发送者UID
-	DeviceID string // 设备ID
+	UID             string // 发送者UID
+	TrustedInternal bool   // 是否由服务端内部可信入口创建
 }
 
 // IsPublicChannelType 检查是否为公开频道类型，这些频道类型允许直接通过权限检查
@@ -105,8 +105,8 @@ func (p *PermissionService) HasPermissionForSender(channelId string, channelType
 		}
 	}
 
-	// 系统发的消息直接通过
-	if options.G.IsSystemDevice(sender.DeviceID) {
+	// 只有服务端内部可信入口创建的消息才能跳过发送者权限。
+	if sender.TrustedInternal {
 		return wkproto.ReasonSuccess, nil
 	}
 

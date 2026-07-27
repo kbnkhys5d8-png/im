@@ -83,6 +83,7 @@ func (a *rpc) messageSend(c *wkrpc.Context) {
 		Conn: &eventbus.Conn{
 			Uid:      req.FromUid,
 			DeviceId: options.G.SystemDeviceId,
+			Internal: true,
 		},
 		Type:      eventType,
 		Frame:     sendPacket,

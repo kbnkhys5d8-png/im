@@ -39,6 +39,8 @@ type Conn struct {
 	DeviceLevel wkproto.DeviceLevel
 	// 连接是否通过认证
 	Auth bool
+	// 是否由服务端内部创建。客户端连接不能设置此字段。
+	Internal bool
 	// 连接的aes iv
 	AesIV []byte
 	// 连接的aes key
@@ -68,6 +70,7 @@ func (c *Conn) Encode() ([]byte, error) {
 	enc.WriteUint8(c.ProtoVersion)
 	enc.WriteUint64(c.Uptime)
 	enc.WriteUint8(wkutil.BoolToUint8(c.IsJsonRpc))
+	enc.WriteUint8(wkutil.BoolToUint8(c.Internal))
 	return enc.Bytes(), nil
 }
 
@@ -124,11 +127,21 @@ func (c *Conn) Decode(data []byte) error {
 	}
 	c.IsJsonRpc = wkutil.Uint8ToBool(isJsonRpc)
 
+	// Internal was added after the original connection encoding. Treat an
+	// absent trailing byte as false so rolling upgrades can decode old events.
+	if dec.Len() > 0 {
+		var internal uint8
+		if internal, err = dec.Uint8(); err != nil {
+			return err
+		}
+		c.Internal = wkutil.Uint8ToBool(internal)
+	}
+
 	return nil
 }
 
 func (c *Conn) Size() uint64 {
-	return uint64(8 + len(c.Uid) + len(c.DeviceId) + 1 + 1 + 8 + 1 + len(c.AesIV) + len(c.AesKey) + 1)
+	return uint64(8 + len(c.Uid) + len(c.DeviceId) + 1 + 1 + 8 + 1 + len(c.AesIV) + len(c.AesKey) + 1 + 1)
 }
 
 func (c *Conn) Equal(cn *Conn) bool {

@@ -70,10 +70,7 @@ func (s *apiServer) start() {
 	s.r.Use(bandwidthMiddleware())
 
 	s.setRoutes()
-	s.httpServer = &http.Server{
-		Addr:    s.addr,
-		Handler: s.r,
-	}
+	s.httpServer = newHTTPServer(s.addr, s.r)
 	go func(server *http.Server) {
 		err := server.ListenAndServe()
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
