@@ -43,6 +43,32 @@ func TestInitializeSearchSourceBeforeTrafficTimesOutAndReturnsControl(t *testing
 	// failure is recorded for search readiness but is not returned by Start.
 }
 
+func TestInitializeSearchSourceBeforeTrafficRecordsOriginalRequiredError(t *testing.T) {
+	NewTestServer(t) // initializes options.G for the real plugin bootstrap path.
+	var recorded error
+	err := initializeSearchSourceBeforeTraffic(
+		context.Background(),
+		0,
+		func(ctx context.Context) error {
+			_, err := plugin.ApplySearchSourceOfflineBootstrapMarker(
+				ctx,
+				filepath.Join(t.TempDir(), plugin.SearchSourceOfflineBootstrapMarkerName),
+			)
+			return err
+		},
+		func(err error) { recorded = err },
+	)
+	if err == nil {
+		t.Fatal("ordinary bootstrap returned nil error")
+	}
+	if recorded != err {
+		t.Fatalf("recorded error = %v, want the original returned error %v", recorded, err)
+	}
+	if !plugin.IsSearchSourceBootstrapRequired(recorded) {
+		t.Fatalf("recorded error = %v, want bootstrap-required sentinel", recorded)
+	}
+}
+
 func TestInitializeSearchSourceWithoutDeadlineWaitsForCompletion(t *testing.T) {
 	started := make(chan struct{})
 	completed := make(chan struct{})
