@@ -28,6 +28,10 @@ const (
 
 var errSearchSourceBootstrapRequired = errors.New("explicit offline search bootstrap is required")
 
+func IsSearchSourceBootstrapRequired(err error) bool {
+	return errors.Is(err, errSearchSourceBootstrapRequired)
+}
+
 type searchSourceOfflineBootstrapMarker struct {
 	Version int    `json:"version"`
 	NodeID  uint64 `json:"node_id"`

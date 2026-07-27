@@ -86,7 +86,7 @@ type Server struct {
 	pluginServer *plugin.Server
 }
 
-const searchSourceBootstrapStartupTimeout = 20 * time.Minute
+const searchSourceBootstrapStartupTimeout time.Duration = 0
 
 func New(opts *options.Options) *Server {
 	now := time.Now().UTC()
@@ -310,6 +310,10 @@ func (s *Server) Start() error {
 		s.pluginServer.SetSearchSourceBootstrapResult,
 	)
 	if bootstrapErr != nil {
+		if !plugin.IsSearchSourceBootstrapRequired(bootstrapErr) {
+			s.Error("offline search source bootstrap failed; traffic remains stopped", zap.Error(bootstrapErr))
+			return fmt.Errorf("offline search source bootstrap: %w", bootstrapErr)
+		}
 		s.Error("offline search source bootstrap failed; search source disabled", zap.Error(bootstrapErr))
 	}
 	s.engine.OnConnect(s.onConnect)
@@ -371,7 +375,11 @@ func initializeSearchSourceBeforeTraffic(
 	apply func(context.Context) error,
 	record func(error),
 ) error {
-	ctx, cancel := context.WithTimeout(parent, timeout)
+	ctx := parent
+	cancel := func() {}
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(parent, timeout)
+	}
 	defer cancel()
 	err := apply(ctx)
 	record(err)

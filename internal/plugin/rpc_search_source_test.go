@@ -252,6 +252,21 @@ func TestSearchSourceBootstrapFailureDisablesBothSourceMethodsBeforeDBReads(t *t
 	}
 }
 
+func TestIsSearchSourceBootstrapRequired(t *testing.T) {
+	if !IsSearchSourceBootstrapRequired(fmt.Errorf("startup bootstrap: %w", errSearchSourceBootstrapRequired)) {
+		t.Fatal("wrapped bootstrap-required sentinel was not recognized")
+	}
+	for _, err := range []error{
+		context.Canceled,
+		errSearchSourceFence,
+		errors.New("unrelated failure"),
+	} {
+		if IsSearchSourceBootstrapRequired(err) {
+			t.Fatalf("unexpected bootstrap-required classification for %v", err)
+		}
+	}
+}
+
 func TestSearchSourceChannelsReturnsV5TopologyAndWatermarks(t *testing.T) {
 	cfg := validSearchSourceConfig()
 	store := &fakeSearchSourceStore{
