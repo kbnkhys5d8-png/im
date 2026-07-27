@@ -18,7 +18,7 @@ import (
 
 const (
 	SearchSourceOfflineBootstrapMarkerName = "search-source-bootstrap-v1.json"
-	searchSourceBootstrapPageSize          = 100
+	searchSourceBootstrapPageSize          = 500
 	searchSourceBootstrapMarkerMaxBytes    = 4096
 	searchSourceAuthorityRetryInterval     = 50 * time.Millisecond
 	searchSourceRecoveryAuthorizedSuffix   = ".recovery-authorized"
