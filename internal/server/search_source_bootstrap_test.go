@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -147,10 +148,22 @@ func TestSearchSourceBootstrapRequiredStillAllowsOrdinaryTrafficStartup(t *testi
 			}
 			t.Cleanup(s.StopNoErr)
 			assertTrafficIsRunning(t, s)
+			assertSearchSourceReadinessRecordedRequiredBootstrap(t, s)
 			if _, err := os.Stat(markerPath + ".window-closed"); err != nil {
 				t.Fatalf("required bootstrap state was not retained: %v", err)
 			}
 		})
+	}
+}
+
+func assertSearchSourceReadinessRecordedRequiredBootstrap(t *testing.T, s *Server) {
+	t.Helper()
+	readiness := reflect.ValueOf(s.pluginServer).Elem().FieldByName("searchReady")
+	if !readiness.IsValid() || readiness.IsNil() {
+		t.Fatal("plugin search readiness is unavailable")
+	}
+	if readiness.Elem().FieldByName("ready").Bool() {
+		t.Fatal("search readiness was enabled after required bootstrap state")
 	}
 }
 
