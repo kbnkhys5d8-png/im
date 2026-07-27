@@ -276,6 +276,23 @@ func (wk *wukongDB) GetMessage(messageId uint64) (Message, error) {
 	return EmptyMessage, ErrNotFound
 }
 
+const maxMessageResultPrealloc = 128
+
+func messageResultCapacity(limit int, minSeq, maxSeq uint64) int {
+	if limit <= 0 || maxSeq <= minSeq {
+		return 0
+	}
+
+	capacity := limit
+	if capacity > maxMessageResultPrealloc {
+		capacity = maxMessageResultPrealloc
+	}
+	if span := maxSeq - minSeq; span < uint64(capacity) {
+		return int(span)
+	}
+	return capacity
+}
+
 // 情况1: startMessageSeq=100, endMessageSeq=0, limit=10 返回的消息seq为91-100的消息 (limit生效)
 // 情况2: startMessageSeq=5, endMessageSeq=0, limit=10 返回的消息seq为1-5的消息（消息无）
 
@@ -331,7 +348,11 @@ func (wk *wukongDB) LoadPrevRangeMsgs(channelId string, channelType uint8, start
 	})
 	defer iter.Close()
 
-	msgs := make([]Message, 0)
+	msgs := make(
+		[]Message,
+		0,
+		messageResultCapacity(limit, minSeq, maxSeq),
+	)
 	err = wk.iteratorChannelMessages(iter, limit, func(m Message) bool {
 		msgs = append(msgs, m)
 		return true
@@ -370,7 +391,11 @@ func (wk *wukongDB) LoadNextRangeMsgs(channelId string, channelType uint8, start
 	})
 	defer iter.Close()
 
-	msgs := make([]Message, 0)
+	msgs := make(
+		[]Message,
+		0,
+		messageResultCapacity(limit, minSeq, maxSeq),
+	)
 
 	err = wk.iteratorChannelMessages(iter, limit, func(m Message) bool {
 		msgs = append(msgs, m)

@@ -176,6 +176,51 @@ func runParallel[K comparable, V any](
 	return totalResults, nil
 }
 
+func requestPeerRecentMessages(
+	groups map[uint64][]*channelRecentMessageReq,
+	localNodeID uint64,
+	process func(
+		uint64,
+		[]*channelRecentMessageReq,
+	) ([]*channelRecentMessage, error),
+) ([]*channelRecentMessage, error) {
+	results := make([]*channelRecentMessage, 0)
+	var resultsLock sync.Mutex
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(groups))
+
+	for nodeID, requests := range groups {
+		if nodeID == localNodeID {
+			continue
+		}
+
+		wg.Add(1)
+		go func(peerID uint64, peerRequests []*channelRecentMessageReq) {
+			defer wg.Done()
+
+			peerResults, err := process(peerID, peerRequests)
+			if err != nil {
+				errCh <- err
+				return
+			}
+
+			resultsLock.Lock()
+			results = append(results, peerResults...)
+			resultsLock.Unlock()
+		}(nodeID, requests)
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		if err != nil {
+			return nil, err
+		}
+	}
+	return results, nil
+}
+
 // ==================== 集群消息同步 ====================
 
 func (s *request) getRecentMessagesForCluster(uid string, msgCount int, channels []*channelRecentMessageReq, orderByLast bool) ([]*channelRecentMessage, error) {
@@ -183,11 +228,7 @@ func (s *request) getRecentMessagesForCluster(uid string, msgCount int, channels
 		return nil, nil
 	}
 
-	var (
-		channelRecentMessages     []*channelRecentMessage
-		err                       error
-		channelRecentMessagesLock sync.Mutex
-	)
+	var channelRecentMessages []*channelRecentMessage
 
 	// 按照频道所在节点进行分组
 	peerChannelRecentMessageReqsMap := make(map[uint64][]*channelRecentMessageReq)
@@ -201,31 +242,35 @@ func (s *request) getRecentMessagesForCluster(uid string, msgCount int, channels
 
 	// 请求远程的消息列表
 	if len(peerChannelRecentMessageReqsMap) > 0 {
-		var reqErr error
-		wg := &sync.WaitGroup{}
-		for nodeId, peerChannelRecentMessageReqs := range peerChannelRecentMessageReqsMap {
-			if nodeId == options.G.Cluster.NodeId {
-				continue
-			}
-			wg.Add(1)
-			go func(pID uint64, reqs []*channelRecentMessageReq) {
-				defer wg.Done()
-				results, err := s.requestSyncMessage(pID, reqs, uid, msgCount, orderByLast)
+		peerMessages, requestErr := requestPeerRecentMessages(
+			peerChannelRecentMessageReqsMap,
+			options.G.Cluster.NodeId,
+			func(
+				peerID uint64,
+				requests []*channelRecentMessageReq,
+			) ([]*channelRecentMessage, error) {
+				results, err := s.requestSyncMessage(
+					peerID,
+					requests,
+					uid,
+					msgCount,
+					orderByLast,
+				)
 				if err != nil {
-					s.Error("请求同步消息失败！", zap.Error(err), zap.Uint64("nodeId", pID))
-					reqErr = err
-					return
+					s.Error(
+						"请求同步消息失败！",
+						zap.Error(err),
+						zap.Uint64("nodeId", peerID),
+					)
 				}
-				channelRecentMessagesLock.Lock()
-				channelRecentMessages = append(channelRecentMessages, results...)
-				channelRecentMessagesLock.Unlock()
-			}(nodeId, peerChannelRecentMessageReqs)
+				return results, err
+			},
+		)
+		if requestErr != nil {
+			s.Error("请求同步消息失败！", zap.Error(requestErr))
+			return nil, requestErr
 		}
-		wg.Wait()
-		if reqErr != nil {
-			s.Error("请求同步消息失败！!", zap.Error(err))
-			return nil, reqErr
-		}
+		channelRecentMessages = append(channelRecentMessages, peerMessages...)
 	}
 
 	// 请求本地的最近消息列表

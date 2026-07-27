@@ -408,14 +408,13 @@ func (s *conversation) syncUserConversation(c *wkhttp.Context) {
 	}
 
 	// 将用户缓存的新的频道添加到会话列表中
+	conversationIndex := indexConversationChannels(conversations)
 	for _, cacheChannel := range cacheChannels {
-		notNeedAdd := false
-		for _, conversation := range conversations {
-			if cacheChannel.ChannelID == conversation.ChannelId && cacheChannel.ChannelType == conversation.ChannelType {
-				notNeedAdd = true
-				break
-			}
+		channelKey := conversationChannelKey{
+			channelID:   cacheChannel.ChannelID,
+			channelType: cacheChannel.ChannelType,
 		}
+		_, notNeedAdd := conversationIndex[channelKey]
 
 		if !isAllowSync(cacheChannel.ChannelID, cacheChannel.ChannelType) {
 			continue
@@ -428,6 +427,7 @@ func (s *conversation) syncUserConversation(c *wkhttp.Context) {
 				Uid:         req.UID,
 				Type:        wkdb.ConversationTypeChat,
 			})
+			conversationIndex[channelKey] = struct{}{}
 		}
 	}
 
@@ -507,6 +507,7 @@ func (s *conversation) syncUserConversation(c *wkhttp.Context) {
 			return
 		}
 
+		recentMessageIndex := indexFirstRecentMessages(channelRecentMessages)
 		for i := 0; i < len(conversations); i++ {
 			conversation := conversations[i]
 			realChannelId := getRealChannelId(conversation.ChannelId, conversation.ChannelType)
@@ -516,38 +517,39 @@ func (s *conversation) syncUserConversation(c *wkhttp.Context) {
 			resp := newSyncUserConversationResp(conversation)
 
 			// 填充最近消息
-			for _, channelRecentMessage := range channelRecentMessages {
-				if conversation.ChannelId == channelRecentMessage.ChannelId && conversation.ChannelType == channelRecentMessage.ChannelType {
-					if len(channelRecentMessage.Messages) > 0 {
-						lastMsg := channelRecentMessage.Messages[0]
-						resp.LastMsgSeq = uint32(lastMsg.MessageSeq)
-						resp.LastClientMsgNo = lastMsg.ClientMsgNo
-						resp.Timestamp = int64(lastMsg.Timestamp)
-						if lastMsg.MessageSeq > uint64(resp.ReadedToMsgSeq) {
-							resp.Unread = int(lastMsg.MessageSeq - uint64(resp.ReadedToMsgSeq))
-						}
-
-						// 判断如果当前频道最新的消息序号减去当前用户在当前频道里发送的最后一条消息序号小于未读数量 则未读数量应该以频道最新序号 - 用户最后一条消息发送序号为准
-						if channelRecentMessage.UserLastMsgSeq > uint64(resp.ReadedToMsgSeq) {
-							if (lastMsg.MessageSeq-channelRecentMessage.UserLastMsgSeq) < uint64(resp.Unread) && lastMsg.MessageSeq >= uint64(resp.ReadedToMsgSeq) {
-								resp.Unread = int(lastMsg.MessageSeq - channelRecentMessage.UserLastMsgSeq)
-								resp.ReadedToMsgSeq = uint32(channelRecentMessage.UserLastMsgSeq)
-							}
-						}
-
-						resp.Version = time.Unix(int64(lastMsg.Timestamp), 0).UnixNano()
+			channelRecentMessage := recentMessageIndex[conversationChannelKey{
+				channelID:   conversation.ChannelId,
+				channelType: conversation.ChannelType,
+			}]
+			if channelRecentMessage != nil {
+				if len(channelRecentMessage.Messages) > 0 {
+					lastMsg := channelRecentMessage.Messages[0]
+					resp.LastMsgSeq = uint32(lastMsg.MessageSeq)
+					resp.LastClientMsgNo = lastMsg.ClientMsgNo
+					resp.Timestamp = int64(lastMsg.Timestamp)
+					if lastMsg.MessageSeq > uint64(resp.ReadedToMsgSeq) {
+						resp.Unread = int(lastMsg.MessageSeq - uint64(resp.ReadedToMsgSeq))
 					}
 
-					resp.Recents = channelRecentMessage.Messages
-					if len(resp.Recents) > 0 {
-						lastMsg := resp.Recents[0]
-						// 如果最后一条消息是自己发送的，则已读序号为最后一条消息的序号
-						if lastMsg.FromUID == req.UID {
-							resp.ReadedToMsgSeq = uint32(lastMsg.MessageSeq)
-							resp.Unread = 0
+					// 判断如果当前频道最新的消息序号减去当前用户在当前频道里发送的最后一条消息序号小于未读数量 则未读数量应该以频道最新序号 - 用户最后一条消息发送序号为准
+					if channelRecentMessage.UserLastMsgSeq > uint64(resp.ReadedToMsgSeq) {
+						if (lastMsg.MessageSeq-channelRecentMessage.UserLastMsgSeq) < uint64(resp.Unread) && lastMsg.MessageSeq >= uint64(resp.ReadedToMsgSeq) {
+							resp.Unread = int(lastMsg.MessageSeq - channelRecentMessage.UserLastMsgSeq)
+							resp.ReadedToMsgSeq = uint32(channelRecentMessage.UserLastMsgSeq)
 						}
 					}
-					break
+
+					resp.Version = time.Unix(int64(lastMsg.Timestamp), 0).UnixNano()
+				}
+
+				resp.Recents = channelRecentMessage.Messages
+				if len(resp.Recents) > 0 {
+					lastMsg := resp.Recents[0]
+					// 如果最后一条消息是自己发送的，则已读序号为最后一条消息的序号
+					if lastMsg.FromUID == req.UID {
+						resp.ReadedToMsgSeq = uint32(lastMsg.MessageSeq)
+						resp.Unread = 0
+					}
 				}
 			}
 
@@ -565,6 +567,46 @@ func (s *conversation) syncUserConversation(c *wkhttp.Context) {
 	}
 
 	c.JSON(http.StatusOK, resps)
+}
+
+type conversationChannelKey struct {
+	channelID   string
+	channelType uint8
+}
+
+func indexFirstRecentMessages(
+	recentMessages []*channelRecentMessage,
+) map[conversationChannelKey]*channelRecentMessage {
+	index := make(
+		map[conversationChannelKey]*channelRecentMessage,
+		len(recentMessages),
+	)
+	for _, recentMessage := range recentMessages {
+		if recentMessage == nil {
+			continue
+		}
+		key := conversationChannelKey{
+			channelID:   recentMessage.ChannelId,
+			channelType: recentMessage.ChannelType,
+		}
+		if _, exists := index[key]; !exists {
+			index[key] = recentMessage
+		}
+	}
+	return index
+}
+
+func indexConversationChannels(
+	conversations []wkdb.Conversation,
+) map[conversationChannelKey]struct{} {
+	index := make(map[conversationChannelKey]struct{}, len(conversations))
+	for _, conversation := range conversations {
+		index[conversationChannelKey{
+			channelID:   conversation.ChannelId,
+			channelType: conversation.ChannelType,
+		}] = struct{}{}
+	}
+	return index
 }
 
 func removeDuplicates(conversations []wkdb.Conversation) []wkdb.Conversation {
@@ -664,14 +706,13 @@ func (s *conversation) conversationChannels(c *wkhttp.Context) {
 		return
 	}
 
+	conversationIndex := indexConversationChannels(conversations)
 	for _, cacheChannel := range cacheChannels {
-		exist := false
-		for _, conversation := range conversations {
-			if cacheChannel.ChannelID == conversation.ChannelId && cacheChannel.ChannelType == conversation.ChannelType {
-				exist = true
-				break
-			}
+		channelKey := conversationChannelKey{
+			channelID:   cacheChannel.ChannelID,
+			channelType: cacheChannel.ChannelType,
 		}
+		_, exist := conversationIndex[channelKey]
 
 		if !exist {
 			conversations = append(conversations, wkdb.Conversation{
@@ -680,6 +721,7 @@ func (s *conversation) conversationChannels(c *wkhttp.Context) {
 				ChannelType: cacheChannel.ChannelType,
 				Type:        wkdb.ConversationTypeChat,
 			})
+			conversationIndex[channelKey] = struct{}{}
 		}
 	}
 
@@ -811,6 +853,7 @@ func (s *conversation) syncConversationByChannels(c *wkhttp.Context) {
 
 	// 组装响应
 	resps := make([]*syncUserConversationResp, 0, len(req.Channels))
+	recentMessageIndex := indexFirstRecentMessages(channelRecentMessages)
 
 	for _, ch := range req.Channels {
 		fakeChannelId := ch.ChannelId
@@ -825,38 +868,39 @@ func (s *conversation) syncConversationByChannels(c *wkhttp.Context) {
 		resp.ChannelId = getRealChannelId(fakeChannelId, ch.ChannelType)
 
 		// 填充最近消息
-		for _, channelRecentMessage := range channelRecentMessages {
-			if fakeChannelId == channelRecentMessage.ChannelId && ch.ChannelType == channelRecentMessage.ChannelType {
-				if len(channelRecentMessage.Messages) > 0 {
-					lastMsg := channelRecentMessage.Messages[0]
-					resp.LastMsgSeq = uint32(lastMsg.MessageSeq)
-					resp.LastClientMsgNo = lastMsg.ClientMsgNo
-					resp.Timestamp = int64(lastMsg.Timestamp)
-					if lastMsg.MessageSeq > uint64(resp.ReadedToMsgSeq) {
-						resp.Unread = int(lastMsg.MessageSeq - uint64(resp.ReadedToMsgSeq))
-					}
-
-					// 判断如果当前频道最新的消息序号减去当前用户在当前频道里发送的最后一条消息序号小于未读数量 则未读数量应该以频道最新序号 - 用户最后一条消息发送序号为准
-					if channelRecentMessage.UserLastMsgSeq > uint64(resp.ReadedToMsgSeq) {
-						if (lastMsg.MessageSeq - channelRecentMessage.UserLastMsgSeq) < uint64(resp.Unread) {
-							resp.Unread = int(lastMsg.MessageSeq - channelRecentMessage.UserLastMsgSeq)
-							resp.ReadedToMsgSeq = uint32(channelRecentMessage.UserLastMsgSeq)
-						}
-					}
-
-					resp.Version = time.Unix(int64(lastMsg.Timestamp), 0).UnixNano()
+		channelRecentMessage := recentMessageIndex[conversationChannelKey{
+			channelID:   fakeChannelId,
+			channelType: ch.ChannelType,
+		}]
+		if channelRecentMessage != nil {
+			if len(channelRecentMessage.Messages) > 0 {
+				lastMsg := channelRecentMessage.Messages[0]
+				resp.LastMsgSeq = uint32(lastMsg.MessageSeq)
+				resp.LastClientMsgNo = lastMsg.ClientMsgNo
+				resp.Timestamp = int64(lastMsg.Timestamp)
+				if lastMsg.MessageSeq > uint64(resp.ReadedToMsgSeq) {
+					resp.Unread = int(lastMsg.MessageSeq - uint64(resp.ReadedToMsgSeq))
 				}
-				resp.Recents = channelRecentMessage.Messages
 
-				// 如果最后一条消息是自己发送的，则已读序号为最后一条消息的序号
-				if len(resp.Recents) > 0 {
-					lastMsg := resp.Recents[0]
-					if lastMsg.FromUID == req.UID {
-						resp.ReadedToMsgSeq = uint32(lastMsg.MessageSeq)
-						resp.Unread = 0
+				// 判断如果当前频道最新的消息序号减去当前用户在当前频道里发送的最后一条消息序号小于未读数量 则未读数量应该以频道最新序号 - 用户最后一条消息发送序号为准
+				if channelRecentMessage.UserLastMsgSeq > uint64(resp.ReadedToMsgSeq) {
+					if (lastMsg.MessageSeq - channelRecentMessage.UserLastMsgSeq) < uint64(resp.Unread) {
+						resp.Unread = int(lastMsg.MessageSeq - channelRecentMessage.UserLastMsgSeq)
+						resp.ReadedToMsgSeq = uint32(channelRecentMessage.UserLastMsgSeq)
 					}
 				}
-				break
+
+				resp.Version = time.Unix(int64(lastMsg.Timestamp), 0).UnixNano()
+			}
+			resp.Recents = channelRecentMessage.Messages
+
+			// 如果最后一条消息是自己发送的，则已读序号为最后一条消息的序号
+			if len(resp.Recents) > 0 {
+				lastMsg := resp.Recents[0]
+				if lastMsg.FromUID == req.UID {
+					resp.ReadedToMsgSeq = uint32(lastMsg.MessageSeq)
+					resp.Unread = 0
+				}
 			}
 		}
 

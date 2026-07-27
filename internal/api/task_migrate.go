@@ -113,7 +113,7 @@ func (m *MigrateTask) stepMessageImport() {
 	m.Info("Start importing message data")
 
 	m.Info("Fetch topics from old version")
-	var slotNum uint32 = 128
+	var slotNum uint32 = 64
 	for i := uint32(0); i < slotNum; i++ {
 		topics, err := m.getTopicsFromOldVersion(i)
 		if err != nil {
