@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb/key"
@@ -77,6 +78,25 @@ func TestAppendMessagesWritesSearchOutboxFloorOnce(t *testing.T) {
 	floor, enabled, err = db.GetSearchOutboxFloor("channel", 2)
 	if err != nil || !enabled || floor != 40 {
 		t.Fatalf("stable floor = %d/%v, err=%v", floor, enabled, err)
+	}
+}
+
+func TestGetSearchOutboxFloorTreatsUnsupportedChannelAsLegacy(t *testing.T) {
+	db := openSearchOutboxTestDB(t)
+	for _, channel := range []struct {
+		id          string
+		channelType uint8
+	}{
+		{id: "", channelType: 2},
+		{id: string([]byte{0xff}), channelType: 2},
+		{id: strings.Repeat("x", key.MaxSearchOutboxChannelIDBytes+1), channelType: 2},
+		{id: "channel", channelType: 0},
+	} {
+		floor, enabled, err := db.GetSearchOutboxFloor(channel.id, channel.channelType)
+		if err != nil || enabled || floor != 0 {
+			t.Fatalf("GetSearchOutboxFloor(%q/%d) = %d/%v, err=%v; want legacy 0/false",
+				channel.id, channel.channelType, floor, enabled, err)
+		}
 	}
 }
 
@@ -646,6 +666,30 @@ func TestTruncateLogToDeletesOnlyHigherSearchOutboxRecords(t *testing.T) {
 	records := rawSearchOutboxRecords(t, db, "channel", 2)
 	if len(records) != 1 || records[0].Identity.MessageSeq != 1 {
 		t.Fatalf("records after truncate = %+v, want only sequence 1", records)
+	}
+}
+
+func TestTruncateLogToPreservesUnsupportedLegacyChannelBehavior(t *testing.T) {
+	db := openSearchOutboxTestDB(t)
+	channelID := strings.Repeat("x", key.MaxSearchOutboxChannelIDBytes+1)
+	first := searchOutboxTestMessage(1, 327, false)
+	first.ChannelID = channelID
+	second := searchOutboxTestMessage(2, 328, false)
+	second.ChannelID = channelID
+	if err := db.AppendMessages(channelID, 2, []Message{first, second}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.TruncateLogTo(channelID, 2, 1); err != nil {
+		t.Fatal(err)
+	}
+	if message, err := db.LoadMsg(channelID, 2, 1); err != nil || message.MessageID != first.MessageID {
+		t.Fatalf("retained message = %+v, err=%v", message, err)
+	}
+	requireMessageMissing(t, db, channelID, 2, 2)
+	lastSequence, _, err := db.GetChannelLastMessageSeq(channelID, 2)
+	if err != nil || lastSequence != 1 {
+		t.Fatalf("last sequence = %d, err=%v; want 1", lastSequence, err)
 	}
 }
 

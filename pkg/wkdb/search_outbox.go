@@ -271,6 +271,9 @@ func (wk *wukongDB) ScanSearchOutboxChannels(ctx context.Context, visit func(Cha
 }
 
 func (wk *wukongDB) GetSearchOutboxFloor(channelID string, channelType uint8) (floor uint64, enabled bool, err error) {
+	if !key.IsValidSearchOutboxChannelIdentity(channelID, channelType) {
+		return 0, false, nil
+	}
 	keyBytes, err := key.NewSearchOutboxFloorKey(channelID, channelType)
 	if err != nil {
 		return 0, false, err

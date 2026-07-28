@@ -575,7 +575,8 @@ func (wk *wukongDB) TruncateLogTo(channelId string, channelType uint8, messageSe
 	}
 
 	var outboxLower, outboxUpper []byte
-	if messageSeq < MaxMessageSequence {
+	if key.IsValidSearchOutboxChannelIdentity(channelId, channelType) &&
+		messageSeq < MaxMessageSequence {
 		outboxLower, outboxUpper, err = key.NewSearchOutboxChannelRange(
 			channelId,
 			channelType,

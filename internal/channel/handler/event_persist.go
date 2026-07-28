@@ -2,7 +2,6 @@ package handler
 
 import (
 	"time"
-	"unicode/utf8"
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
 	"github.com/WuKongIM/WuKongIM/internal/options"
@@ -234,10 +233,7 @@ func (h *Handler) toPersistMessages(channelId string, channelType uint8, events 
 }
 
 func searchOutboxEligible(channelID string, channelType uint8, messageID int64, payload []byte) bool {
-	return channelID != "" &&
-		channelType != 0 &&
+	return key.IsValidSearchOutboxChannelIdentity(channelID, channelType) &&
 		messageID > 0 &&
-		len(payload) > 0 &&
-		utf8.ValidString(channelID) &&
-		len(channelID) <= key.MaxSearchOutboxChannelIDBytes
+		len(payload) > 0
 }

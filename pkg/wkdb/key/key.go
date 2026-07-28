@@ -15,9 +15,17 @@ var MaxColumnKey = [2]byte{0xff, 0xff}
 
 const MaxSearchOutboxChannelIDBytes = 100
 
+func IsValidSearchOutboxChannelIdentity(channelID string, channelType uint8) bool {
+	channelBytes := []byte(channelID)
+	return channelID != "" &&
+		channelType != 0 &&
+		utf8.ValidString(channelID) &&
+		len(channelBytes) <= MaxSearchOutboxChannelIDBytes
+}
+
 func searchOutboxChannelPrefix(channelID string, channelType uint8) ([]byte, error) {
 	channelBytes := []byte(channelID)
-	if channelID == "" || !utf8.ValidString(channelID) || len(channelBytes) > MaxSearchOutboxChannelIDBytes || channelType == 0 {
+	if !IsValidSearchOutboxChannelIdentity(channelID, channelType) {
 		return nil, fmt.Errorf("invalid search outbox channel identity")
 	}
 	prefix := make([]byte, 2+2+1+2+len(channelBytes))
