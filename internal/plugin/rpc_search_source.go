@@ -213,18 +213,44 @@ func (a *rpc) searchSourceChannelsRoute(c *wkrpc.Context) {
 }
 
 func (a *rpc) requireSearchSourceAuthorization(next wkrpc.Handler) wkrpc.Handler {
+	return a.requireLocalSearchAuthorizationWithError(
+		a.searchSourceReady,
+		errSearchSourceUnavailable,
+		next,
+	)
+}
+
+func (a *rpc) requireSearchOutboxAuthorization(next wkrpc.Handler) wkrpc.Handler {
+	return a.requireLocalSearchAuthorization(a.searchOutboxReady, next)
+}
+
+func (a *rpc) requireLocalSearchAuthorization(
+	ready func() error,
+	next wkrpc.Handler,
+) wkrpc.Handler {
+	return a.requireLocalSearchAuthorizationWithError(
+		ready,
+		errSearchOutboxUnavailable,
+		next,
+	)
+}
+
+func (a *rpc) requireLocalSearchAuthorizationWithError(
+	ready func() error,
+	unavailable error,
+	next wkrpc.Handler,
+) wkrpc.Handler {
 	return func(c *wkrpc.Context) {
 		if a.s == nil || a.s.searchAuth == nil {
 			c.WriteErr(errSearchSourceUnauthorized)
 			return
 		}
 		if err := a.s.searchAuth.authorizeRequest(c.Conn().Fd(), c.Uid(), c.Conn()); err != nil {
-			a.Warn("search source request rejected", zap.Error(err))
 			c.WriteErr(errSearchSourceUnauthorized)
 			return
 		}
-		if a.searchSourceReady == nil || a.searchSourceReady() != nil {
-			c.WriteErr(errSearchSourceUnavailable)
+		if ready == nil || ready() != nil {
+			c.WriteErr(unavailable)
 			return
 		}
 		next(c)

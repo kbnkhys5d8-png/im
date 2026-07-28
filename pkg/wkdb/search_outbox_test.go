@@ -588,6 +588,50 @@ func TestAckSearchOutboxRetryConvergesAfterLaterShardFailure(t *testing.T) {
 	requireNoRawSearchOutboxRecords(t, db, channel1, 2)
 }
 
+func TestSearchOutboxThreeReplicasShareIdentityAndAckLocally(t *testing.T) {
+	replicas := []*wukongDB{
+		openSearchOutboxTestDB(t),
+		openSearchOutboxTestDB(t),
+		openSearchOutboxTestDB(t),
+	}
+	message := searchOutboxTestMessage(1, 401, true)
+	var identities []SearchOutboxIdentity
+	for _, replica := range replicas {
+		appendAppliedSearchOutboxMessages(t, replica, message)
+		result, err := replica.PullSearchOutbox(10, 1<<20)
+		if err != nil {
+			t.Fatal(err)
+		}
+		identities = append(identities, result.Records[0].Identity)
+	}
+	if identities[0] != identities[1] || identities[1] != identities[2] {
+		t.Fatalf("replica identities = %+v", identities)
+	}
+	if err := replicas[0].AckSearchOutbox(
+		[]SearchOutboxIdentity{identities[0]},
+	); err != nil {
+		t.Fatal(err)
+	}
+	for index, replica := range replicas {
+		result, err := replica.PullSearchOutbox(10, 1<<20)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := 1
+		if index == 0 {
+			want = 0
+		}
+		if len(result.Records) != want {
+			t.Fatalf(
+				"replica %d records = %d, want %d",
+				index,
+				len(result.Records),
+				want,
+			)
+		}
+	}
+}
+
 func TestTruncateLogToDeletesOnlyHigherSearchOutboxRecords(t *testing.T) {
 	db := openSearchOutboxTestDB(t)
 	appendSearchOutboxMessages(t, db,

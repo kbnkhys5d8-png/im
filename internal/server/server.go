@@ -239,6 +239,7 @@ func New(opts *options.Options) *Server {
 		),
 	)
 	s.pluginServer.SetSearchSourceRuntimeReady(s.clusterServer.SearchOutboxReady)
+	s.pluginServer.SetSearchOutboxRuntimeReady(s.clusterServer.SearchOutboxReady)
 	service.PluginManager = s.pluginServer
 	return s
 }

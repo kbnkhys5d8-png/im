@@ -14,6 +14,10 @@ type rpc struct {
 	searchSourceNodeID    func() uint64
 	searchSourceRoster    func() ([]uint64, error)
 	searchSourceAuthority func(channelID string, channelType uint8) (wkdb.ChannelClusterConfig, error)
+
+	searchOutboxStore  searchOutboxStore
+	searchOutboxReady  func() error
+	searchOutboxNodeID func() uint64
 }
 
 func newRpc(s *Server) *rpc {
@@ -25,6 +29,9 @@ func newRpc(s *Server) *rpc {
 		searchSourceNodeID:    defaultSearchSourceNodeID,
 		searchSourceRoster:    defaultSearchSourceRoster,
 		searchSourceAuthority: defaultSearchSourceAuthority,
+		searchOutboxStore:     defaultSearchOutboxStore(),
+		searchOutboxReady:     s.searchOutboxReady.check,
+		searchOutboxNodeID:    defaultSearchSourceNodeID,
 	}
 }
 
@@ -49,5 +56,9 @@ func (a *rpc) routes() {
 	// ------------------- 本地持久化搜索源 -------------------
 	a.s.rpcServer.Route("/search/source/channels", a.requireSearchSourceAuthorization(a.searchSourceChannelsRoute))
 	a.s.rpcServer.Route("/search/source/messages", a.requireSearchSourceAuthorization(a.searchSourceMessagesRoute))
+
+	// ------------------- 本地搜索发件箱 -------------------
+	a.s.rpcServer.Route("/search/outbox/pull", a.requireSearchOutboxAuthorization(a.searchOutboxPullRoute))
+	a.s.rpcServer.Route("/search/outbox/ack", a.requireSearchOutboxAuthorization(a.searchOutboxAckRoute))
 
 }

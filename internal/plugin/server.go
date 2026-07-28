@@ -26,12 +26,13 @@ import (
 )
 
 type Server struct {
-	rpcServer       *wkrpc.Server
-	pluginManager   *pluginManager
-	searchAuth      *localPluginAuthorizer
-	searchReady     *searchSourceReadiness
-	searchQueryGate searchQueryGateFunc
-	rpc             *rpc
+	rpcServer         *wkrpc.Server
+	pluginManager     *pluginManager
+	searchAuth        *localPluginAuthorizer
+	searchReady       *searchSourceReadiness
+	searchOutboxReady *searchOutboxReadiness
+	searchQueryGate   searchQueryGateFunc
+	rpc               *rpc
 	wklog.Log
 	opts       *Options
 	sandboxDir string // 沙箱目录
@@ -103,16 +104,17 @@ func NewServer(opts *Options) *Server {
 	// }
 
 	s := &Server{
-		rpcServer:       rpcServer,
-		opts:            opts,
-		pluginManager:   newPluginManager(),
-		searchAuth:      searchAuth,
-		searchReady:     &searchSourceReadiness{},
-		searchQueryGate: defaultSearchQueryGate,
-		Log:             wklog.NewWKLog("plugin.server"),
-		sandboxDir:      sandboxDir,
-		bucketSize:      10,
-		children:        make(map[*pluginChild]struct{}),
+		rpcServer:         rpcServer,
+		opts:              opts,
+		pluginManager:     newPluginManager(),
+		searchAuth:        searchAuth,
+		searchReady:       &searchSourceReadiness{},
+		searchOutboxReady: &searchOutboxReadiness{},
+		searchQueryGate:   defaultSearchQueryGate,
+		Log:               wklog.NewWKLog("plugin.server"),
+		sandboxDir:        sandboxDir,
+		bucketSize:        10,
+		children:          make(map[*pluginChild]struct{}),
 	}
 	s.rpc = newRpc(s)
 
@@ -125,6 +127,10 @@ func NewServer(opts *Options) *Server {
 
 func (s *Server) SetSearchSourceRuntimeReady(check func() error) {
 	s.searchReady.setRuntimeReady(check)
+}
+
+func (s *Server) SetSearchOutboxRuntimeReady(check func() error) {
+	s.searchOutboxReady.setRuntimeReady(check)
 }
 
 func (s *Server) Start() error {
