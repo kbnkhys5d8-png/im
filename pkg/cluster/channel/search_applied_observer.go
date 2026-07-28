@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
+	"github.com/WuKongIM/WuKongIM/pkg/wkdb/key"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	"go.uber.org/zap"
@@ -193,18 +194,19 @@ func (o *searchAppliedObserver) retrySnapshot() map[string]uint64 {
 // preventing a database outage from multiplying into thousands of writes and
 // warnings per retry tick.
 func (o *searchAppliedObserver) flush(pending map[string]uint64) error {
-	for key, index := range pending {
-		channelID, channelType := wkutil.ChannelFromlKey(key)
-		if channelID == "" || channelType == 0 {
-			o.deferBatch(pending)
-			return errors.New("invalid channel key")
+	for channelKey, index := range pending {
+		channelID, channelType := wkutil.ChannelFromlKey(channelKey)
+		if !key.IsValidSearchOutboxChannelIdentity(channelID, channelType) {
+			o.recordSuccess(channelKey, index)
+			delete(pending, channelKey)
+			continue
 		}
 		if err := o.db.UpdateChannelAppliedIndex(channelID, channelType, index); err != nil {
 			o.deferBatch(pending)
 			return err
 		}
-		o.recordSuccess(key, index)
-		delete(pending, key)
+		o.recordSuccess(channelKey, index)
+		delete(pending, channelKey)
 	}
 	return nil
 }

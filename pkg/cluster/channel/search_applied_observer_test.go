@@ -50,6 +50,26 @@ func TestSearchAppliedObserverRetriesTransientFailureWithoutNewMessage(t *testin
 	}
 }
 
+func TestSearchAppliedObserverIgnoresUnsupportedLegacyChannelIdentities(t *testing.T) {
+	observer := newSearchAppliedObserver(nil)
+	pending := map[string]uint64{
+		wkutil.ChannelToKey("", 2):                        1,
+		wkutil.ChannelToKey("channel", 0):                 2,
+		wkutil.ChannelToKey(string([]byte{0xff}), 2):      3,
+		wkutil.ChannelToKey(string(make([]byte, 101)), 2): 4,
+	}
+
+	if err := observer.flush(pending); err != nil {
+		t.Fatalf("flush unsupported legacy identities: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("unsupported legacy identities remained pending: %v", pending)
+	}
+	if err := observer.Ready(); err != nil {
+		t.Fatalf("unsupported legacy identities poisoned readiness: %v", err)
+	}
+}
+
 func TestSearchAppliedObserverRetainsLastNewChannelWhenPrimaryQueueIsFull(t *testing.T) {
 	db := openAppliedTestDB(t)
 	observer := newSearchAppliedObserver(db)
