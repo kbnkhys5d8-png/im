@@ -224,6 +224,7 @@ func (h *Handler) toPersistMessages(channelId string, channelType uint8, events 
 				StreamNo:    sendPacket.StreamNo,
 				Payload:     sendPacket.Payload,
 			},
+			SearchOutbox: true,
 		}
 		persists = append(persists, msg)
 	}

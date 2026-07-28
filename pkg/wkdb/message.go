@@ -2,6 +2,7 @@ package wkdb
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -1343,7 +1344,11 @@ func (wk *wukongDB) iteratorChannelMessagesDirection(iter *pebble.Iterator, limi
 			preMessage.Payload = payload
 		case key.TableMessage.Column.Term:
 			preMessage.Term = wk.endian.Uint64(iter.Value())
-
+		case key.TableMessage.Column.SearchOutbox:
+			if len(iter.Value()) != 1 || iter.Value()[0] != 1 {
+				return errors.New("message has invalid search outbox column")
+			}
+			preMessage.SearchOutbox = true
 		}
 		hasData = true
 	}
@@ -1423,6 +1428,11 @@ func (wk *wukongDB) parseChannelMessagesWithLimitSize(iter *pebble.Iterator, lim
 			preMessage.Payload = payload
 		case key.TableMessage.Column.Term:
 			preMessage.Term = wk.endian.Uint64(iter.Value())
+		case key.TableMessage.Column.SearchOutbox:
+			if len(iter.Value()) != 1 || iter.Value()[0] != 1 {
+				return nil, errors.New("message has invalid search outbox column")
+			}
+			preMessage.SearchOutbox = true
 		}
 	}
 
@@ -1492,6 +1502,18 @@ func (wk *wukongDB) writeMessage(channelId string, channelType uint8, msg Messag
 	termBytes := make([]byte, 8)
 	wk.endian.PutUint64(termBytes, msg.Term)
 	w.Set(key.NewMessageColumnKey(channelId, channelType, uint64(msg.MessageSeq), key.TableMessage.Column.Term), termBytes)
+
+	if msg.SearchOutbox {
+		w.Set(
+			key.NewMessageColumnKey(
+				channelId,
+				channelType,
+				uint64(msg.MessageSeq),
+				key.TableMessage.Column.SearchOutbox,
+			),
+			[]byte{1},
+		)
+	}
 
 	var primaryValue = [16]byte{}
 	wk.endian.PutUint64(primaryValue[:], key.ChannelToNum(channelId, channelType))

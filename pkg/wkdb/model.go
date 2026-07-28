@@ -19,37 +19,40 @@ func IsEmptyMessage(m Message) bool {
 	return m.MessageID == 0 && m.MessageSeq == 0
 }
 
+const (
+	messageDataVersionLegacy uint8 = iota
+	messageDataVersionSearchOutbox
+)
+
 type Message struct {
 	wkproto.RecvPacket
-	Term    uint64 // raft term
-	version uint8  // 数据协议版本
+	Term         uint64 // raft term
+	SearchOutbox bool
+	version      uint8 // 数据协议版本
 }
 
 func (m *Message) Unmarshal(data []byte) error {
-
 	dec := wkproto.NewDecoder(data)
-	var (
-		version uint8
-		err     error
-	)
-	if version, err = dec.Uint8(); err != nil {
+	version, err := dec.Uint8()
+	if err != nil {
 		return err
 	}
 
-	fixVersion := uint8(100) // 借助一个固定的版本号，用于兼容老版本编码
-
-	var newEncode = false // 是否是新版本编码
-	if version > fixVersion {
-		version = version - fixVersion
-		newEncode = true
+	const fixVersion uint8 = 100
+	newEncode := version > fixVersion
+	if newEncode {
+		version -= fixVersion
 	}
 
+	dataVersion := messageDataVersionLegacy
 	var recvPacketData []byte
 	if newEncode {
-
-		// 数据版本，暂时为默认的0，后续数据协议升级时，可以根据此版本号进行兼容处理
-		if _, err := dec.Uint8(); err != nil {
+		dataVersion, err = dec.Uint8()
+		if err != nil {
 			return err
+		}
+		if dataVersion > messageDataVersionSearchOutbox {
+			return fmt.Errorf("unsupported message data version %d", dataVersion)
 		}
 		recvPacketDataLen, err := dec.Uint32()
 		if err != nil {
@@ -66,17 +69,36 @@ func (m *Message) Unmarshal(data []byte) error {
 		}
 	}
 
-	f, _, err := proto.DecodeFrame(recvPacketData, version)
+	frame, _, err := proto.DecodeFrame(recvPacketData, version)
 	if err != nil {
 		return err
 	}
-	rcv := f.(*wkproto.RecvPacket)
-
-	m.RecvPacket = *rcv
-	if m.Term, err = dec.Uint64(); err != nil {
+	recvPacket, ok := frame.(*wkproto.RecvPacket)
+	if !ok {
+		return fmt.Errorf("decoded frame type %T is not RecvPacket", frame)
+	}
+	m.RecvPacket = *recvPacket
+	m.SearchOutbox = false
+	m.version = dataVersion
+	m.Term, err = dec.Uint64()
+	if err != nil {
 		return err
 	}
 
+	if dataVersion >= messageDataVersionSearchOutbox {
+		flag, err := dec.Uint8()
+		if err != nil {
+			return err
+		}
+		switch flag {
+		case 0:
+			m.SearchOutbox = false
+		case 1:
+			m.SearchOutbox = true
+		default:
+			return fmt.Errorf("invalid search outbox flag %d", flag)
+		}
+	}
 	return nil
 }
 
@@ -90,13 +112,28 @@ func (m *Message) Marshal() ([]byte, error) {
 	// 所以这里wkproto.LatestVersion不能大于156，否则uint8会溢出，实际中wkproto.LatestVersion应该不会太大
 	fixVersion := uint8(100)
 
+	dataVersion := m.version
+	if m.SearchOutbox {
+		dataVersion = messageDataVersionSearchOutbox
+	}
+	if dataVersion > messageDataVersionSearchOutbox {
+		return nil, fmt.Errorf("unsupported message data version %d", dataVersion)
+	}
+
 	enc := wkproto.NewEncoder()
 	defer enc.End()
 	enc.WriteUint8(wkproto.LatestVersion + fixVersion)
-	enc.WriteUint8(m.version)
+	enc.WriteUint8(dataVersion)
 	enc.WriteUint32(uint32(len(data)))
 	enc.WriteBytes(data)
 	enc.WriteUint64(m.Term)
+	if dataVersion >= messageDataVersionSearchOutbox {
+		if m.SearchOutbox {
+			enc.WriteUint8(1)
+		} else {
+			enc.WriteUint8(0)
+		}
+	}
 	return enc.Bytes(), nil
 }
 

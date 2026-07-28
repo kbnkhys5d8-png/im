@@ -8,6 +8,33 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+func TestAppendAndLoadMessagePreservesSearchOutbox(t *testing.T) {
+	db := newTestDB(t)
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	message := wkdb.Message{RecvPacket: wkproto.RecvPacket{
+		MessageID: 10, MessageSeq: 1, ClientMsgNo: "persisted",
+		ChannelID: "channel", ChannelType: 2, Payload: []byte("body"),
+	}, SearchOutbox: true}
+	if err := db.AppendMessages("channel", 2, []wkdb.Message{message}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.LoadMsg("channel", 2, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.SearchOutbox {
+		t.Fatal("stored message lost SearchOutbox")
+	}
+}
+
 func TestLoadPrevRangeMsgs(t *testing.T) {
 
 	d := newTestDB(t)
