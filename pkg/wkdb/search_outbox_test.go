@@ -346,6 +346,44 @@ func TestPullSearchOutboxRejectsMissingServerTimestamp(t *testing.T) {
 	}
 }
 
+func TestPullSearchOutboxFailsClosedOnMalformedAppliedValue(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  []byte
+	}{
+		{name: "short", raw: []byte{0, 0, 0, 0, 0, 0, 1}},
+		{name: "long", raw: []byte{0, 0, 0, 0, 0, 0, 0, 1, 0}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db := openSearchOutboxTestDB(t)
+			appendSearchOutboxMessages(t, db, searchOutboxTestMessage(1, 220, true))
+			setRawChannelAppliedIndex(t, db, test.raw)
+
+			result, err := pullSearchOutboxWithoutPanic(t, db)
+			if err == nil {
+				t.Fatalf("PullSearchOutbox accepted malformed applied value: %+v", result)
+			}
+			if len(result.Records) != 0 {
+				t.Fatalf("PullSearchOutbox released records after corruption: %+v", result)
+			}
+		})
+	}
+}
+
+func pullSearchOutboxWithoutPanic(
+	t *testing.T,
+	db *wukongDB,
+) (result SearchOutboxPullResult, err error) {
+	t.Helper()
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			t.Fatalf("PullSearchOutbox panicked on malformed applied value: %v", recovered)
+		}
+	}()
+	return db.PullSearchOutbox(10, 1<<20)
+}
+
 func TestScanSearchOutboxChannelsVisitsOnlyDistinctPendingChannels(t *testing.T) {
 	db := openSearchOutboxTestDB(t)
 	first := searchOutboxTestMessage(1, 214, true)

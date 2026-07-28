@@ -1,6 +1,7 @@
 package wkdb
 
 import (
+	"fmt"
 	"math"
 	"sort"
 	"time"
@@ -517,6 +518,9 @@ func (wk *wukongDB) GetChannelAppliedIndex(channelId string, channelType uint8) 
 			return 0, nil
 		}
 		return 0, err
+	}
+	if len(data) != 8 {
+		return 0, fmt.Errorf("channel applied index is corrupt: got %d bytes", len(data))
 	}
 
 	return wk.endian.Uint64(data), nil

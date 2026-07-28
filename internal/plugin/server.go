@@ -123,13 +123,6 @@ func NewServer(opts *Options) *Server {
 	return s
 }
 
-// SetSearchSourceBootstrapResult opens the local search-source routes only
-// after the one-time offline bootstrap check has completed successfully.
-// A bootstrap failure must not prevent the IM server itself from starting.
-func (s *Server) SetSearchSourceBootstrapResult(err error) {
-	s.searchReady.setBootstrapResult(err)
-}
-
 func (s *Server) SetSearchSourceRuntimeReady(check func() error) {
 	s.searchReady.setRuntimeReady(check)
 }
