@@ -442,10 +442,237 @@ func TestScanSearchOutboxChannelsHonorsCancellationAndVisitErrors(t *testing.T) 
 	})
 }
 
+func TestAckSearchOutboxDeletesOnlyExactIdentity(t *testing.T) {
+	db := openSearchOutboxTestDB(t)
+	appendAppliedSearchOutboxMessages(t, db,
+		searchOutboxTestMessage(1, 301, true),
+		searchOutboxTestMessage(2, 302, true),
+		searchOutboxTestMessage(3, 303, true),
+	)
+
+	ack := SearchOutboxIdentity{
+		ChannelID: "channel", ChannelType: 2,
+		MessageSeq: 2, MessageID: 302,
+	}
+	if err := db.AckSearchOutbox([]SearchOutboxIdentity{ack}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := db.PullSearchOutbox(10, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSearchOutboxMessageIDs(t, got.Records, 301, 303)
+}
+
+func TestAckSearchOutboxIsIdempotent(t *testing.T) {
+	db := openSearchOutboxTestDB(t)
+	message := searchOutboxTestMessage(1, 304, true)
+	appendAppliedSearchOutboxMessages(t, db, message)
+	identity := searchOutboxIdentityFromMessage(message)
+
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := db.AckSearchOutbox([]SearchOutboxIdentity{identity}); err != nil {
+			t.Fatalf("attempt %d: %v", attempt, err)
+		}
+	}
+	requireNoRawSearchOutboxRecords(t, db, "channel", 2)
+}
+
+func TestAckSearchOutboxRejectsKeyValueIdentityMismatch(t *testing.T) {
+	db := openSearchOutboxTestDB(t)
+	message := searchOutboxTestMessage(1, 305, true)
+	appendAppliedSearchOutboxMessages(t, db, message)
+	replaceRawOutboxValueWithDifferentMessage(t, db, message, 999)
+
+	if err := db.AckSearchOutbox([]SearchOutboxIdentity{
+		searchOutboxIdentityFromMessage(message),
+	}); err == nil {
+		t.Fatal("corrupt outbox identity was acknowledged")
+	}
+	requireRawSearchOutboxRecordCount(t, db, "channel", 2, 1)
+}
+
+func TestAckSearchOutboxDeduplicatesIdentities(t *testing.T) {
+	db := openSearchOutboxTestDB(t)
+	message := searchOutboxTestMessage(1, 306, true)
+	appendAppliedSearchOutboxMessages(t, db, message)
+	identity := searchOutboxIdentityFromMessage(message)
+
+	if err := db.AckSearchOutbox([]SearchOutboxIdentity{
+		identity,
+		identity,
+		identity,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	requireNoRawSearchOutboxRecords(t, db, "channel", 2)
+}
+
+func TestAckSearchOutboxValidatesWholeListBeforeDeleting(t *testing.T) {
+	db := openSearchOutboxTestDB(t)
+	first := searchOutboxTestMessage(1, 307, true)
+	second := searchOutboxTestMessage(2, 308, true)
+	appendAppliedSearchOutboxMessages(t, db, first, second)
+
+	err := db.AckSearchOutbox([]SearchOutboxIdentity{
+		searchOutboxIdentityFromMessage(first),
+		{ChannelID: "", ChannelType: 2, MessageSeq: 2, MessageID: 308},
+	})
+	if !errors.Is(err, ErrSearchOutboxInvalidIdentity) {
+		t.Fatalf("AckSearchOutbox error = %v, want ErrSearchOutboxInvalidIdentity", err)
+	}
+	requireRawSearchOutboxRecordCount(t, db, "channel", 2, 2)
+}
+
+func TestAckSearchOutboxSameSequenceDifferentMessageIDIsNoOp(t *testing.T) {
+	db := openSearchOutboxTestDB(t)
+	message := searchOutboxTestMessage(1, 309, true)
+	appendAppliedSearchOutboxMessages(t, db, message)
+
+	if err := db.AckSearchOutbox([]SearchOutboxIdentity{{
+		ChannelID: message.ChannelID, ChannelType: message.ChannelType,
+		MessageSeq: uint64(message.MessageSeq), MessageID: message.MessageID + 1,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	requireRawSearchOutboxRecordCount(t, db, "channel", 2, 1)
+}
+
+func TestAckSearchOutboxDeletesIdentitiesAcrossShards(t *testing.T) {
+	db := openSearchOutboxTestDBWithShards(t, 2)
+	channel0 := findSearchOutboxChannelOnShard(t, db, 0)
+	channel1 := findSearchOutboxChannelOnShard(t, db, 1)
+	first := searchOutboxTestMessage(1, 310, true)
+	first.ChannelID = channel0
+	second := searchOutboxTestMessage(1, 311, true)
+	second.ChannelID = channel1
+	appendAppliedSearchOutboxMessages(t, db, first, second)
+
+	if err := db.AckSearchOutbox([]SearchOutboxIdentity{
+		searchOutboxIdentityFromMessage(second),
+		searchOutboxIdentityFromMessage(first),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	requireNoRawSearchOutboxRecords(t, db, channel0, 2)
+	requireNoRawSearchOutboxRecords(t, db, channel1, 2)
+}
+
+func TestAckSearchOutboxRetryConvergesAfterLaterShardFailure(t *testing.T) {
+	db := openSearchOutboxTestDBWithShards(t, 2)
+	channel0 := findSearchOutboxChannelOnShard(t, db, 0)
+	channel1 := findSearchOutboxChannelOnShard(t, db, 1)
+	first := searchOutboxTestMessage(1, 312, true)
+	first.ChannelID = channel0
+	second := searchOutboxTestMessage(1, 313, true)
+	second.ChannelID = channel1
+	appendAppliedSearchOutboxMessages(t, db, first, second)
+
+	injected := errors.New("later shard delete failed")
+	installOneShotFailingOutboxDelete(t, db, 1, injected)
+	identities := []SearchOutboxIdentity{
+		searchOutboxIdentityFromMessage(second),
+		searchOutboxIdentityFromMessage(first),
+	}
+	if err := db.AckSearchOutbox(identities); !errors.Is(err, injected) {
+		t.Fatalf("first AckSearchOutbox error = %v, want %v", err, injected)
+	}
+	requireNoRawSearchOutboxRecords(t, db, channel0, 2)
+	requireRawSearchOutboxRecordCount(t, db, channel1, 2, 1)
+
+	if err := db.AckSearchOutbox(identities); err != nil {
+		t.Fatalf("retry AckSearchOutbox: %v", err)
+	}
+	requireNoRawSearchOutboxRecords(t, db, channel0, 2)
+	requireNoRawSearchOutboxRecords(t, db, channel1, 2)
+}
+
+func TestTruncateLogToDeletesOnlyHigherSearchOutboxRecords(t *testing.T) {
+	db := openSearchOutboxTestDB(t)
+	appendSearchOutboxMessages(t, db,
+		searchOutboxTestMessage(1, 321, true),
+		searchOutboxTestMessage(2, 322, true),
+		searchOutboxTestMessage(3, 323, true),
+	)
+
+	if err := db.TruncateLogTo("channel", 2, 1); err != nil {
+		t.Fatal(err)
+	}
+	records := rawSearchOutboxRecords(t, db, "channel", 2)
+	if len(records) != 1 || records[0].Identity.MessageSeq != 1 {
+		t.Fatalf("records after truncate = %+v, want only sequence 1", records)
+	}
+}
+
+func TestTruncateLogToOutboxDeleteFailureCommitsNothing(t *testing.T) {
+	db := openSearchOutboxTestDB(t)
+	appendSearchOutboxMessages(t, db,
+		searchOutboxTestMessage(1, 324, true),
+		searchOutboxTestMessage(2, 325, true),
+	)
+	injected := errors.New("outbox range delete failed")
+	installFailingOutboxDeleteRange(t, db, "channel", 2, injected)
+
+	if err := db.TruncateLogTo("channel", 2, 1); !errors.Is(err, injected) {
+		t.Fatalf("TruncateLogTo error = %v, want %v", err, injected)
+	}
+	message, err := db.LoadMsg("channel", 2, 2)
+	if err != nil || message.MessageID != 325 {
+		t.Fatalf("message 2 changed after failed truncate: %+v, %v", message, err)
+	}
+	requireRawSearchOutboxRecordCount(t, db, "channel", 2, 2)
+	lastSequence, _, err := db.GetChannelLastMessageSeq("channel", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lastSequence != 2 {
+		t.Fatalf("last sequence = %d, want 2 after failed truncate", lastSequence)
+	}
+}
+
+func TestTruncateLogToBeforeOutboxFloorRemovesFloorAtomically(t *testing.T) {
+	db := openSearchOutboxTestDB(t)
+	appendSearchOutboxMessages(t, db, searchOutboxTestMessage(41, 326, true))
+
+	if err := db.TruncateLogTo("channel", 2, 39); err != nil {
+		t.Fatal(err)
+	}
+	if floor, enabled, err := db.GetSearchOutboxFloor("channel", 2); err != nil || enabled {
+		t.Fatalf("floor = %d/%v err=%v, want absent", floor, enabled, err)
+	}
+}
+
 type outboxFailingPhysicalBatch struct {
 	failTable   [2]byte
 	err         error
 	commitCalls int
+}
+
+type oneShotFailingOutboxDeleteBatch struct {
+	physicalBatch
+	err error
+}
+
+func (b *oneShotFailingOutboxDeleteBatch) Delete(keyBytes []byte, options *pebble.WriteOptions) error {
+	if len(keyBytes) >= len(key.TableSearchOutbox.Id) &&
+		bytes.Equal(keyBytes[:len(key.TableSearchOutbox.Id)], key.TableSearchOutbox.Id[:]) {
+		return b.err
+	}
+	return b.physicalBatch.Delete(keyBytes, options)
+}
+
+type failingOutboxDeleteRangeBatch struct {
+	physicalBatch
+	err error
+}
+
+func (b *failingOutboxDeleteRangeBatch) DeleteRange(start, end []byte, options *pebble.WriteOptions) error {
+	if len(start) >= len(key.TableSearchOutbox.Id) &&
+		bytes.Equal(start[:len(key.TableSearchOutbox.Id)], key.TableSearchOutbox.Id[:]) {
+		return b.err
+	}
+	return b.physicalBatch.DeleteRange(start, end, options)
 }
 
 func (b *outboxFailingPhysicalBatch) Set(keyBytes, _ []byte, _ *pebble.WriteOptions) error {
@@ -478,6 +705,42 @@ func installFailingPhysicalBatch(t *testing.T, db *wukongDB, channelID string, c
 		batchDB.newPhysicalBatch = original
 	})
 	return physical
+}
+
+func installOneShotFailingOutboxDelete(t *testing.T, db *wukongDB, shard uint32, injected error) {
+	t.Helper()
+	batchDB := db.shardBatchDBById(shard)
+	original := batchDB.newPhysicalBatch
+	first := true
+	batchDB.newPhysicalBatch = func() physicalBatch {
+		physical := original()
+		if first {
+			first = false
+			return &oneShotFailingOutboxDeleteBatch{
+				physicalBatch: physical,
+				err:           injected,
+			}
+		}
+		return physical
+	}
+	t.Cleanup(func() {
+		batchDB.newPhysicalBatch = original
+	})
+}
+
+func installFailingOutboxDeleteRange(t *testing.T, db *wukongDB, channelID string, channelType uint8, injected error) {
+	t.Helper()
+	batchDB := db.channelBatchDb(channelID, channelType)
+	original := batchDB.newPhysicalBatch
+	batchDB.newPhysicalBatch = func() physicalBatch {
+		return &failingOutboxDeleteRangeBatch{
+			physicalBatch: original(),
+			err:           injected,
+		}
+	}
+	t.Cleanup(func() {
+		batchDB.newPhysicalBatch = original
+	})
 }
 
 func openSearchOutboxTestDB(t *testing.T) *wukongDB {
@@ -533,6 +796,107 @@ func appendSearchOutboxMessages(t *testing.T, db *wukongDB, messages ...Message)
 			t.Fatal(err)
 		}
 	}
+}
+
+func appendAppliedSearchOutboxMessages(t *testing.T, db *wukongDB, messages ...Message) {
+	t.Helper()
+	appendSearchOutboxMessages(t, db, messages...)
+	appliedByChannel := make(map[searchOutboxChannel]uint64)
+	for _, message := range messages {
+		channel := searchOutboxChannel{
+			id:          message.ChannelID,
+			channelType: message.ChannelType,
+		}
+		if uint64(message.MessageSeq) > appliedByChannel[channel] {
+			appliedByChannel[channel] = uint64(message.MessageSeq)
+		}
+	}
+	for channel, applied := range appliedByChannel {
+		if err := db.UpdateChannelAppliedIndex(channel.id, channel.channelType, applied); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func assertSearchOutboxMessageIDs(t *testing.T, records []SearchOutboxRecord, expected ...int64) {
+	t.Helper()
+	if len(records) != len(expected) {
+		t.Fatalf("record count = %d, want %d: %+v", len(records), len(expected), records)
+	}
+	for index, record := range records {
+		if record.Identity.MessageID != expected[index] {
+			t.Fatalf("record %d message ID = %d, want %d", index, record.Identity.MessageID, expected[index])
+		}
+	}
+}
+
+func replaceRawOutboxValueWithDifferentMessage(t *testing.T, db *wukongDB, message Message, replacementMessageID int64) {
+	t.Helper()
+	keyBytes, err := key.NewSearchOutboxKey(
+		message.ChannelID,
+		message.ChannelType,
+		uint64(message.MessageSeq),
+		message.MessageID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message.MessageID = replacementMessageID
+	value, err := message.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.channelDb(message.ChannelID, message.ChannelType).Set(keyBytes, value, pebble.Sync); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func requireRawSearchOutboxRecordCount(t *testing.T, db *wukongDB, channelID string, channelType uint8, expected int) {
+	t.Helper()
+	lower, upper, err := key.NewSearchOutboxChannelRange(channelID, channelType, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	iter := db.channelDb(channelID, channelType).NewIter(&pebble.IterOptions{
+		LowerBound: lower,
+		UpperBound: upper,
+	})
+	defer iter.Close()
+	count := 0
+	for iter.First(); iter.Valid(); iter.Next() {
+		count++
+	}
+	if err := iter.Error(); err != nil {
+		t.Fatal(err)
+	}
+	if count != expected {
+		t.Fatalf("raw outbox record count = %d, want %d", count, expected)
+	}
+}
+
+func rawSearchOutboxRecords(t *testing.T, db *wukongDB, channelID string, channelType uint8) []SearchOutboxRecord {
+	t.Helper()
+	lower, upper, err := key.NewSearchOutboxChannelRange(channelID, channelType, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	iter := db.channelDb(channelID, channelType).NewIter(&pebble.IterOptions{
+		LowerBound: lower,
+		UpperBound: upper,
+	})
+	defer iter.Close()
+	records := make([]SearchOutboxRecord, 0)
+	for iter.First(); iter.Valid(); iter.Next() {
+		record, err := decodeSearchOutboxRecord(iter.Key(), iter.Value())
+		if err != nil {
+			t.Fatal(err)
+		}
+		records = append(records, record)
+	}
+	if err := iter.Error(); err != nil {
+		t.Fatal(err)
+	}
+	return records
 }
 
 func deleteOnlyMessageColumns(t *testing.T, db *wukongDB, channelID string, channelType uint8, messageSeq uint64) {

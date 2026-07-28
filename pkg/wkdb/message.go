@@ -562,8 +562,38 @@ func (wk *wukongDB) TruncateLogTo(channelId string, channelType uint8, messageSe
 		}()
 	}
 
+	floor, floorEnabled, err := wk.GetSearchOutboxFloor(channelId, channelType)
+	if err != nil {
+		return fmt.Errorf("load search outbox floor before truncate: %w", err)
+	}
+	var floorKey []byte
+	if floorEnabled && messageSeq < floor {
+		floorKey, err = key.NewSearchOutboxFloorKey(channelId, channelType)
+		if err != nil {
+			return fmt.Errorf("build search outbox floor key before truncate: %w", err)
+		}
+	}
+
+	var outboxLower, outboxUpper []byte
+	if messageSeq < MaxMessageSequence {
+		outboxLower, outboxUpper, err = key.NewSearchOutboxChannelRange(
+			channelId,
+			channelType,
+			messageSeq+1,
+		)
+		if err != nil {
+			return fmt.Errorf("build search outbox truncate range: %w", err)
+		}
+	}
+
 	db := wk.channelBatchDb(channelId, channelType)
 	batch := db.NewBatch()
+	if floorKey != nil {
+		batch.Delete(floorKey)
+	}
+	if outboxLower != nil {
+		batch.DeleteRange(outboxLower, outboxUpper)
+	}
 	batch.DeleteRange(key.NewMessagePrimaryKey(channelId, channelType, messageSeq+1), key.NewMessagePrimaryKey(channelId, channelType, math.MaxUint64))
 
 	err = wk.setChannelLastMessageSeq(channelId, channelType, messageSeq, batch)

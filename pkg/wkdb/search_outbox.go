@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb/key"
 	"github.com/cockroachdb/pebble"
@@ -46,6 +47,93 @@ type SearchOutboxPullResult struct {
 type searchOutboxChannel struct {
 	id          string
 	channelType uint8
+}
+
+type searchOutboxAck struct {
+	identity SearchOutboxIdentity
+	key      []byte
+}
+
+func (wk *wukongDB) AckSearchOutbox(identities []SearchOutboxIdentity) error {
+	if len(identities) == 0 {
+		return nil
+	}
+
+	unique := make([]SearchOutboxIdentity, 0, len(identities))
+	seen := make(map[SearchOutboxIdentity]struct{}, len(identities))
+	for index, identity := range identities {
+		if err := identity.Validate(); err != nil {
+			return fmt.Errorf("validate search outbox ack identity %d: %w", index, err)
+		}
+		if _, ok := seen[identity]; ok {
+			continue
+		}
+		seen[identity] = struct{}{}
+		unique = append(unique, identity)
+	}
+
+	acksByShard := make(map[uint32][]searchOutboxAck)
+	shardIDs := make([]uint32, 0)
+	for _, identity := range unique {
+		keyBytes, err := key.NewSearchOutboxKey(
+			identity.ChannelID,
+			identity.ChannelType,
+			identity.MessageSeq,
+			identity.MessageID,
+		)
+		if err != nil {
+			return fmt.Errorf("build search outbox ack key: %w", err)
+		}
+		shardID := wk.GetChannelShardIndex(identity.ChannelID, identity.ChannelType)
+		if _, ok := acksByShard[shardID]; !ok {
+			shardIDs = append(shardIDs, shardID)
+		}
+		acksByShard[shardID] = append(acksByShard[shardID], searchOutboxAck{
+			identity: identity,
+			key:      keyBytes,
+		})
+	}
+	sort.Slice(shardIDs, func(left, right int) bool {
+		return shardIDs[left] < shardIDs[right]
+	})
+
+	for _, shardID := range shardIDs {
+		shardDB := wk.shardDBById(shardID)
+		keysToDelete := make([][]byte, 0, len(acksByShard[shardID]))
+		for _, ack := range acksByShard[shardID] {
+			value, closer, err := shardDB.Get(ack.key)
+			if errors.Is(err, pebble.ErrNotFound) {
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("load search outbox ack record: %w", err)
+			}
+			record, decodeErr := decodeSearchOutboxRecord(ack.key, value)
+			closeErr := closer.Close()
+			if decodeErr != nil {
+				return fmt.Errorf("validate search outbox ack: %w", decodeErr)
+			}
+			if closeErr != nil {
+				return fmt.Errorf("close search outbox ack record: %w", closeErr)
+			}
+			if record.Identity != ack.identity {
+				return errors.New("search outbox ack identity differs from stored record")
+			}
+			keysToDelete = append(keysToDelete, ack.key)
+		}
+		if len(keysToDelete) == 0 {
+			continue
+		}
+
+		batch := wk.shardBatchDBById(shardID).NewBatch()
+		for _, keyBytes := range keysToDelete {
+			batch.Delete(keyBytes)
+		}
+		if err := batch.CommitWait(); err != nil {
+			return fmt.Errorf("commit search outbox ack for shard %d: %w", shardID, err)
+		}
+	}
+	return nil
 }
 
 func (wk *wukongDB) PullSearchOutbox(limit int, maxBytes uint64) (SearchOutboxPullResult, error) {

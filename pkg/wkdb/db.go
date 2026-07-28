@@ -61,6 +61,7 @@ type MessageEventDB interface {
 
 type MessageDB interface {
 	GetSearchOutboxFloor(channelID string, channelType uint8) (uint64, bool, error)
+	AckSearchOutbox(identities []SearchOutboxIdentity) error
 	PullSearchOutbox(limit int, maxBytes uint64) (SearchOutboxPullResult, error)
 	ScanSearchOutboxChannels(ctx context.Context, visit func(Channel) error) error
 
