@@ -70,6 +70,38 @@ func TestSearchAppliedObserverIgnoresUnsupportedLegacyChannelIdentities(t *testi
 	}
 }
 
+func TestSearchAppliedObserverDoesNotQueueUnsupportedLegacyChannelIdentities(t *testing.T) {
+	observer := newSearchAppliedObserver(nil)
+	for _, channelKey := range []string{
+		wkutil.ChannelToKey("", 2),
+		wkutil.ChannelToKey("channel", 0),
+		wkutil.ChannelToKey(string([]byte{0xff}), 2),
+	} {
+		if err := observer.Observe(channelKey, 1); err != nil {
+			t.Fatalf("Observe(%q): %v", channelKey, err)
+		}
+	}
+	for index := 0; index < searchAppliedObservationQueueSize+searchAppliedRetryCapacity+1; index++ {
+		channelID := fmt.Sprintf("%0101d", index)
+		if err := observer.Observe(wkutil.ChannelToKey(channelID, 2), 1); err != nil {
+			t.Fatalf("Observe oversized channel %d: %v", index, err)
+		}
+	}
+
+	observer.mu.Lock()
+	queueLength := len(observer.queue)
+	retryLength := len(observer.retry)
+	overflowed := observer.overflowed
+	observer.mu.Unlock()
+	if queueLength != 0 || retryLength != 0 || overflowed {
+		t.Fatalf("unsupported observations changed bounded state: queue=%d retry=%d overflowed=%v",
+			queueLength, retryLength, overflowed)
+	}
+	if err := observer.Ready(); err != nil {
+		t.Fatalf("unsupported observations poisoned readiness: %v", err)
+	}
+}
+
 func TestSearchAppliedObserverRetainsLastNewChannelWhenPrimaryQueueIsFull(t *testing.T) {
 	db := openAppliedTestDB(t)
 	observer := newSearchAppliedObserver(db)

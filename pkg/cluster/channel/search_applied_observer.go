@@ -91,6 +91,9 @@ func (o *searchAppliedObserver) Observe(key string, index uint64) error {
 	if key == "" || index == 0 {
 		return errors.New("invalid search applied observation")
 	}
+	if !supportsSearchAppliedObservation(key) {
+		return nil
+	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if !o.accepting {
@@ -113,6 +116,11 @@ func (o *searchAppliedObserver) Observe(key string, index uint64) error {
 		// not a Raft warning for every message.
 		return nil
 	}
+}
+
+func supportsSearchAppliedObservation(channelKey string) bool {
+	channelID, channelType := wkutil.ChannelFromlKey(channelKey)
+	return key.IsValidSearchOutboxChannelIdentity(channelID, channelType)
 }
 
 func (o *searchAppliedObserver) Ready() error {
