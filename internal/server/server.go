@@ -86,8 +86,6 @@ type Server struct {
 	pluginServer *plugin.Server
 }
 
-const searchSourceBootstrapStartupTimeout time.Duration = 0
-
 func New(opts *options.Options) *Server {
 	now := time.Now().UTC()
 
@@ -240,7 +238,7 @@ func New(opts *options.Options) *Server {
 			plugin.WithInstall(s.opts.Plugin.Install),
 		),
 	)
-	s.pluginServer.SetSearchSourceRuntimeReady(s.clusterServer.SearchSourceReady)
+	s.pluginServer.SetSearchSourceRuntimeReady(s.clusterServer.SearchOutboxReady)
 	service.PluginManager = s.pluginServer
 	return s
 }
@@ -297,24 +295,11 @@ func (s *Server) Start() error {
 	if err != nil {
 		return err
 	}
-	bootstrapErr := initializeSearchSourceBeforeTraffic(
-		s.ctx,
-		searchSourceBootstrapStartupTimeout,
-		func(ctx context.Context) error {
-			_, err := plugin.ApplySearchSourceOfflineBootstrapMarker(
-				ctx,
-				filepath.Join(s.opts.DataDir, plugin.SearchSourceOfflineBootstrapMarkerName),
-			)
-			return err
-		},
-		s.pluginServer.SetSearchSourceBootstrapResult,
-	)
-	if bootstrapErr != nil {
-		if !plugin.IsSearchSourceBootstrapRequired(bootstrapErr) {
-			s.Error("offline search source bootstrap failed; traffic remains stopped", zap.Error(bootstrapErr))
-			return fmt.Errorf("offline search source bootstrap: %w", bootstrapErr)
-		}
-		s.Error("offline search source bootstrap failed; search source disabled", zap.Error(bootstrapErr))
+	if recoveryErr := s.clusterServer.RecoverSearchOutbox(s.ctx); recoveryErr != nil {
+		s.Error(
+			"search outbox recovery failed; search push remains disabled",
+			zap.Error(recoveryErr),
+		)
 	}
 	s.engine.OnConnect(s.onConnect)
 	s.engine.OnData(s.onData)
@@ -367,23 +352,6 @@ func (s *Server) Start() error {
 
 	ready = true
 	return nil
-}
-
-func initializeSearchSourceBeforeTraffic(
-	parent context.Context,
-	timeout time.Duration,
-	apply func(context.Context) error,
-	record func(error),
-) error {
-	ctx := parent
-	cancel := func() {}
-	if timeout > 0 {
-		ctx, cancel = context.WithTimeout(parent, timeout)
-	}
-	defer cancel()
-	err := apply(ctx)
-	record(err)
-	return err
 }
 
 func (s *Server) StopNoErr() {

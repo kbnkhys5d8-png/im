@@ -1,6 +1,7 @@
 package wkdb
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
@@ -33,6 +34,152 @@ type SearchOutboxRecord struct {
 	Identity     SearchOutboxIdentity
 	Message      Message
 	AppliedIndex uint64
+}
+
+type SearchOutboxPullResult struct {
+	Records         []SearchOutboxRecord
+	Pending         uint64
+	OldestCreatedAt int64
+	AppliedBlocked  uint64
+}
+
+type searchOutboxChannel struct {
+	id          string
+	channelType uint8
+}
+
+func (wk *wukongDB) PullSearchOutbox(limit int, maxBytes uint64) (SearchOutboxPullResult, error) {
+	if limit < 1 || limit > MaxSearchOutboxPullLimit {
+		return SearchOutboxPullResult{}, fmt.Errorf("search outbox pull limit must be between 1 and %d", MaxSearchOutboxPullLimit)
+	}
+	if maxBytes == 0 {
+		return SearchOutboxPullResult{}, errors.New("search outbox byte budget must be positive")
+	}
+
+	result := SearchOutboxPullResult{
+		Records: make([]SearchOutboxRecord, 0, limit),
+	}
+	appliedByChannel := make(map[searchOutboxChannel]uint64)
+	var (
+		usedBytes      uint64
+		recordsStopped bool
+	)
+	for shardID := uint32(0); shardID < wk.shardNum; shardID++ {
+		iter := wk.shardDBById(shardID).NewIter(&pebble.IterOptions{
+			LowerBound: key.NewSearchOutboxLowKey(),
+			UpperBound: key.NewSearchOutboxHighKey(),
+		})
+		for iter.First(); iter.Valid(); iter.Next() {
+			keyBytes := iter.Key()
+			value := append([]byte(nil), iter.Value()...)
+			record, err := decodeSearchOutboxRecord(keyBytes, value)
+			if err != nil {
+				iter.Close()
+				return SearchOutboxPullResult{}, err
+			}
+			if record.Message.Timestamp <= 0 {
+				iter.Close()
+				return SearchOutboxPullResult{}, errors.New("search outbox record has no server timestamp")
+			}
+
+			result.Pending++
+			timestamp := int64(record.Message.Timestamp)
+			if result.OldestCreatedAt == 0 || timestamp < result.OldestCreatedAt {
+				result.OldestCreatedAt = timestamp
+			}
+
+			channel := searchOutboxChannel{
+				id:          record.Identity.ChannelID,
+				channelType: record.Identity.ChannelType,
+			}
+			applied, ok := appliedByChannel[channel]
+			if !ok {
+				applied, err = wk.GetChannelAppliedIndex(channel.id, channel.channelType)
+				if err != nil {
+					iter.Close()
+					return SearchOutboxPullResult{}, fmt.Errorf("load durable applied index: %w", err)
+				}
+				appliedByChannel[channel] = applied
+			}
+			if applied == 0 || applied < record.Identity.MessageSeq {
+				result.AppliedBlocked++
+				continue
+			}
+			if recordsStopped {
+				continue
+			}
+			if len(result.Records) == limit {
+				recordsStopped = true
+				continue
+			}
+
+			recordBytes := uint64(len(keyBytes)) + uint64(len(value))
+			if recordBytes > maxBytes-usedBytes {
+				if len(result.Records) == 0 {
+					iter.Close()
+					return SearchOutboxPullResult{}, ErrSearchOutboxByteBudget
+				}
+				recordsStopped = true
+				continue
+			}
+			record.AppliedIndex = applied
+			result.Records = append(result.Records, record)
+			usedBytes += recordBytes
+		}
+		if err := iter.Error(); err != nil {
+			iter.Close()
+			return SearchOutboxPullResult{}, fmt.Errorf("iterate search outbox: %w", err)
+		}
+		if err := iter.Close(); err != nil {
+			return SearchOutboxPullResult{}, fmt.Errorf("close search outbox iterator: %w", err)
+		}
+	}
+	return result, nil
+}
+
+func (wk *wukongDB) ScanSearchOutboxChannels(ctx context.Context, visit func(Channel) error) error {
+	if ctx == nil {
+		return errors.New("search outbox scan context is nil")
+	}
+	if visit == nil {
+		return errors.New("search outbox visit function is nil")
+	}
+
+	visited := make(map[searchOutboxChannel]struct{})
+	for shardID := uint32(0); shardID < wk.shardNum; shardID++ {
+		iter := wk.shardDBById(shardID).NewIter(&pebble.IterOptions{
+			LowerBound: key.NewSearchOutboxLowKey(),
+			UpperBound: key.NewSearchOutboxHighKey(),
+		})
+		for iter.First(); iter.Valid(); iter.Next() {
+			if err := ctx.Err(); err != nil {
+				iter.Close()
+				return err
+			}
+			channelID, channelType, _, _, err := key.ParseSearchOutboxKey(iter.Key())
+			if err != nil {
+				iter.Close()
+				return fmt.Errorf("parse search outbox key: %w", err)
+			}
+			pending := searchOutboxChannel{id: channelID, channelType: channelType}
+			if _, ok := visited[pending]; ok {
+				continue
+			}
+			visited[pending] = struct{}{}
+			if err := visit(Channel{ChannelId: channelID, ChannelType: channelType}); err != nil {
+				iter.Close()
+				return err
+			}
+		}
+		if err := iter.Error(); err != nil {
+			iter.Close()
+			return fmt.Errorf("iterate search outbox channels: %w", err)
+		}
+		if err := iter.Close(); err != nil {
+			return fmt.Errorf("close search outbox iterator: %w", err)
+		}
+	}
+	return ctx.Err()
 }
 
 func (wk *wukongDB) GetSearchOutboxFloor(channelID string, channelType uint8) (floor uint64, enabled bool, err error) {

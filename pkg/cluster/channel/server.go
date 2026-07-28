@@ -1,6 +1,7 @@
 package channel
 
 import (
+	"errors"
 	"sync"
 
 	"github.com/WuKongIM/WuKongIM/pkg/fasthash"
@@ -24,6 +25,12 @@ type Server struct {
 	wake struct {
 		sync.RWMutex
 		channels map[string]bool
+	}
+
+	searchOutboxRecovery struct {
+		sync.RWMutex
+		completed bool
+		err       error
 	}
 
 	wakeLeaderLock *ringlock.RingLock
@@ -75,6 +82,25 @@ func (s *Server) Stop() {
 
 func (s *Server) SearchSourceReady() error {
 	return s.searchAppliedObserver.Ready()
+}
+
+func (s *Server) SetSearchOutboxRecoveryResult(err error) {
+	s.searchOutboxRecovery.Lock()
+	s.searchOutboxRecovery.completed = true
+	s.searchOutboxRecovery.err = err
+	s.searchOutboxRecovery.Unlock()
+}
+
+func (s *Server) SearchOutboxReady() error {
+	if err := s.searchAppliedObserver.Ready(); err != nil {
+		return err
+	}
+	s.searchOutboxRecovery.RLock()
+	defer s.searchOutboxRecovery.RUnlock()
+	if !s.searchOutboxRecovery.completed {
+		return errors.New("search outbox recovery has not completed")
+	}
+	return s.searchOutboxRecovery.err
 }
 
 // 唤醒频道领导

@@ -286,6 +286,30 @@ func (s *Server) SearchSourceReady() error {
 	return s.channelServer.SearchSourceReady()
 }
 
+func (s *Server) RecoverSearchOutbox(ctx context.Context) error {
+	err := s.store.DB().ScanSearchOutboxChannels(ctx, func(channel wkdb.Channel) error {
+		config, err := s.LoadOnlyChannelClusterConfig(channel.ChannelId, channel.ChannelType)
+		if err != nil {
+			return fmt.Errorf("load pending outbox authority: %w", err)
+		}
+		nodeID := s.opts.ConfigOptions.NodeId
+		if !wkutil.ArrayContainsUint64(config.Replicas, nodeID) &&
+			!wkutil.ArrayContainsUint64(config.Learners, nodeID) {
+			return errors.New("local pending outbox is not covered by channel authority")
+		}
+		if config.LeaderId == nodeID {
+			return s.channelServer.WakeLeaderIfNeed(config)
+		}
+		return s.channelServer.WakeFollowerfNeed(channel.ChannelId, channel.ChannelType)
+	})
+	s.channelServer.SetSearchOutboxRecoveryResult(err)
+	return err
+}
+
+func (s *Server) SearchOutboxReady() error {
+	return s.channelServer.SearchOutboxReady()
+}
+
 // 配置改变
 func (s *Server) OnConfigChange(cfg *types.Config) {
 
