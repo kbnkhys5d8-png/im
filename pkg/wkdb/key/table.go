@@ -912,3 +912,9 @@ var TableMessageEventSeq = struct {
 	Id:   [2]byte{0x1A, 0x01},
 	Size: 2 + 2 + 8 + 8, // tableId + dataType + channel_hash + client_hash
 }
+
+var TableSearchOutbox = struct {
+	Id [2]byte
+}{
+	Id: [2]byte{0x1B, 0x01},
+}

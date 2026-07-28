@@ -30,11 +30,24 @@ func (wk *wukongDB) AppendMessages(channelId string, channelType uint8, msgs []M
 	}
 
 	batch := wk.channelBatchDb(channelId, channelType).NewBatch()
+	for _, message := range msgs {
+		if !message.SearchOutbox {
+			continue
+		}
+		if err := wk.ensureSearchOutboxFloor(channelId, channelType, uint64(message.MessageSeq), batch); err != nil {
+			return err
+		}
+		break
+	}
 	for _, msg := range msgs {
 		if err := wk.writeMessage(channelId, channelType, msg, batch); err != nil {
 			return err
 		}
-
+		if msg.SearchOutbox {
+			if err := wk.writeSearchOutbox(msg, batch); err != nil {
+				return err
+			}
+		}
 	}
 	lastMsg := msgs[len(msgs)-1]
 	err := wk.setChannelLastMessageSeq(channelId, channelType, uint64(lastMsg.MessageSeq), batch)

@@ -7,10 +7,107 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 var MinColumnKey = [2]byte{0x00, 0x00}
 var MaxColumnKey = [2]byte{0xff, 0xff}
+
+const MaxSearchOutboxChannelIDBytes = 100
+
+func searchOutboxChannelPrefix(channelID string, channelType uint8) ([]byte, error) {
+	channelBytes := []byte(channelID)
+	if channelID == "" || !utf8.ValidString(channelID) || len(channelBytes) > MaxSearchOutboxChannelIDBytes || channelType == 0 {
+		return nil, fmt.Errorf("invalid search outbox channel identity")
+	}
+	prefix := make([]byte, 2+2+1+2+len(channelBytes))
+	copy(prefix[0:2], TableSearchOutbox.Id[:])
+	prefix[2] = dataTypeTable
+	prefix[3] = 0
+	prefix[4] = channelType
+	binary.BigEndian.PutUint16(prefix[5:7], uint16(len(channelBytes)))
+	copy(prefix[7:], channelBytes)
+	return prefix, nil
+}
+
+func NewSearchOutboxKey(channelID string, channelType uint8, messageSeq uint64, messageID int64) ([]byte, error) {
+	prefix, err := searchOutboxChannelPrefix(channelID, channelType)
+	if err != nil {
+		return nil, err
+	}
+	if messageSeq == 0 || messageSeq > math.MaxUint32 || messageID <= 0 {
+		return nil, fmt.Errorf("invalid search outbox message identity")
+	}
+	keyBytes := make([]byte, len(prefix)+8+8)
+	copy(keyBytes, prefix)
+	offset := len(prefix)
+	binary.BigEndian.PutUint64(keyBytes[offset:offset+8], messageSeq)
+	binary.BigEndian.PutUint64(keyBytes[offset+8:], uint64(messageID))
+	return keyBytes, nil
+}
+
+func ParseSearchOutboxKey(raw []byte) (channelID string, channelType uint8, messageSeq uint64, messageID int64, err error) {
+	const fixedBytes = 2 + 2 + 1 + 2 + 8 + 8
+	if len(raw) < fixedBytes || raw[0] != TableSearchOutbox.Id[0] || raw[1] != TableSearchOutbox.Id[1] || raw[2] != dataTypeTable || raw[3] != 0 || raw[4] == 0 {
+		return "", 0, 0, 0, fmt.Errorf("invalid search outbox key prefix")
+	}
+	channelLength := int(binary.BigEndian.Uint16(raw[5:7]))
+	if channelLength == 0 || len(raw) != fixedBytes+channelLength {
+		return "", 0, 0, 0, fmt.Errorf("invalid search outbox key length")
+	}
+	channelBytes := raw[7 : 7+channelLength]
+	if !utf8.Valid(channelBytes) {
+		return "", 0, 0, 0, fmt.Errorf("invalid search outbox channel encoding")
+	}
+	offset := 7 + channelLength
+	messageSeq = binary.BigEndian.Uint64(raw[offset : offset+8])
+	rawMessageID := binary.BigEndian.Uint64(raw[offset+8:])
+	if messageSeq == 0 || messageSeq > math.MaxUint32 || rawMessageID == 0 || rawMessageID > math.MaxInt64 {
+		return "", 0, 0, 0, fmt.Errorf("invalid search outbox message identity")
+	}
+	return string(channelBytes), raw[4], messageSeq, int64(rawMessageID), nil
+}
+
+func NewSearchOutboxLowKey() []byte {
+	return []byte{TableSearchOutbox.Id[0], TableSearchOutbox.Id[1], dataTypeTable, 0}
+}
+
+func NewSearchOutboxHighKey() []byte {
+	return []byte{TableSearchOutbox.Id[0], TableSearchOutbox.Id[1], dataTypeTable, 1}
+}
+
+func NewSearchOutboxFloorKey(channelID string, channelType uint8) ([]byte, error) {
+	prefix, err := searchOutboxChannelPrefix(channelID, channelType)
+	if err != nil {
+		return nil, err
+	}
+	keyBytes := append([]byte(nil), prefix...)
+	keyBytes[2] = dataTypeOther
+	return keyBytes, nil
+}
+
+func NewSearchOutboxChannelRange(channelID string, channelType uint8, firstMessageSeq uint64) (lower []byte, upper []byte, err error) {
+	prefix, err := searchOutboxChannelPrefix(channelID, channelType)
+	if err != nil {
+		return nil, nil, err
+	}
+	if firstMessageSeq == 0 || firstMessageSeq > math.MaxUint32 {
+		return nil, nil, fmt.Errorf("invalid first search outbox sequence")
+	}
+	lower = make([]byte, len(prefix)+8+8)
+	copy(lower, prefix)
+	binary.BigEndian.PutUint64(lower[len(prefix):], firstMessageSeq)
+	binary.BigEndian.PutUint64(lower[len(prefix)+8:], 1)
+
+	upper = append([]byte(nil), prefix...)
+	for index := len(upper) - 1; index >= 0; index-- {
+		if upper[index] != math.MaxUint8 {
+			upper[index]++
+			return lower, upper[:index+1], nil
+		}
+	}
+	return nil, nil, fmt.Errorf("search outbox channel prefix has no upper bound")
+}
 
 // ---------------------- Message ----------------------
 func NewMessageColumnKey(channelId string, channelType uint8, messageSeq uint64, columnName [2]byte) []byte {

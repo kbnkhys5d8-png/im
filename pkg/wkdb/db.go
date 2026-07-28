@@ -58,6 +58,7 @@ type MessageEventDB interface {
 }
 
 type MessageDB interface {
+	GetSearchOutboxFloor(channelID string, channelType uint8) (uint64, bool, error)
 
 	// GetMessage 获取指定消息id的消息 TODO: 如果消息不在此节点上，是查询不到的，需要通过频道id判断消息是否在此节点上
 	GetMessage(messageId uint64) (Message, error)
