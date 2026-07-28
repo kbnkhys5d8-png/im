@@ -16,6 +16,17 @@ import (
 )
 
 func (wk *wukongDB) AppendMessages(channelId string, channelType uint8, msgs []Message) error {
+	for _, message := range msgs {
+		if message.ChannelID != channelId || message.ChannelType != channelType {
+			return fmt.Errorf(
+				"append message channel identity %q/%d differs from target %q/%d",
+				message.ChannelID,
+				message.ChannelType,
+				channelId,
+				channelType,
+			)
+		}
+	}
 
 	wk.metrics.AppendMessagesAdd(1)
 

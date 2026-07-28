@@ -3,6 +3,7 @@ package wkdb
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb/key"
@@ -78,6 +79,42 @@ func TestAppendMessagesWritesSearchOutboxFloorOnce(t *testing.T) {
 	}
 }
 
+func TestAppendMessagesRejectsMismatchedMessageChannelBeforeBatch(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, *wukongDB, *Message)
+	}{
+		{
+			name: "different channel id across shard",
+			mutate: func(t *testing.T, db *wukongDB, message *Message) {
+				message.ChannelID = findCrossShardChannelID(t, db, message.ChannelID, message.ChannelType)
+			},
+		},
+		{
+			name: "different channel type",
+			mutate: func(_ *testing.T, _ *wukongDB, message *Message) {
+				message.ChannelType = 3
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db := openSearchOutboxTestDBWithShards(t, 2)
+			const targetChannelID = "channel"
+			const targetChannelType uint8 = 2
+			message := searchOutboxTestMessage(1, 151, true)
+			test.mutate(t, db, &message)
+
+			if err := db.AppendMessages(targetChannelID, targetChannelType, []Message{message}); err == nil {
+				t.Error("AppendMessages accepted a mismatched message channel identity")
+			}
+			requireSearchOutboxChannelStateEmpty(t, db, targetChannelID, targetChannelType, 1)
+			requireSearchOutboxChannelStateEmpty(t, db, message.ChannelID, message.ChannelType, 1)
+		})
+	}
+}
+
 type outboxFailingPhysicalBatch struct {
 	failTable   [2]byte
 	err         error
@@ -117,8 +154,12 @@ func installFailingPhysicalBatch(t *testing.T, db *wukongDB, channelID string, c
 }
 
 func openSearchOutboxTestDB(t *testing.T) *wukongDB {
+	return openSearchOutboxTestDBWithShards(t, 1)
+}
+
+func openSearchOutboxTestDBWithShards(t *testing.T, shardCount int) *wukongDB {
 	t.Helper()
-	db := NewWukongDB(NewOptions(WithDir(t.TempDir()), WithShardNum(1))).(*wukongDB)
+	db := NewWukongDB(NewOptions(WithDir(t.TempDir()), WithShardNum(shardCount))).(*wukongDB)
 	if err := db.Open(); err != nil {
 		t.Fatal(err)
 	}
@@ -128,6 +169,19 @@ func openSearchOutboxTestDB(t *testing.T) *wukongDB {
 		}
 	})
 	return db
+}
+
+func findCrossShardChannelID(t *testing.T, db *wukongDB, channelID string, channelType uint8) string {
+	t.Helper()
+	targetShard := db.channelDbIndex(channelID, channelType)
+	for index := 0; index < 1000; index++ {
+		candidate := fmt.Sprintf("%s-mismatch-%d", channelID, index)
+		if db.channelDbIndex(candidate, channelType) != targetShard {
+			return candidate
+		}
+	}
+	t.Fatal("could not find a channel identity on another shard")
+	return ""
 }
 
 func searchOutboxTestMessage(sequence uint32, messageID int64, searchOutbox bool) Message {
@@ -171,6 +225,48 @@ func requireNoRawSearchOutboxRecords(t *testing.T, db *wukongDB, channelID strin
 	defer iter.Close()
 	if iter.First() {
 		t.Fatalf("unexpected outbox key %x", iter.Key())
+	}
+}
+
+func requireNoRawSearchOutboxRecordsOnAnyShard(t *testing.T, db *wukongDB, channelID string, channelType uint8) {
+	t.Helper()
+	lower, upper, err := key.NewSearchOutboxChannelRange(channelID, channelType, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for shard := uint32(0); shard < db.shardNum; shard++ {
+		iter := db.shardDBById(shard).NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
+		found := iter.First()
+		var foundKey []byte
+		if found {
+			foundKey = append([]byte(nil), iter.Key()...)
+		}
+		if err := iter.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if found {
+			t.Fatalf("unexpected outbox key on shard %d: %x", shard, foundKey)
+		}
+	}
+}
+
+func requireSearchOutboxChannelStateEmpty(t *testing.T, db *wukongDB, channelID string, channelType uint8, sequence uint64) {
+	t.Helper()
+	requireMessageMissing(t, db, channelID, channelType, sequence)
+	requireNoRawSearchOutboxRecordsOnAnyShard(t, db, channelID, channelType)
+	floor, enabled, err := db.GetSearchOutboxFloor(channelID, channelType)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if enabled || floor != 0 {
+		t.Fatalf("search outbox floor = %d/%v, want 0/false", floor, enabled)
+	}
+	lastSequence, _, err := db.GetChannelLastMessageSeq(channelID, channelType)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lastSequence != 0 {
+		t.Fatalf("last sequence = %d, want 0", lastSequence)
 	}
 }
 

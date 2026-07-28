@@ -52,7 +52,7 @@ func ParseSearchOutboxKey(raw []byte) (channelID string, channelType uint8, mess
 		return "", 0, 0, 0, fmt.Errorf("invalid search outbox key prefix")
 	}
 	channelLength := int(binary.BigEndian.Uint16(raw[5:7]))
-	if channelLength == 0 || len(raw) != fixedBytes+channelLength {
+	if channelLength == 0 || channelLength > MaxSearchOutboxChannelIDBytes || len(raw) != fixedBytes+channelLength {
 		return "", 0, 0, 0, fmt.Errorf("invalid search outbox key length")
 	}
 	channelBytes := raw[7 : 7+channelLength]

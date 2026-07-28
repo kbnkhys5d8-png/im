@@ -89,3 +89,20 @@ func TestSearchOutboxKeyRejectsMalformedEncoding(t *testing.T) {
 		})
 	}
 }
+
+func TestSearchOutboxKeyParserRejectsOversizedChannel(t *testing.T) {
+	channelLength := MaxSearchOutboxChannelIDBytes + 1
+	raw := make([]byte, 2+2+1+2+channelLength+8+8)
+	copy(raw[0:2], TableSearchOutbox.Id[:])
+	raw[2] = dataTypeTable
+	raw[4] = 2
+	binary.BigEndian.PutUint16(raw[5:7], uint16(channelLength))
+	copy(raw[7:7+channelLength], bytes.Repeat([]byte("x"), channelLength))
+	offset := 7 + channelLength
+	binary.BigEndian.PutUint64(raw[offset:offset+8], 1)
+	binary.BigEndian.PutUint64(raw[offset+8:], 1)
+
+	if _, _, _, _, err := ParseSearchOutboxKey(raw); err == nil {
+		t.Fatal("ParseSearchOutboxKey accepted a 101-byte channel identity")
+	}
+}
