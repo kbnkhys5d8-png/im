@@ -42,3 +42,30 @@ func TestRecoverSearchOutboxRunsBeforeTrafficStartup(t *testing.T) {
 		}
 	}
 }
+
+func TestSearchReadinessWiringUsesSeparateCallbacks(t *testing.T) {
+	source, err := os.ReadFile("server.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceWiring := []byte(
+		"s.pluginServer.SetSearchSourceRuntimeReady(s.clusterServer.SearchSourceReady)",
+	)
+	outboxWiring := []byte(
+		"s.pluginServer.SetSearchOutboxRuntimeReady(s.clusterServer.SearchOutboxReady)",
+	)
+	if count := bytes.Count(source, sourceWiring); count != 1 {
+		t.Fatalf("search source readiness wiring count = %d, want 1", count)
+	}
+	if count := bytes.Count(source, outboxWiring); count != 1 {
+		t.Fatalf("search outbox readiness wiring count = %d, want 1", count)
+	}
+	if bytes.Contains(
+		source,
+		[]byte(
+			"s.pluginServer.SetSearchSourceRuntimeReady(s.clusterServer.SearchOutboxReady)",
+		),
+	) {
+		t.Fatal("search source readiness is cross-wired to search outbox recovery")
+	}
+}
