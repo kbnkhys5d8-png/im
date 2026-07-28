@@ -2,6 +2,7 @@ package wkdb
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -15,6 +16,17 @@ import (
 )
 
 func (wk *wukongDB) AppendMessages(channelId string, channelType uint8, msgs []Message) error {
+	for _, message := range msgs {
+		if message.ChannelID != channelId || message.ChannelType != channelType {
+			return fmt.Errorf(
+				"append message channel identity %q/%d differs from target %q/%d",
+				message.ChannelID,
+				message.ChannelType,
+				channelId,
+				channelType,
+			)
+		}
+	}
 
 	wk.metrics.AppendMessagesAdd(1)
 
@@ -29,11 +41,24 @@ func (wk *wukongDB) AppendMessages(channelId string, channelType uint8, msgs []M
 	}
 
 	batch := wk.channelBatchDb(channelId, channelType).NewBatch()
+	for _, message := range msgs {
+		if !message.SearchOutbox {
+			continue
+		}
+		if err := wk.ensureSearchOutboxFloor(channelId, channelType, uint64(message.MessageSeq), batch); err != nil {
+			return err
+		}
+		break
+	}
 	for _, msg := range msgs {
 		if err := wk.writeMessage(channelId, channelType, msg, batch); err != nil {
 			return err
 		}
-
+		if msg.SearchOutbox {
+			if err := wk.writeSearchOutbox(msg, batch); err != nil {
+				return err
+			}
+		}
 	}
 	lastMsg := msgs[len(msgs)-1]
 	err := wk.setChannelLastMessageSeq(channelId, channelType, uint64(lastMsg.MessageSeq), batch)
@@ -537,8 +562,39 @@ func (wk *wukongDB) TruncateLogTo(channelId string, channelType uint8, messageSe
 		}()
 	}
 
+	floor, floorEnabled, err := wk.GetSearchOutboxFloor(channelId, channelType)
+	if err != nil {
+		return fmt.Errorf("load search outbox floor before truncate: %w", err)
+	}
+	var floorKey []byte
+	if floorEnabled && messageSeq < floor {
+		floorKey, err = key.NewSearchOutboxFloorKey(channelId, channelType)
+		if err != nil {
+			return fmt.Errorf("build search outbox floor key before truncate: %w", err)
+		}
+	}
+
+	var outboxLower, outboxUpper []byte
+	if key.IsValidSearchOutboxChannelIdentity(channelId, channelType) &&
+		messageSeq < MaxMessageSequence {
+		outboxLower, outboxUpper, err = key.NewSearchOutboxChannelRange(
+			channelId,
+			channelType,
+			messageSeq+1,
+		)
+		if err != nil {
+			return fmt.Errorf("build search outbox truncate range: %w", err)
+		}
+	}
+
 	db := wk.channelBatchDb(channelId, channelType)
 	batch := db.NewBatch()
+	if floorKey != nil {
+		batch.Delete(floorKey)
+	}
+	if outboxLower != nil {
+		batch.DeleteRange(outboxLower, outboxUpper)
+	}
 	batch.DeleteRange(key.NewMessagePrimaryKey(channelId, channelType, messageSeq+1), key.NewMessagePrimaryKey(channelId, channelType, math.MaxUint64))
 
 	err = wk.setChannelLastMessageSeq(channelId, channelType, messageSeq, batch)
@@ -1343,7 +1399,11 @@ func (wk *wukongDB) iteratorChannelMessagesDirection(iter *pebble.Iterator, limi
 			preMessage.Payload = payload
 		case key.TableMessage.Column.Term:
 			preMessage.Term = wk.endian.Uint64(iter.Value())
-
+		case key.TableMessage.Column.SearchOutbox:
+			if len(iter.Value()) != 1 || iter.Value()[0] != 1 {
+				return errors.New("message has invalid search outbox column")
+			}
+			preMessage.SearchOutbox = true
 		}
 		hasData = true
 	}
@@ -1423,6 +1483,11 @@ func (wk *wukongDB) parseChannelMessagesWithLimitSize(iter *pebble.Iterator, lim
 			preMessage.Payload = payload
 		case key.TableMessage.Column.Term:
 			preMessage.Term = wk.endian.Uint64(iter.Value())
+		case key.TableMessage.Column.SearchOutbox:
+			if len(iter.Value()) != 1 || iter.Value()[0] != 1 {
+				return nil, errors.New("message has invalid search outbox column")
+			}
+			preMessage.SearchOutbox = true
 		}
 	}
 
@@ -1492,6 +1557,18 @@ func (wk *wukongDB) writeMessage(channelId string, channelType uint8, msg Messag
 	termBytes := make([]byte, 8)
 	wk.endian.PutUint64(termBytes, msg.Term)
 	w.Set(key.NewMessageColumnKey(channelId, channelType, uint64(msg.MessageSeq), key.TableMessage.Column.Term), termBytes)
+
+	if msg.SearchOutbox {
+		w.Set(
+			key.NewMessageColumnKey(
+				channelId,
+				channelType,
+				uint64(msg.MessageSeq),
+				key.TableMessage.Column.SearchOutbox,
+			),
+			[]byte{1},
+		)
+	}
 
 	var primaryValue = [16]byte{}
 	wk.endian.PutUint64(primaryValue[:], key.ChannelToNum(channelId, channelType))

@@ -10,6 +10,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/types"
 	"github.com/WuKongIM/WuKongIM/internal/types/pluginproto"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
+	"github.com/WuKongIM/WuKongIM/pkg/wkdb/key"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"go.uber.org/zap"
 )
@@ -224,8 +225,15 @@ func (h *Handler) toPersistMessages(channelId string, channelType uint8, events 
 				StreamNo:    sendPacket.StreamNo,
 				Payload:     sendPacket.Payload,
 			},
+			SearchOutbox: searchOutboxEligible(channelId, channelType, e.MessageId, sendPacket.Payload),
 		}
 		persists = append(persists, msg)
 	}
 	return persists
+}
+
+func searchOutboxEligible(channelID string, channelType uint8, messageID int64, payload []byte) bool {
+	return key.IsValidSearchOutboxChannelIdentity(channelID, channelType) &&
+		messageID > 0 &&
+		len(payload) > 0
 }

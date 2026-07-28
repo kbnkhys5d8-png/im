@@ -380,22 +380,33 @@ func groupBatch(bs []*Batch) []*Batch {
 	return newBatchs
 }
 
+type physicalBatch interface {
+	Set(key, value []byte, options *pebble.WriteOptions) error
+	Delete(key []byte, options *pebble.WriteOptions) error
+	DeleteRange(start, end []byte, options *pebble.WriteOptions) error
+	Commit(options *pebble.WriteOptions) error
+	Close() error
+}
+
 type BatchDB struct {
 	db *pebble.DB
 
 	batchChan chan *Batch
 
-	stopper *syncutil.Stopper
-	Index   int
+	stopper          *syncutil.Stopper
+	Index            int
+	newPhysicalBatch func() physicalBatch
 }
 
 func NewBatchDB(index int, db *pebble.DB) *BatchDB {
-	return &BatchDB{
+	batchDB := &BatchDB{
 		batchChan: make(chan *Batch, 4000),
 		stopper:   syncutil.NewStopper(),
 		db:        db,
 		Index:     index,
 	}
+	batchDB.newPhysicalBatch = func() physicalBatch { return db.NewBatch() }
+	return batchDB
 }
 
 func (wk *BatchDB) NewBatch() *Batch {
@@ -445,59 +456,46 @@ func (wk *BatchDB) loop() {
 	}
 }
 
-func (wk *BatchDB) executeBatch(bs []*Batch) {
-
-	bt := wk.db.NewBatch()
-	defer bt.Close()
-
-	// start := time.Now()
-
-	for _, b := range bs {
-
-		// fmt.Println("batch-->:", b.String())
-
-		// trace.GlobalTrace.Metrics.DB().SetAdd(int64(len(b.setKvs)))
-		// trace.GlobalTrace.Metrics.DB().DeleteAdd(int64(len(b.delKvs)))
-		// trace.GlobalTrace.Metrics.DB().DeleteRangeAdd(int64(len(b.delRangeKvs)))
-
-		for _, kv := range b.delKvs {
-			if err := bt.Delete(kv.key, pebble.NoSync); err != nil {
-				b.err = err
-				break
-			}
+func applyBatchOperations(physical physicalBatch, logical *Batch) error {
+	for _, entry := range logical.delKvs {
+		if err := physical.Delete(entry.key, pebble.NoSync); err != nil {
+			return err
 		}
-
-		for _, kv := range b.delRangeKvs {
-			if err := bt.DeleteRange(kv.key, kv.val, pebble.NoSync); err != nil {
-				b.err = err
-				break
-			}
-		}
-
-		for _, kv := range b.setKvs {
-			if err := bt.Set(kv.key, kv.val, pebble.NoSync); err != nil {
-				b.err = err
-				break
-			}
-		}
-
 	}
-	// trace.GlobalTrace.Metrics.DB().CommitAdd(1)
-	err := bt.Commit(pebble.Sync)
-	if err != nil {
-		for _, b := range bs {
-			b.complete(err)
+	for _, entry := range logical.delRangeKvs {
+		if err := physical.DeleteRange(entry.key, entry.val, pebble.NoSync); err != nil {
+			return err
 		}
+	}
+	for _, entry := range logical.setKvs {
+		if err := physical.Set(entry.key, entry.val, pebble.NoSync); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func completeBatches(batches []*Batch, err error) {
+	for _, batch := range batches {
+		batch.complete(err)
+	}
+}
+
+func (wk *BatchDB) executeBatch(batches []*Batch) {
+	physical := wk.newPhysicalBatch()
+	defer physical.Close()
+
+	for _, logical := range batches {
+		if err := applyBatchOperations(physical, logical); err != nil {
+			completeBatches(batches, err)
+			return
+		}
+	}
+	if err := physical.Commit(pebble.Sync); err != nil {
+		completeBatches(batches, err)
 		return
 	}
-
-	// end := time.Since(start)
-	// fmt.Println("executeBatch耗时--->", end, len(bs))
-
-	for _, b := range bs {
-		b.complete(nil)
-	}
-
+	completeBatches(batches, nil)
 }
 
 type Batch struct {

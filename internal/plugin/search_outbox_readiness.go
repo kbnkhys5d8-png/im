@@ -5,25 +5,25 @@ import (
 	"sync"
 )
 
-var errSearchSourceUnavailable = errors.New("search source is unavailable")
+var errSearchOutboxUnavailable = errors.New("search outbox is unavailable")
 
-type searchSourceReadiness struct {
+type searchOutboxReadiness struct {
 	mu           sync.RWMutex
 	runtimeReady func() error
 }
 
-func (r *searchSourceReadiness) setRuntimeReady(check func() error) {
+func (r *searchOutboxReadiness) setRuntimeReady(check func() error) {
 	r.mu.Lock()
 	r.runtimeReady = check
 	r.mu.Unlock()
 }
 
-func (r *searchSourceReadiness) check() error {
+func (r *searchOutboxReadiness) check() error {
 	r.mu.RLock()
 	runtimeReady := r.runtimeReady
 	r.mu.RUnlock()
 	if runtimeReady == nil || runtimeReady() != nil {
-		return errSearchSourceUnavailable
+		return errSearchOutboxUnavailable
 	}
 	return nil
 }

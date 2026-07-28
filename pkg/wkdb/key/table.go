@@ -26,20 +26,21 @@ var TableMessage = struct {
 	IndexSize       int
 	SecondIndexSize int
 	Column          struct {
-		Header      [2]byte
-		Setting     [2]byte
-		Expire      [2]byte
-		MessageId   [2]byte
-		MessageSeq  [2]byte
-		ClientMsgNo [2]byte
-		Timestamp   [2]byte
-		ChannelId   [2]byte
-		ChannelType [2]byte
-		Topic       [2]byte
-		FromUid     [2]byte
-		Payload     [2]byte
-		Term        [2]byte
-		StreamNo    [2]byte
+		Header       [2]byte
+		Setting      [2]byte
+		Expire       [2]byte
+		MessageId    [2]byte
+		MessageSeq   [2]byte
+		ClientMsgNo  [2]byte
+		Timestamp    [2]byte
+		ChannelId    [2]byte
+		ChannelType  [2]byte
+		Topic        [2]byte
+		FromUid      [2]byte
+		Payload      [2]byte
+		Term         [2]byte
+		StreamNo     [2]byte
+		SearchOutbox [2]byte
 	}
 	Index struct {
 		MessageId [2]byte
@@ -56,35 +57,37 @@ var TableMessage = struct {
 	IndexSize:       2 + 2 + 2 + 8,      // tableId + dataType + indexName + columnHash
 	SecondIndexSize: 2 + 2 + 2 + 8 + 16, // tableId + dataType + secondIndexName + columnValue + primaryKey
 	Column: struct {
-		Header      [2]byte
-		Setting     [2]byte
-		Expire      [2]byte
-		MessageId   [2]byte
-		MessageSeq  [2]byte
-		ClientMsgNo [2]byte
-		Timestamp   [2]byte
-		ChannelId   [2]byte
-		ChannelType [2]byte
-		Topic       [2]byte
-		FromUid     [2]byte
-		Payload     [2]byte
-		Term        [2]byte
-		StreamNo    [2]byte
+		Header       [2]byte
+		Setting      [2]byte
+		Expire       [2]byte
+		MessageId    [2]byte
+		MessageSeq   [2]byte
+		ClientMsgNo  [2]byte
+		Timestamp    [2]byte
+		ChannelId    [2]byte
+		ChannelType  [2]byte
+		Topic        [2]byte
+		FromUid      [2]byte
+		Payload      [2]byte
+		Term         [2]byte
+		StreamNo     [2]byte
+		SearchOutbox [2]byte
 	}{
-		Header:      [2]byte{0x01, 0x01},
-		Setting:     [2]byte{0x01, 0x02},
-		Expire:      [2]byte{0x01, 0x03},
-		MessageId:   [2]byte{0x01, 0x04},
-		MessageSeq:  [2]byte{0x01, 0x05},
-		ClientMsgNo: [2]byte{0x01, 0x06},
-		Timestamp:   [2]byte{0x01, 0x07},
-		ChannelId:   [2]byte{0x01, 0x08},
-		ChannelType: [2]byte{0x01, 0x09},
-		Topic:       [2]byte{0x01, 0x0A},
-		FromUid:     [2]byte{0x01, 0x0B},
-		Payload:     [2]byte{0x01, 0x0C},
-		Term:        [2]byte{0x01, 0x0D},
-		StreamNo:    [2]byte{0x01, 0x0E},
+		Header:       [2]byte{0x01, 0x01},
+		Setting:      [2]byte{0x01, 0x02},
+		Expire:       [2]byte{0x01, 0x03},
+		MessageId:    [2]byte{0x01, 0x04},
+		MessageSeq:   [2]byte{0x01, 0x05},
+		ClientMsgNo:  [2]byte{0x01, 0x06},
+		Timestamp:    [2]byte{0x01, 0x07},
+		ChannelId:    [2]byte{0x01, 0x08},
+		ChannelType:  [2]byte{0x01, 0x09},
+		Topic:        [2]byte{0x01, 0x0A},
+		FromUid:      [2]byte{0x01, 0x0B},
+		Payload:      [2]byte{0x01, 0x0C},
+		Term:         [2]byte{0x01, 0x0D},
+		StreamNo:     [2]byte{0x01, 0x0E},
+		SearchOutbox: [2]byte{0x01, 0x0F},
 	},
 	Index: struct {
 		MessageId [2]byte
@@ -908,4 +911,10 @@ var TableMessageEventSeq = struct {
 }{
 	Id:   [2]byte{0x1A, 0x01},
 	Size: 2 + 2 + 8 + 8, // tableId + dataType + channel_hash + client_hash
+}
+
+var TableSearchOutbox = struct {
+	Id [2]byte
+}{
+	Id: [2]byte{0x1B, 0x01},
 }

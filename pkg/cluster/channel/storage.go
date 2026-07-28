@@ -1,6 +1,8 @@
 package channel
 
 import (
+	"fmt"
+
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
@@ -19,15 +21,38 @@ func newStorage(db wkdb.DB, s *Server) *storage {
 }
 
 func (s *storage) GetState(channelId string, channelType uint8) (types.RaftState, error) {
-	lastMsg, err := s.db.GetLastMsg(channelId, channelType)
+	lastMessage, err := s.db.GetLastMsg(channelId, channelType)
 	if err != nil {
 		return types.RaftState{}, err
 	}
-
+	last := uint64(lastMessage.MessageSeq)
+	floor, outboxEnabled, err := s.db.GetSearchOutboxFloor(channelId, channelType)
+	if err != nil {
+		return types.RaftState{}, fmt.Errorf("load search outbox floor: %w", err)
+	}
+	if !outboxEnabled {
+		return types.RaftState{
+			LastLogIndex: last,
+			LastTerm:     uint32(lastMessage.Term),
+			AppliedIndex: last,
+		}, nil
+	}
+	applied, err := s.db.GetChannelAppliedIndex(channelId, channelType)
+	if err != nil {
+		return types.RaftState{}, fmt.Errorf("load durable applied index: %w", err)
+	}
+	restartApplied := max(floor, applied)
+	if restartApplied > last {
+		return types.RaftState{}, fmt.Errorf(
+			"search outbox restart index %d exceeds last log index %d",
+			restartApplied,
+			last,
+		)
+	}
 	return types.RaftState{
-		LastLogIndex: uint64(lastMsg.MessageSeq),
-		LastTerm:     uint32(lastMsg.Term),
-		AppliedIndex: uint64(lastMsg.MessageSeq),
+		LastLogIndex: last,
+		LastTerm:     uint32(lastMessage.Term),
+		AppliedIndex: restartApplied,
 	}, nil
 }
 

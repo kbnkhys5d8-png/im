@@ -61,6 +61,25 @@ func TestLoadNextRangeSearchSourceMessagesPreservesSearchFields(t *testing.T) {
 	}
 }
 
+func TestLoadNextRangeSearchSourceMessagesAcceptsOptionalSearchOutboxColumn(t *testing.T) {
+	db := newSearchSourceMessageTestDB(t)
+	message := Message{RecvPacket: wkproto.RecvPacket{
+		MessageID: 11, MessageSeq: 1, ClientMsgNo: "source-compatible",
+		ChannelID: "channel", ChannelType: 2, FromUID: "sender",
+		Payload: []byte("body"),
+	}, SearchOutbox: true}
+	if err := db.AppendMessages("channel", 2, []Message{message}); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.LoadNextRangeSearchSourceMessages("channel", 2, 1, 2, 1, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || !rows[0].Message.SearchOutbox {
+		t.Fatalf("rows = %+v, want one flagged row", rows)
+	}
+}
+
 func TestLoadNextRangeSearchSourceMessagesOmitsOnlyOversizedPayload(t *testing.T) {
 	db := NewWukongDB(NewOptions(WithDir(t.TempDir()), WithShardNum(1))).(*wukongDB)
 	if err := db.Open(); err != nil {

@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"errors"
+	"strings"
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
 	"github.com/WuKongIM/WuKongIM/internal/options"
@@ -42,11 +43,17 @@ func (h *Handler) handleOnSend(event *eventbus.Event) {
 	sendPacket := event.Frame.(*wkproto.SendPacket)
 	channelId := sendPacket.ChannelID
 	channelType := sendPacket.ChannelType
-	fakeChannelId := channelId
-	if channelType == wkproto.ChannelTypePerson { // 个人频道
-		fakeChannelId = options.GetFakeChannelIDWith(channelId, conn.Uid)
-	} else if channelType == wkproto.ChannelTypeAgent { // agent 频道
-		fakeChannelId = options.GetAgentChannelIDWith(conn.Uid, channelId)
+	fakeChannelId, validChannelID := resolveSendChannelID(channelId, channelType, conn.Uid)
+	if !validChannelID {
+		sendack := &wkproto.SendackPacket{
+			Framer:      sendPacket.Framer,
+			MessageID:   event.MessageId,
+			ClientSeq:   sendPacket.ClientSeq,
+			ClientMsgNo: sendPacket.ClientMsgNo,
+			ReasonCode:  wkproto.ReasonChannelIDError,
+		}
+		eventbus.User.ConnWrite(event.ReqId, conn, sendack)
+		return
 	}
 
 	if options.G.Logger.TraceOn {
@@ -140,6 +147,23 @@ func (h *Handler) handleOnSend(event *eventbus.Event) {
 	// 推进
 	eventbus.Channel.Advance(fakeChannelId, channelType)
 
+}
+
+func resolveSendChannelID(channelID string, channelType uint8, uid string) (string, bool) {
+	if strings.Contains(channelID, "&") {
+		return "", false
+	}
+
+	resolvedChannelID := channelID
+	if channelType == wkproto.ChannelTypePerson {
+		resolvedChannelID = options.GetFakeChannelIDWith(channelID, uid)
+	} else if channelType == wkproto.ChannelTypeAgent {
+		resolvedChannelID = options.GetAgentChannelIDWith(uid, channelID)
+	}
+	if strings.Contains(resolvedChannelID, "&") {
+		return "", false
+	}
+	return resolvedChannelID, true
 }
 
 // 检查发送者全局权限

@@ -147,7 +147,7 @@ func measureSearchSourceMessages(iter searchSourceMessageIterator, limit int, li
 }
 
 func appendSearchSourceMessagePlan(plans *[]searchSourceMessagePlan, pageBytes *uint64, row searchSourceMessageMeasurement, limit uint64) (bool, error) {
-	if row.columns != searchSourceRequiredColumnMask {
+	if row.columns&searchSourceRequiredColumnMask != searchSourceRequiredColumnMask {
 		return false, fmt.Errorf("search source message %d is missing required columns: present=%#x required=%#x", row.messageSeq, row.columns, searchSourceRequiredColumnMask)
 	}
 	if row.metadataTooLarge {
@@ -229,7 +229,10 @@ func validateSearchSourceStoredColumn(seq uint64, column [2]byte, value []byte) 
 	}
 	want := -1
 	switch column {
-	case key.TableMessage.Column.Header, key.TableMessage.Column.Setting, key.TableMessage.Column.ChannelType:
+	case key.TableMessage.Column.Header,
+		key.TableMessage.Column.Setting,
+		key.TableMessage.Column.ChannelType,
+		key.TableMessage.Column.SearchOutbox:
 		want = 1
 	case key.TableMessage.Column.Expire, key.TableMessage.Column.Timestamp:
 		want = 4
@@ -241,6 +244,9 @@ func validateSearchSourceStoredColumn(seq uint64, column [2]byte, value []byte) 
 	}
 	if column == key.TableMessage.Column.MessageSeq && binary.BigEndian.Uint64(value) != seq {
 		return fmt.Errorf("search source message key sequence %d differs from stored sequence %d", seq, binary.BigEndian.Uint64(value))
+	}
+	if column == key.TableMessage.Column.SearchOutbox && value[0] != 1 {
+		return fmt.Errorf("search source message %d has invalid search outbox flag", seq)
 	}
 	return nil
 }
@@ -262,6 +268,8 @@ const (
 	searchSourceColumnStreamNo
 	searchSourceRequiredColumnMask = (1 << iota) - 1
 )
+
+const searchSourceColumnSearchOutbox uint16 = 1 << 14
 
 func searchSourceStoredColumnBit(column [2]byte) (uint16, bool) {
 	switch column {
@@ -293,6 +301,8 @@ func searchSourceStoredColumnBit(column [2]byte) (uint16, bool) {
 		return searchSourceColumnTerm, true
 	case key.TableMessage.Column.StreamNo:
 		return searchSourceColumnStreamNo, true
+	case key.TableMessage.Column.SearchOutbox:
+		return searchSourceColumnSearchOutbox, true
 	default:
 		return 0, false
 	}
@@ -335,6 +345,8 @@ func decodeSearchSourceStoredColumn(row *SearchSourceMessage, column [2]byte, va
 		}
 	case key.TableMessage.Column.Term:
 		row.Message.Term = binary.BigEndian.Uint64(value)
+	case key.TableMessage.Column.SearchOutbox:
+		row.Message.SearchOutbox = true
 	}
 	return nil
 }

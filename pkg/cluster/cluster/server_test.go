@@ -149,7 +149,7 @@ func TestAppendMessages(t *testing.T) {
 	messages = append(messages, wkdb.Message{
 		RecvPacket: wkproto.RecvPacket{
 			ChannelID:   "ch1",
-			ChannelType: 1,
+			ChannelType: 2,
 			Payload:     []byte("hello"),
 		},
 		Term: 1,
