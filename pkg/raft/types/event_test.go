@@ -42,3 +42,31 @@ func TestEventMarshalUnmarshal(t *testing.T) {
 		assert.Equal(t, event.Logs[i].Data, decoded.Logs[i].Data)
 	}
 }
+
+func TestTermResponseEventRoundTrip(t *testing.T) {
+	if TermResp != Destory+1 {
+		t.Fatalf("TermResp value = %d, want append-only value %d", TermResp, Destory+1)
+	}
+	event := Event{
+		Type: TermResp,
+		From: 2,
+		To:   1,
+		Term: 12,
+	}
+
+	encoded, err := event.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var decoded Event
+	if err := decoded.Unmarshal(encoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Type != TermResp || decoded.From != 2 || decoded.To != 1 || decoded.Term != 12 {
+		t.Fatalf("decoded term response = %+v, want type:%d from:2 to:1 term:12", decoded, TermResp)
+	}
+	if got := TermResp.String(); got != "TermResp" {
+		t.Fatalf("term response event name = %q, want TermResp", got)
+	}
+}

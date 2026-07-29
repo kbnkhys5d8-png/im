@@ -90,6 +90,15 @@ func (n *Node) sendVoteResp(to uint64, reason types.Reason) {
 	})
 }
 
+func (n *Node) sendTermResp(to uint64) {
+	n.events = append(n.events, types.Event{
+		Type: types.TermResp,
+		From: n.opts.NodeId,
+		To:   to,
+		Term: n.cfg.Term,
+	})
+}
+
 func (n *Node) sendPing(to uint64) {
 	if !n.IsLeader() {
 		return

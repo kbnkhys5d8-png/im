@@ -106,6 +106,8 @@ const (
 	ConfigResp
 	// Destory 销毁节点
 	Destory
+	// TermResp 返回接收方当前的更高任期，不表示发送方是领导者
+	TermResp
 )
 
 func (e EventType) String() string {
@@ -168,6 +170,8 @@ func (e EventType) String() string {
 		return "ConfigResp"
 	case Destory:
 		return "Destory"
+	case TermResp:
+		return "TermResp"
 	default:
 		return "Unknown"
 	}

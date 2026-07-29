@@ -17,15 +17,58 @@ func TestStep_Term0_LocalMessage_DirectRoute(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-func TestStep_LowTerm_Dropped(t *testing.T) {
+func TestStep_LowTermReplicationEvents_ReportCurrentTerm(t *testing.T) {
+	for _, eventType := range []types.EventType{types.Ping, types.NotifySync, types.SyncReq} {
+		t.Run(eventType.String(), func(t *testing.T) {
+			n := newTestNode(2, []uint64{1, 2, 3})
+			makeFollower(n, 12, 3)
+
+			err := n.Step(types.Event{Type: eventType, Term: 11, From: 1, To: 2})
+			assert.NoError(t, err)
+
+			events := collectEvents(n)
+			if assert.Len(t, events, 1) {
+				assert.Equal(t, types.TermResp, events[0].Type)
+				assert.Equal(t, uint64(2), events[0].From)
+				assert.Equal(t, uint64(1), events[0].To)
+				assert.Equal(t, uint32(12), events[0].Term)
+			}
+		})
+	}
+}
+
+func TestStep_HighTermResponse_DemotesLeaderWithoutNamingResponder(t *testing.T) {
 	n := newTestNode(1, []uint64{1, 2, 3})
-	makeFollower(n, 5, 2)
-	// Event with term < current term should be dropped
-	err := n.Step(types.Event{Type: types.Ping, Term: 3, From: 2})
+	makeLeader(n, 11)
+
+	err := n.Step(types.Event{
+		Type: types.TermResp,
+		From: 2,
+		To:   1,
+		Term: 12,
+	})
 	assert.NoError(t, err)
-	events := collectEvents(n)
-	// No response events should be generated
-	assert.Equal(t, 0, len(events))
+	assert.Equal(t, types.RoleFollower, n.cfg.Role)
+	assert.Equal(t, uint32(12), n.cfg.Term)
+	assert.Equal(t, uint64(0), n.cfg.Leader)
+	assert.False(t, n.IsLeader())
+}
+
+func TestStep_LowTermResponse_DoesNotReply(t *testing.T) {
+	n := newTestNode(2, []uint64{1, 2, 3})
+	makeFollower(n, 12, 3)
+
+	err := n.Step(types.Event{
+		Type: types.TermResp,
+		From: 1,
+		To:   2,
+		Term: 11,
+	})
+
+	assert.NoError(t, err)
+	assert.Empty(t, collectEvents(n))
+	assert.Equal(t, uint32(12), n.cfg.Term)
+	assert.Equal(t, uint64(3), n.cfg.Leader)
 }
 
 func TestStep_HighTerm_PingSyncResp_BecomeFollower(t *testing.T) {
@@ -595,14 +638,14 @@ func TestFollower_ConfigResp_SwitchesConfig(t *testing.T) {
 	assert.Equal(t, 4, len(n.cfg.Replicas))
 }
 
-func TestFollower_Propose_Ignored(t *testing.T) {
+func TestFollower_Propose_ReturnsNotLeader(t *testing.T) {
 	n := newTestNode(1, []uint64{1, 2, 3})
 	makeFollower(n, 3, 2)
 	err := n.Step(types.Event{
 		Type: types.Propose, Logs: []types.Log{{Term: 3, Index: 1, Data: []byte("data")}},
 	})
-	assert.NoError(t, err)
-	// No StoreReq should be generated
+	assert.ErrorIs(t, err, types.ErrNotLeader)
+	assert.Equal(t, uint64(0), n.LastLogIndex())
 	events := collectEvents(n)
 	assert.Equal(t, 0, countEvents(events, types.StoreReq))
 }
@@ -672,7 +715,7 @@ func TestCandidate_VoteResp_NotEnough_Waiting(t *testing.T) {
 	assert.Equal(t, types.RoleCandidate, n.cfg.Role)
 }
 
-func TestCandidate_Propose_Ignored(t *testing.T) {
+func TestCandidate_Propose_ReturnsNotLeader(t *testing.T) {
 	opts := NewOptions(
 		WithNodeId(1),
 		WithReplicas([]uint64{1, 2, 3}),
@@ -687,7 +730,8 @@ func TestCandidate_Propose_Ignored(t *testing.T) {
 	err := n.Step(types.Event{
 		Type: types.Propose, Logs: []types.Log{{Term: 1, Index: 1}},
 	})
-	assert.NoError(t, err)
+	assert.ErrorIs(t, err, types.ErrNotLeader)
+	assert.Equal(t, uint64(0), n.LastLogIndex())
 	events := collectEvents(n)
 	assert.Equal(t, 0, countEvents(events, types.StoreReq))
 }
@@ -783,6 +827,20 @@ func TestLearner_ConfigResp_SwitchesConfig(t *testing.T) {
 	}
 	n.Step(types.Event{Type: types.ConfigResp, Term: 3, From: 2, Config: newCfg})
 	assert.Equal(t, uint64(2), n.cfg.Version)
+}
+
+func TestLearner_Propose_ReturnsNotLeader(t *testing.T) {
+	n := newTestNode(1, []uint64{1, 2, 3})
+	makeLearner(n, 3, 2)
+
+	err := n.Step(types.Event{
+		Type: types.Propose, Logs: []types.Log{{Term: 3, Index: 1, Data: []byte("data")}},
+	})
+
+	assert.ErrorIs(t, err, types.ErrNotLeader)
+	assert.Equal(t, uint64(0), n.LastLogIndex())
+	events := collectEvents(n)
+	assert.Equal(t, 0, countEvents(events, types.StoreReq))
 }
 
 // ==================== committedIndex ====================

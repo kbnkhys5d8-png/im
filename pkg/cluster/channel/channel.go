@@ -57,6 +57,36 @@ func createChannel(cfg wkdb.ChannelClusterConfig, s *Server, rg *raftgroup.RaftG
 	return ch, nil
 }
 
+func (ch *Channel) Step(event rafttype.Event) error {
+	if event.Type == rafttype.ConfChange || event.Type == rafttype.ConfigResp {
+		currentTerm := ch.Node.Config().Term
+		minimumTerm := currentTerm
+		if event.Term > minimumTerm {
+			minimumTerm = event.Term
+		}
+		if event.Config.Term != 0 && event.Config.Term < minimumTerm {
+			if event.Term > currentTerm {
+				if err := ch.Node.Step(rafttype.Event{
+					Type: rafttype.TermResp,
+					From: event.From,
+					To:   event.To,
+					Term: event.Term,
+				}); err != nil {
+					return err
+				}
+			}
+			ch.Node.Warn("reject channel config with stale term",
+				zap.Uint32("configTerm", event.Config.Term),
+				zap.Uint32("currentTerm", currentTerm),
+				zap.Uint32("eventTerm", event.Term),
+				zap.String("eventType", event.Type.String()),
+			)
+			return errStaleConfigTerm
+		}
+	}
+	return ch.Node.Step(event)
+}
+
 func (ch *Channel) switchConfig(cfg rafttype.Config) error {
 
 	return ch.rg.AddEventWait(ch.channelKey, rafttype.Event{

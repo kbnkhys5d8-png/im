@@ -80,6 +80,8 @@ func isHighPriority(event types.Event) bool {
 		return true
 	case types.ConfigReq:
 		return true
+	case types.TermResp:
+		return true
 	}
 	return false
 }

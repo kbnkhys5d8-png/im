@@ -122,6 +122,31 @@ func TestPropose(t *testing.T) {
 
 }
 
+func TestProposeBatchUntilApplied_NoLeaderReturnsNotLeader(t *testing.T) {
+	rg := raftgroup.New(newTestOptions(
+		raftgroup.WithTransport(blackholeTransport{}),
+		raftgroup.WithStorage(newTestStorage()),
+	))
+	node := newTestRaftNode(
+		"no-leader",
+		1,
+		0,
+		types.RaftState{},
+		raft.WithReplicas([]uint64{1, 2}),
+		raft.WithAdvance(rg.Advance),
+	)
+	rg.AddRaft(node)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err := rg.ProposeBatchUntilAppliedTimeout(ctx, "no-leader", types.ProposeReqSet{{
+		Id:   1,
+		Data: []byte("message"),
+	}})
+
+	assert.ErrorIs(t, err, types.ErrNotLeader)
+}
+
 func TestStopWaitsForInFlightNotNeedAppliedObserver(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -373,6 +398,10 @@ func (t *testTransport) Send(key string, event types.Event) {
 
 	g.Advance()
 }
+
+type blackholeTransport struct{}
+
+func (blackholeTransport) Send(string, types.Event) {}
 
 type testStorage struct {
 	logs            map[string][]types.Log

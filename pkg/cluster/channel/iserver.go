@@ -2,6 +2,7 @@ package channel
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -29,7 +30,10 @@ func (s *Server) ProposeBatchUntilAppliedTimeout(ctx context.Context, channelId 
 	// ========== 如果当前节点存在频道的raft，则直接提按 ==========
 	raft := rg.GetRaft(channelKey)
 	if raft != nil && raft.IsLeader() {
-		return rg.ProposeBatchUntilAppliedTimeout(ctx, channelKey, reqs)
+		resps, err := rg.ProposeBatchUntilAppliedTimeout(ctx, channelKey, reqs)
+		if !errors.Is(err, types.ErrNotLeader) {
+			return resps, err
+		}
 	}
 
 	// ========== 如果不存在，则先从频道的槽领导获取频道的分布式配置，然后根据配置执行对应逻辑 ==========
@@ -60,7 +64,10 @@ func (s *Server) ProposeBatchUntilAppliedTimeoutForLocal(ctx context.Context, ch
 	// ========== 如果当前节点存在频道的raft，则直接提按 ==========
 	raft := rg.GetRaft(channelKey)
 	if raft != nil && raft.IsLeader() {
-		return rg.ProposeBatchUntilAppliedTimeout(ctx, channelKey, reqs)
+		resps, err := rg.ProposeBatchUntilAppliedTimeout(ctx, channelKey, reqs)
+		if !errors.Is(err, types.ErrNotLeader) {
+			return resps, err
+		}
 	}
 
 	// ========== 如果不存在，则先从频道的槽领导获取频道的分布式配置，然后根据配置执行对应逻辑 ==========

@@ -85,6 +85,9 @@ func (rg *RaftGroup) ProposeBatchUntilAppliedTimeout(ctx context.Context, raftKe
 	raft.KeepAlive()
 
 	if !raft.IsLeader() {
+		if raft.LeaderId() == 0 {
+			return nil, types.ErrNotLeader
+		}
 		// 如果不是leader，则转发给leader
 		resps, err = rg.fowardPropose(ctx, raft, reqs)
 		if err != nil {
