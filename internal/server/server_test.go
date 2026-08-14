@@ -1,20 +1,24 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/options"
+	"github.com/WuKongIM/WuKongIM/internal/service"
 	"github.com/WuKongIM/WuKongIM/pkg/client"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
 	"github.com/WuKongIM/WuKongIM/pkg/jsonrpc"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
+	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -118,6 +122,122 @@ func TestSingleSendMessage(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for the recipient to receive the message")
 	}
+}
+
+func TestClientCannotSendReservedWalletContent(t *testing.T) {
+	s := NewTestServer(t)
+	s.opts.Mode = options.TestMode
+	require.NoError(t, s.Start())
+	defer s.StopNoErr()
+	s.MustWaitAllSlotsReady(10 * time.Second)
+
+	clientCases := []struct {
+		name      string
+		addr      string
+		uid       string
+		noPersist bool
+	}{
+		{name: "encrypted tcp client", addr: s.opts.External.TCPAddr, uid: "reserved-wallet-tcp"},
+		{name: "no persist client", addr: s.opts.External.TCPAddr, uid: "reserved-wallet-no-persist", noPersist: true},
+	}
+	for _, tt := range clientCases {
+		t.Run(tt.name, func(t *testing.T) {
+			cli := client.New(tt.addr, client.WithUID(tt.uid))
+			ackCh := make(chan wkproto.ReasonCode, 1)
+			cli.SetOnSendack(func(ack *wkproto.SendackPacket) {
+				ackCh <- ack.ReasonCode
+			})
+			require.NoError(t, cli.Connect())
+			defer cli.Close()
+
+			require.NoError(t, cli.SendMessage(
+				client.NewChannel("receiver", wkproto.ChannelTypePerson),
+				[]byte(`{"type":9}`),
+				client.SendOptionWithNoPersist(tt.noPersist),
+				client.SendOptionWithClientMsgNo("blocked-"+tt.uid),
+			))
+			select {
+			case reason := <-ackCh:
+				require.Equal(t, wkproto.ReasonNotAllowSend, reason)
+			case <-time.After(5 * time.Second):
+				t.Fatal("timed out waiting for reserved wallet message sendack")
+			}
+			if !tt.noPersist {
+				fakeChannelID := options.GetFakeChannelIDWith(tt.uid, "receiver")
+				require.Never(t, func() bool {
+					message, err := service.Store.LoadMsgByClientMsgNo(
+						fakeChannelID,
+						wkproto.ChannelTypePerson,
+						"blocked-"+tt.uid,
+					)
+					return err == nil && !wkdb.IsEmptyMessage(message)
+				}, 300*time.Millisecond, 20*time.Millisecond, "rejected client wallet UI must not be persisted")
+			}
+		})
+	}
+
+	t.Run("websocket json rpc client", func(t *testing.T) {
+		wsURL := strings.Replace(s.opts.External.WSAddr, "0.0.0.0", "127.0.0.1", 1)
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+		require.NoError(t, err)
+		defer conn.Close()
+
+		writeJSON := func(message interface{}) {
+			encoded, encodeErr := jsonrpc.Encode(message)
+			require.NoError(t, encodeErr)
+			require.NoError(t, conn.WriteMessage(websocket.BinaryMessage, encoded))
+		}
+		readJSON := func() interface{} {
+			_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			_, encoded, readErr := conn.ReadMessage()
+			require.NoError(t, readErr)
+			decoded, _, decodeErr := jsonrpc.Decode(json.NewDecoder(bytes.NewReader(encoded)))
+			require.NoError(t, decodeErr)
+			return decoded
+		}
+
+		writeJSON(jsonrpc.ConnectRequest{
+			BaseRequest: jsonrpc.BaseRequest{Method: jsonrpc.MethodConnect, ID: "reserved-ws-connect"},
+			Params: jsonrpc.ConnectParams{
+				Version: wkproto.LatestVersion, DeviceID: "reserved-ws-device", UID: "reserved-wallet-ws", Token: "token",
+			},
+		})
+		_ = readJSON()
+		writeJSON(jsonrpc.SendRequest{
+			BaseRequest: jsonrpc.BaseRequest{Method: jsonrpc.MethodSend, ID: "reserved-ws-send"},
+			Params: jsonrpc.SendParams{
+				ChannelID: "receiver", ChannelType: int(wkproto.ChannelTypePerson), Payload: json.RawMessage(`{"type":9}`),
+			},
+		})
+		response := assertDecodedAs[jsonrpc.GenericResponse](t, readJSON())
+		var result jsonrpc.SendResult
+		require.NoError(t, json.Unmarshal(response.Result, &result))
+		require.Equal(t, jsonrpc.ReasonCodeEnum(wkproto.ReasonNotAllowSend), result.ReasonCode)
+	})
+
+	t.Run("json rpc client", func(t *testing.T) {
+		conn := connectRawTCP(t, s.opts.External.TCPAddr)
+		defer conn.Close()
+		sendJSON(t, conn, jsonrpc.ConnectRequest{
+			BaseRequest: jsonrpc.BaseRequest{Method: jsonrpc.MethodConnect, ID: "reserved-connect"},
+			Params: jsonrpc.ConnectParams{
+				Version: wkproto.LatestVersion, DeviceID: "reserved-device", UID: "reserved-wallet-json", Token: "token",
+			},
+		})
+		_, _ = readJSON(t, conn, 5*time.Second)
+
+		sendJSON(t, conn, jsonrpc.SendRequest{
+			BaseRequest: jsonrpc.BaseRequest{Method: jsonrpc.MethodSend, ID: "reserved-send"},
+			Params: jsonrpc.SendParams{
+				ChannelID: "receiver", ChannelType: int(wkproto.ChannelTypePerson), Payload: json.RawMessage(`{"type":"10"}`),
+			},
+		})
+		decoded, _ := readJSON(t, conn, 5*time.Second)
+		response := assertDecodedAs[jsonrpc.GenericResponse](t, decoded)
+		var result jsonrpc.SendResult
+		require.NoError(t, json.Unmarshal(response.Result, &result))
+		require.Equal(t, jsonrpc.ReasonCodeEnum(wkproto.ReasonNotAllowSend), result.ReasonCode)
+	})
 }
 
 // --- New JSON-RPC Test Cases ---

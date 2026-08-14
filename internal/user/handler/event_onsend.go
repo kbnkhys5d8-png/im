@@ -117,6 +117,23 @@ func (h *Handler) handleOnSend(event *eventbus.Event) {
 		// 如果禁用了加密，则直接使用原始 Payload，不做任何操作
 		// sendPacket.Payload 保持不变
 	}
+	if contentType, reserved := reservedWalletContentType(sendPacket.Payload); reserved {
+		h.Warn("client attempted to send reserved wallet content",
+			zap.String("uid", conn.Uid),
+			zap.String("channelId", channelId),
+			zap.Uint8("channelType", channelType),
+			zap.Int("contentType", contentType),
+		)
+		sendack := &wkproto.SendackPacket{
+			Framer:      sendPacket.Framer,
+			MessageID:   event.MessageId,
+			ClientSeq:   sendPacket.ClientSeq,
+			ClientMsgNo: sendPacket.ClientMsgNo,
+			ReasonCode:  wkproto.ReasonNotAllowSend,
+		}
+		eventbus.User.ConnWrite(event.ReqId, conn, sendack)
+		return
+	}
 
 	// 调用插件
 	reason, err := h.pluginInvokeSend(sendPacket, event)

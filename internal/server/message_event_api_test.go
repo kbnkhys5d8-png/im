@@ -147,6 +147,35 @@ func TestMessageEventAPI_AppendSyncAndMessageSyncMeta(t *testing.T) {
 	_ = s
 }
 
+func TestBackendHTTPCanSendReservedWalletContent(t *testing.T) {
+	_, apiBaseURL := newEventAPITestServer(t)
+	const (
+		clientMsgNo = "backend-wallet-type-9"
+		channelID   = "wallet-receiver"
+		fromUID     = "wallet-backend"
+	)
+	payload := []byte(`{"type":9,"hb_id":"real-red-packet"}`)
+	status, body := postJSON(t, apiBaseURL+"/message/send", map[string]interface{}{
+		"header": map[string]interface{}{
+			"no_persist": 0,
+			"red_dot":    1,
+			"sync_once":  0,
+		},
+		"client_msg_no": clientMsgNo,
+		"from_uid":      fromUID,
+		"channel_id":    channelID,
+		"channel_type":  wkproto.ChannelTypePerson,
+		"payload":       base64.StdEncoding.EncodeToString(payload),
+	})
+	require.Equal(t, http.StatusOK, status, "trusted backend wallet message should succeed: %+v", body)
+
+	fakeChannelID := options.GetFakeChannelIDWith(fromUID, channelID)
+	require.Eventually(t, func() bool {
+		message, err := service.Store.LoadMsgByClientMsgNo(fakeChannelID, wkproto.ChannelTypePerson, clientMsgNo)
+		return err == nil && !wkdb.IsEmptyMessage(message) && string(message.Payload) == string(payload)
+	}, 8*time.Second, 80*time.Millisecond)
+}
+
 func TestMessageEventAPI_DefaultEventKey(t *testing.T) {
 	_, apiBaseURL := newEventAPITestServer(t)
 
