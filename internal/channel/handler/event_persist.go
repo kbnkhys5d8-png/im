@@ -225,15 +225,32 @@ func (h *Handler) toPersistMessages(channelId string, channelType uint8, events 
 				StreamNo:    sendPacket.StreamNo,
 				Payload:     sendPacket.Payload,
 			},
-			SearchOutbox: searchOutboxEligible(channelId, channelType, e.MessageId, sendPacket.Payload),
+			SearchOutbox: searchOutboxEligible(
+				channelId,
+				channelType,
+				e.MessageId,
+				sendPacket.Expire,
+				sendPacket.Setting,
+				sendPacket.Payload,
+			),
 		}
 		persists = append(persists, msg)
 	}
 	return persists
 }
 
-func searchOutboxEligible(channelID string, channelType uint8, messageID int64, payload []byte) bool {
+// searchOutboxEligible 只把不会过期、且服务端可读取内容的消息写入搜索发件箱。
+func searchOutboxEligible(
+	channelID string,
+	channelType uint8,
+	messageID int64,
+	expire uint32,
+	setting wkproto.Setting,
+	payload []byte,
+) bool {
 	return key.IsValidSearchOutboxChannelIdentity(channelID, channelType) &&
 		messageID > 0 &&
+		expire == 0 &&
+		!setting.IsSet(wkproto.SettingSignal) &&
 		len(payload) > 0
 }

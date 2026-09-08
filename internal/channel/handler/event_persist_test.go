@@ -63,6 +63,43 @@ func TestHandlerToPersistMessagesOnlyMarksValidSearchOutboxIdentities(t *testing
 	}
 }
 
+func TestHandlerToPersistMessagesExcludesPrivateMetadataFromSearchOutbox(t *testing.T) {
+	tests := []struct {
+		name       string
+		expire     uint32
+		setting    wkproto.Setting
+		wantOutbox bool
+	}{
+		{name: "ordinary message", wantOutbox: true},
+		{name: "expiring message", expire: 60},
+		{name: "signal message", setting: wkproto.SettingSignal},
+		{name: "signal message with receipt", setting: wkproto.SettingSignal | wkproto.SettingReceiptEnabled},
+		{name: "receipt message", setting: wkproto.SettingReceiptEnabled, wantOutbox: true},
+		{name: "unencrypted message", setting: wkproto.SettingNoEncrypt, wantOutbox: true},
+		{name: "topic message", setting: wkproto.SettingTopic, wantOutbox: true},
+		{name: "stream message", setting: wkproto.SettingStream, wantOutbox: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			handler := &Handler{}
+			event := testPersistEvent(test.name, wkproto.ReasonSuccess, false)
+			sendPacket := event.Frame.(*wkproto.SendPacket)
+			sendPacket.Expire = test.expire
+			sendPacket.Setting = test.setting
+
+			got := handler.toPersistMessages("channel", 2, []*eventbus.Event{event})
+
+			if len(got) != 1 {
+				t.Fatalf("persisted messages = %+v, want one retained message", got)
+			}
+			if got[0].SearchOutbox != test.wantOutbox {
+				t.Fatalf("SearchOutbox = %v, want %v for %+v", got[0].SearchOutbox, test.wantOutbox, got[0])
+			}
+		})
+	}
+}
+
 func testPersistEvent(clientMsgNo string, reasonCode wkproto.ReasonCode, noPersist bool) *eventbus.Event {
 	return &eventbus.Event{
 		Conn: &eventbus.Conn{Uid: "sender"},
