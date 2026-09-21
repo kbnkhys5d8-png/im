@@ -389,6 +389,11 @@ func (s *Server) Stop() error {
 		s.conversationManager.Stop()
 	}
 
+	// 先停止回调并保留未确认缓存，再关闭集群存储和观测组件。
+	webhookStopErr := s.webhook.Stop()
+	if webhookStopErr != nil {
+		s.Error("webhook stop error", zap.Error(webhookStopErr))
+	}
 	s.clusterServer.Stop()
 
 	if s.opts.Demo.On {
@@ -403,11 +408,9 @@ func (s *Server) Stop() error {
 
 	s.tagManager.Stop()
 
-	s.webhook.Stop()
-
 	s.Info("Server is stopped")
 
-	return nil
+	return webhookStopErr
 }
 
 // 等待分布式就绪

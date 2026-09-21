@@ -142,9 +142,17 @@ func cmdRun() error {
 		// 阻塞直到收到退出信号
 		<-quit
 
-		s.Stop() // <-- 调用 Stop() 进行清理
-		wklog.Info("WuKongIM server stopped.")
+		return stopServer(s.Stop)
 	}
+	return nil
+}
+
+func stopServer(stop func() error) error {
+	// 保留失败必须传至 Execute 的非零退出码，不能记录为停止成功。
+	if err := stop(); err != nil {
+		return fmt.Errorf("stop server: %w", err)
+	}
+	wklog.Info("WuKongIM server stopped.")
 	return nil
 }
 

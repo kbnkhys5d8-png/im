@@ -43,6 +43,12 @@ type Webhook struct {
 	onlinestatusList []string
 	focusEvents      map[string]struct{} // 用户关注的事件类型,如果为空则推送所有类型
 	backend          diskqueue.Interface
+	failures         notifyFailureStore
+	requestCtx       context.Context
+	cancelRequests   context.CancelFunc
+	workers          sync.WaitGroup
+	stopOnce         sync.Once
+	stopErr          error
 }
 
 func New() *Webhook {
@@ -91,6 +97,11 @@ func New() *Webhook {
 	if err != nil {
 		panic(err)
 	}
+	failures, err := newNotifyFailureStore(path.Join(options.G.DataDir, "webhook_failed"))
+	if err != nil {
+		panic(err)
+	}
+	requestCtx, cancelRequests := context.WithCancel(context.Background())
 
 	backend := diskqueue.New(
 		"wk_webhook_q",
@@ -112,6 +123,9 @@ func New() *Webhook {
 		onlinestatusList: make([]string, 0),
 		stoped:           make(chan struct{}),
 		backend:          backend,
+		failures:         failures,
+		requestCtx:       requestCtx,
+		cancelRequests:   cancelRequests,
 		httpClient: &http.Client{
 			Transport: &http.Transport{
 				DialContext: (&net.Dialer{
@@ -135,13 +149,19 @@ func New() *Webhook {
 }
 
 func (w *Webhook) Start() error {
-	go w.notifyQueueLoop()
-	go w.loopOnlineStatus()
-
 	err := w.recoverNotifyQueue()
 	if err != nil {
 		return err
 	}
+	w.workers.Add(2)
+	go func() {
+		defer w.workers.Done()
+		w.notifyQueueLoop()
+	}()
+	go func() {
+		defer w.workers.Done()
+		w.loopOnlineStatus()
+	}()
 
 	return nil
 }
@@ -172,9 +192,20 @@ func (w *Webhook) recoverNotifyQueue() error {
 	return nil
 }
 
-func (w *Webhook) Stop() {
-	close(w.stoped)
-	w.backend.Close()
+func (w *Webhook) Stop() error {
+	w.stopOnce.Do(func() {
+		close(w.stoped)
+		if w.cancelRequests != nil {
+			w.cancelRequests()
+		}
+		// 先等消费协程保留未确认缓存，再关闭磁盘队列，停止时不额外补发。
+		w.workers.Wait()
+		if err := w.backend.Close(); err != nil && w.stopErr == nil {
+			w.stopErr = err
+		}
+		w.httpClient.CloseIdleConnections()
+	})
+	return w.stopErr
 }
 
 // Online 用户设备上线通知
@@ -290,6 +321,9 @@ func (w *Webhook) pushOfflineMessages(e *eventbus.Event, sendPacket *wkproto.Sen
 
 func (w *Webhook) AppendMessageOfNotifyQueue(messages []wkdb.Message) error {
 	for _, msg := range messages {
+		if w.isStopping() {
+			return errors.New("webhook is stopping")
+		}
 		data, err := msg.Marshal()
 		if err != nil {
 			return err
@@ -302,126 +336,106 @@ func (w *Webhook) AppendMessageOfNotifyQueue(messages []wkdb.Message) error {
 	return nil
 }
 
-// 通知上层应用 TODO: 此初报错可以做一个邮件报警处理类的东西，
+// 通知上层应用；失败记录转入人工核验目录，不通过截断缓存释放内存。
 func (w *Webhook) notifyQueueLoop() {
-	errorSleepTime := time.Second * 1 // 发生错误后sleep时间
-	ticker := time.NewTicker(options.G.Webhook.MsgNotifyEventPushInterval)
-	defer ticker.Stop()
-
-	// 本地缓存从diskqueue读取的消息
-	// 初始化容量可以根据平均的 MsgNotifyEventCountPerPush 调整，例如其2倍，以减少重分配
-	localMessageCache := make([]wkdb.Message, 0, options.G.Webhook.MsgNotifyEventCountPerPush*2)
-
-	// 触发立即推送的缓存阈值
-	// 如果配置了 MsgNotifyEventCountPerPush，则优先使用它作为即时推送的批大小，否则默认20
-	// 确保 pushThreshold 是一个正数
 	pushThreshold := options.G.Webhook.MsgNotifyEventCountPerPush
 	if pushThreshold <= 0 {
-		pushThreshold = 20 // 默认阈值
+		pushThreshold = 20
 	}
-
-	errMessageIDMap := make(map[int64]int) // 记录错误的消息ID value为错误次数
-
 	if !options.G.WebhookOn(types.EventMsgNotify) {
-		w.Info("Webhook for EventMsgNotify is not enabled.")
 		return
 	}
-	w.Info("notifyQueueLoop started", zap.Duration("pushInterval", options.G.Webhook.MsgNotifyEventPushInterval), zap.Int("pushThreshold", pushThreshold))
-
-	for {
-		var shouldPush bool // 标记是否应该推送消息
-
-		select {
-		case data, ok := <-w.backend.ReadChan():
-			if !ok { // diskqueue的ReadChan被关闭
-				w.Info("diskqueue ReadChan closed. Attempting to push remaining cached messages before exiting notifyQueueLoop.")
-				// 在退出前尝试推送剩余的缓存消息
-				if len(localMessageCache) > 0 {
-					w.pushMessages(localMessageCache, errMessageIDMap)
-					// localMessageCache = localMessageCache[:0] // 清空缓存 (可选，因为即将退出)
-				}
-				return
-			}
-
-			var msg wkdb.Message // 假设 wkdb.Message 是一个结构体。如果它是指针类型，应为 *wkdb.Message
-			err := msg.Unmarshal(data)
-			if err != nil {
-				w.Error("Failed to unmarshal message from diskqueue", zap.Error(err), zap.Int("data_len", len(data)))
-				continue // 跳过这条无法解析的消息
-			}
-			localMessageCache = append(localMessageCache, msg)
-			w.Debug("Message added to local cache from diskqueue", zap.Int64("messageID", msg.MessageID), zap.Int("cacheSize", len(localMessageCache)), zap.Int64("diskqueueDepth", w.backend.Depth()))
-
-			if len(localMessageCache) >= pushThreshold {
-				w.Debug("Push threshold reached, preparing to push messages.", zap.Int("cacheSize", len(localMessageCache)), zap.Int("threshold", pushThreshold))
-				shouldPush = true
-			}
-
-		case <-ticker.C:
-			if len(localMessageCache) > 0 {
-				shouldPush = true
-			}
-
-		case <-w.stoped:
-			w.Info("notifyQueueLoop stopping. Attempting to push any remaining cached messages.")
-			// 在退出前尝试推送剩余的缓存消息
-			if len(localMessageCache) > 0 {
-				w.pushMessages(localMessageCache, errMessageIDMap)
-			}
+	interval := options.G.Webhook.MsgNotifyEventPushInterval
+	if interval <= 0 {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	localMessageCache := make([]wkdb.Message, 0, pushThreshold)
+	errMessageIDMap := make(map[int64]int)
+	defer func() {
+		if len(localMessageCache) == 0 {
 			return
 		}
-
-		if shouldPush && len(localMessageCache) > 0 {
-			// 创建待推送消息的副本，以避免在推送操作（可能是异步或耗时）中修改原始缓存
-			messagesToPush := make([]wkdb.Message, len(localMessageCache))
-			copy(messagesToPush, localMessageCache)
-
-			// 清空本地缓存，准备接收新消息
-			localMessageCache = localMessageCache[:0]
-
-			w.Debug("Attempting to push messages", zap.Int("count", len(messagesToPush)))
-			allSucceeded, retryableMessages := w.pushMessages(messagesToPush, errMessageIDMap)
-			if !allSucceeded {
-				w.Warn("Failed to push a batch of messages. Some may be retried.", zap.Int("count", len(messagesToPush)), zap.Int("retryable_count", len(retryableMessages)))
-				if len(retryableMessages) > 0 {
-					// 将需要重试的消息放回本地缓存的开头，以便优先处理
-					w.Debug("Adding retryable messages back to local cache", zap.Int("count", len(retryableMessages)))
-					localMessageCache = append(retryableMessages, localMessageCache...)
-					// 限制localMessageCache的最大长度，防止无限增长，虽然diskqueue本身有大小限制
-					// 这个最大长度可以是一个比较大的合理值，例如 pushThreshold 的几倍
-					maxLocalCacheSize := pushThreshold * 5
-					if len(localMessageCache) > maxLocalCacheSize {
-						w.Warn("Local message cache has grown too large after adding retryable messages. Truncating.", zap.Int("current_size", len(localMessageCache)), zap.Int("max_size", maxLocalCacheSize))
-						localMessageCache = localMessageCache[len(localMessageCache)-maxLocalCacheSize:] // 保留最新的部分，或者也可以选择保留最旧的
-					}
-				}
-				time.Sleep(errorSleepTime)
+		if err := w.failures.Save(localMessageCache, "shutdown_unconfirmed"); err != nil {
+			w.stopErr = fmt.Errorf("保留停止时的未确认通知失败: %w", err)
+			w.Error("未确认通知未能全部落盘，必须人工核验", zap.Error(err), zap.Int("count", len(localMessageCache)))
+		}
+	}()
+	for {
+		if w.isStopping() {
+			return
+		}
+		// 内存最多保留一批；失败尚未处理完时暂停消费，不删除最旧消息。
+		readChan := w.backend.ReadChan()
+		if len(localMessageCache) >= pushThreshold || len(errMessageIDMap) > 0 {
+			readChan = nil
+		}
+		var shouldPush bool
+		select {
+		case data, ok := <-readChan:
+			if !ok {
+				return
+			}
+			var msg wkdb.Message
+			if err := msg.Unmarshal(data); err != nil {
+				w.Error("Failed to unmarshal message from diskqueue", zap.Error(err), zap.Int("data_len", len(data)))
+				continue
+			}
+			localMessageCache = append(localMessageCache, msg)
+			shouldPush = len(localMessageCache) >= pushThreshold
+		case <-ticker.C:
+			shouldPush = len(localMessageCache) > 0
+		case <-w.stoped:
+			return
+		}
+		if shouldPush {
+			var allSucceeded bool
+			allSucceeded, localMessageCache = w.pushMessages(localMessageCache, errMessageIDMap)
+			if !allSucceeded && !w.waitOrStop(time.Second) {
+				return
 			}
 		}
 	}
 }
 
 // pushMessages 是一个辅助函数，用于处理实际的消息推送逻辑
-// 返回 allSucceeded: 如果批次中所有消息都成功发送（或者那些失败的都已达到最大重试次数被放弃），则为 true
-// 返回 retryableMessages: 如果批次发送失败，这里包含那些未达到最大重试次数且需要被重新尝试的消息。
+// 暂停人工核验不等于投递成功；只有远端确认才返回 allSucceeded=true。
+// retryableMessages 也保留归档失败的消息，此时背压等待存储恢复，不继续请求远端。
 func (w *Webhook) pushMessages(messages []wkdb.Message, errMessageIDMap map[int64]int) (allSucceeded bool, retryableMessages []wkdb.Message) {
 	if len(messages) == 0 {
 		return true, nil
+	}
+	failed := make([]wkdb.Message, 0, len(messages))
+	for _, message := range messages {
+		if errMessageIDMap[message.MessageID] > 0 {
+			failed = append(failed, message)
+		}
+	}
+	// 两种子批共用保留门禁，任一归档未完成时都不能先重发另一种消息。
+	if len(failed) > 0 {
+		if err := w.failures.Save(failed, "send_failed"); err != nil {
+			w.Error("失败通知保留未完成，暂停发送并保留内存批次", zap.Error(err), zap.Int("count", len(failed)))
+			return false, messages
+		}
 	}
 
 	// 分组消息
 	normalMessages, agentMessages := w.groupMessagesByType(messages)
 
 	// 处理普通消息
-	normalRetryable := w.processBatchMessages(normalMessages, errMessageIDMap, "normal", w.sendNormalMessages)
+	normalOK, normalRetryable, archiveErr := w.processBatchMessages(normalMessages, errMessageIDMap, "normal", w.sendNormalMessages)
+	if archiveErr != nil {
+		return false, append(normalRetryable, agentMessages...)
+	}
 
 	// 处理Agent消息
-	agentRetryable := w.processBatchMessages(agentMessages, errMessageIDMap, "agent", w.sendAgentMessages)
+	agentOK, agentRetryable, _ := w.processBatchMessages(agentMessages, errMessageIDMap, "agent", w.sendAgentMessages)
 
 	// 合并需要重试的消息
 	retryableMessages = append(normalRetryable, agentRetryable...)
 
-	return len(retryableMessages) == 0, retryableMessages
+	return normalOK && agentOK, retryableMessages
 }
 
 // groupMessagesByType 将消息按类型分组
@@ -463,25 +477,72 @@ func (w *Webhook) groupMessagesByType(messages []wkdb.Message) (normalMessages, 
 }
 
 // processBatchMessages 处理一批同类型的消息
-func (w *Webhook) processBatchMessages(messages []wkdb.Message, errMessageIDMap map[int64]int, messageType string, sendFunc func([]wkdb.Message) error) []wkdb.Message {
+func (w *Webhook) processBatchMessages(
+	messages []wkdb.Message,
+	errMessageIDMap map[int64]int,
+	messageType string,
+	sendFunc func([]wkdb.Message) error,
+) (bool, []wkdb.Message, error) {
 	if len(messages) == 0 {
-		return nil
+		return true, nil, nil
 	}
-
-	err := sendFunc(messages)
-
-	if err != nil {
+	eligible := make([]wkdb.Message, 0, len(messages))
+	paused := false
+	for _, message := range messages {
+		count := errMessageIDMap[message.MessageID]
+		if count >= w.notifyRetryLimit() {
+			paused = true
+			delete(errMessageIDMap, message.MessageID)
+			w.Warn("通知已持久保留并暂停自动补发，需要人工核验", zap.Int64("messageID", message.MessageID))
+			continue
+		}
+		if count == 0 {
+			exists, err := w.failures.Has(message.MessageID)
+			if err != nil {
+				w.Error("无法确认失败保留记录，暂停发送", zap.Error(err))
+				return false, messages, err
+			}
+			if exists {
+				// 相同 ID 若携带不同内容，必须报错保留缓存，不能把新证据静默丢弃。
+				if err := w.failures.Save([]wkdb.Message{message}, "existing_failure"); err != nil {
+					w.Error("已有失败通知内容冲突或无法确认，暂停发送", zap.Error(err))
+					return false, messages, err
+				}
+				paused = true
+				w.Warn("队列消息已有失败保留记录，不自动重放", zap.Int64("messageID", message.MessageID))
+				continue
+			}
+		}
+		eligible = append(eligible, message)
+	}
+	if len(eligible) == 0 {
+		return !paused, nil, nil
+	}
+	if w.isStopping() {
+		return false, eligible, nil
+	}
+	if err := sendFunc(eligible); err != nil {
 		w.Error("Failed to send webhook for a batch of messages",
 			zap.Error(err),
 			zap.String("type", messageType),
-			zap.Int("message_count", len(messages)))
-
-		return w.handleSendFailure(messages, errMessageIDMap)
+			zap.Int("message_count", len(eligible)))
+		remaining, archiveErr := w.handleSendFailure(eligible, errMessageIDMap)
+		return false, remaining, archiveErr
 	}
-
-	// 发送成功，清理错误计数
-	w.handleSendSuccess(messages, errMessageIDMap, messageType)
-	return nil
+	// 远端已确认，清理证据失败只告警，不能把成功请求重新归为发送失败。
+	confirmed := make([]int64, 0, len(eligible))
+	for _, message := range eligible {
+		if errMessageIDMap[message.MessageID] > 0 {
+			confirmed = append(confirmed, message.MessageID)
+		}
+	}
+	if len(confirmed) > 0 {
+		if err := w.failures.Remove(confirmed); err != nil {
+			w.Error("通知已确认但失败证据清理未完成，仅保留供人工核验", zap.Error(err), zap.Int("count", len(confirmed)))
+		}
+	}
+	w.handleSendSuccess(eligible, errMessageIDMap, messageType)
+	return !paused, nil, nil
 }
 
 // sendNormalMessages 发送普通消息
@@ -525,24 +586,58 @@ func (w *Webhook) convertToMessageResps(messages []wkdb.Message) []*types.Messag
 }
 
 // handleSendFailure 处理发送失败的情况
-func (w *Webhook) handleSendFailure(messages []wkdb.Message, errMessageIDMap map[int64]int) []wkdb.Message {
-	retryableMessages := make([]wkdb.Message, 0)
-
+func (w *Webhook) handleSendFailure(messages []wkdb.Message, errMessageIDMap map[int64]int) ([]wkdb.Message, error) {
 	for _, msg := range messages {
-		errCount := errMessageIDMap[msg.MessageID]
-		errCount++
-		errMessageIDMap[msg.MessageID] = errCount
-
-		if errCount >= options.G.Webhook.MsgNotifyEventRetryMaxCount {
-			w.Warn("Message reached max retry count and will be dropped",
-				zap.Int64("messageID", msg.MessageID))
+		errMessageIDMap[msg.MessageID]++
+	}
+	if err := w.failures.Save(messages, "send_failed"); err != nil {
+		w.Error("失败通知未能持久保留，暂停后续发送", zap.Error(err), zap.Int("count", len(messages)))
+		return messages, err
+	}
+	retryableMessages := make([]wkdb.Message, 0, len(messages))
+	for _, msg := range messages {
+		if errMessageIDMap[msg.MessageID] >= w.notifyRetryLimit() {
+			w.Warn("通知达到重试上限，已持久保留，等待人工核验", zap.Int64("messageID", msg.MessageID))
 			delete(errMessageIDMap, msg.MessageID)
 		} else {
 			retryableMessages = append(retryableMessages, msg)
 		}
 	}
+	return retryableMessages, nil
+}
 
-	return retryableMessages
+func (w *Webhook) notifyRetryLimit() int {
+	if options.G.Webhook.MsgNotifyEventRetryMaxCount < 1 {
+		return 1
+	}
+	return options.G.Webhook.MsgNotifyEventRetryMaxCount
+}
+
+func (w *Webhook) isStopping() bool {
+	select {
+	case <-w.stoped:
+		return true
+	default:
+		return false
+	}
+}
+
+func (w *Webhook) waitOrStop(duration time.Duration) bool {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-w.stoped:
+		return false
+	}
+}
+
+func (w *Webhook) requestContext() context.Context {
+	if w.requestCtx != nil {
+		return w.requestCtx
+	}
+	return context.Background()
 }
 
 // handleSendSuccess 处理发送成功的情况
@@ -567,13 +662,18 @@ func (w *Webhook) loopOnlineStatus() {
 	opLen := 0    // 最后一次操作在线状态数组的长度
 	errCount := 0 // webhook请求失败重试次数
 	for {
+		if w.isStopping() {
+			return
+		}
 		if opLen == 0 {
 			w.onlinestatusLock.Lock()
 			opLen = len(w.onlinestatusList)
 			w.onlinestatusLock.Unlock()
 		}
 		if opLen == 0 {
-			time.Sleep(time.Second * 2) // 没有数据就休息2秒
+			if !w.waitOrStop(time.Second * 2) {
+				return
+			}
 			continue
 		}
 		w.onlinestatusLock.Lock()
@@ -582,7 +682,9 @@ func (w *Webhook) loopOnlineStatus() {
 		jsonData, err := json.Marshal(data)
 		if err != nil {
 			w.Error("webhook的event数据不能json化！", zap.Error(err))
-			time.Sleep(time.Second * 1)
+			if !w.waitOrStop(time.Second) {
+				return
+			}
 			continue
 		}
 
@@ -605,7 +707,9 @@ func (w *Webhook) loopOnlineStatus() {
 				errCount = 0
 			}
 
-			time.Sleep(time.Second * 1) // 如果报错就休息下
+			if !w.waitOrStop(time.Second) {
+				return
+			}
 			continue
 		}
 
@@ -621,7 +725,12 @@ func (w *Webhook) sendWebhookForHttp(event string, data []byte) error {
 	eventURL := fmt.Sprintf("%s?event=%s", options.G.Webhook.HTTPAddr, event)
 	startTime := time.Now().UnixNano() / 1000 / 1000
 	w.Debug("webhook开始请求", zap.String("eventURL", eventURL))
-	resp, err := w.httpClient.Post(eventURL, "application/json", bytes.NewBuffer(data))
+	req, err := http.NewRequestWithContext(w.requestContext(), http.MethodPost, eventURL, bytes.NewBuffer(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := w.httpClient.Do(req)
 	w.Debug("webhook请求结束 耗时", zap.Int64("mill", time.Now().UnixNano()/1000/1000-startTime))
 	if err != nil {
 		w.Warn("调用第三方消息通知失败！", zap.String("Webhook", options.G.Webhook.HTTPAddr), zap.Error(err))
@@ -643,7 +752,12 @@ func (w *Webhook) sendAgentWebhookForHttp(event string, data []byte) error {
 	eventURL := fmt.Sprintf("%s?event=%s", agentWebhookAddr, event)
 	startTime := time.Now().UnixNano() / 1000 / 1000
 	w.Debug("agent webhook开始请求", zap.String("eventURL", eventURL))
-	resp, err := w.httpClient.Post(eventURL, "application/json", bytes.NewBuffer(data))
+	req, err := http.NewRequestWithContext(w.requestContext(), http.MethodPost, eventURL, bytes.NewBuffer(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := w.httpClient.Do(req)
 	w.Debug("agent webhook请求结束 耗时", zap.Int64("mill", time.Now().UnixNano()/1000/1000-startTime))
 	if err != nil {
 		w.Warn("调用第三方agent消息通知失败！", zap.String("Webhook", agentWebhookAddr), zap.Error(err))
@@ -664,7 +778,7 @@ func (w *Webhook) sendWebhookForGRPC(event string, data []byte) error {
 	startTime := startNow.UnixNano() / 1000 / 1000
 	w.Debug("webhook grpc 开始请求", zap.String("event", event))
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*2)
+	ctx, cancel := context.WithTimeout(w.requestContext(), time.Second*2)
 	defer cancel()
 	clientConn, err := w.webhookGRPCPool.Get(ctx)
 	if err != nil {
@@ -677,7 +791,7 @@ func (w *Webhook) sendWebhookForGRPC(event string, data []byte) error {
 	// }
 	cli := wkhook.NewWebhookServiceClient(clientConn)
 
-	sendCtx, sendCancel := context.WithTimeout(context.Background(), time.Second*10)
+	sendCtx, sendCancel := context.WithTimeout(w.requestContext(), time.Second*10)
 	defer sendCancel()
 	resp, err := cli.SendWebhook(sendCtx, &wkhook.EventReq{
 		Event: event,
