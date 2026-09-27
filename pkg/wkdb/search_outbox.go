@@ -4,13 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb/key"
 	"github.com/cockroachdb/pebble"
 )
 
 const MaxSearchOutboxPullLimit = 500
+
+// 固定存储记录上限不随调用方分页预算变化，防止小预算把正常任务隔离。
+const MaxSearchOutboxRecordBytes = uint64(5 * 1024 * 1024)
 
 var (
 	ErrSearchOutboxInvalidIdentity = errors.New("search outbox identity is invalid")
@@ -32,6 +34,7 @@ func (id SearchOutboxIdentity) Validate() error {
 }
 
 type SearchOutboxRecord struct {
+	Epoch        uint64
 	Identity     SearchOutboxIdentity
 	Message      Message
 	AppliedIndex uint64
@@ -40,6 +43,7 @@ type SearchOutboxRecord struct {
 type SearchOutboxPullResult struct {
 	Records         []SearchOutboxRecord
 	Pending         uint64
+	Quarantined     uint64
 	OldestCreatedAt int64
 	AppliedBlocked  uint64
 }
@@ -49,91 +53,12 @@ type searchOutboxChannel struct {
 	channelType uint8
 }
 
-type searchOutboxAck struct {
-	identity SearchOutboxIdentity
-	key      []byte
-}
-
+// 旧入口不能绕过第二版协议的持久代次校验。
 func (wk *wukongDB) AckSearchOutbox(identities []SearchOutboxIdentity) error {
 	if len(identities) == 0 {
 		return nil
 	}
-
-	unique := make([]SearchOutboxIdentity, 0, len(identities))
-	seen := make(map[SearchOutboxIdentity]struct{}, len(identities))
-	for index, identity := range identities {
-		if err := identity.Validate(); err != nil {
-			return fmt.Errorf("validate search outbox ack identity %d: %w", index, err)
-		}
-		if _, ok := seen[identity]; ok {
-			continue
-		}
-		seen[identity] = struct{}{}
-		unique = append(unique, identity)
-	}
-
-	acksByShard := make(map[uint32][]searchOutboxAck)
-	shardIDs := make([]uint32, 0)
-	for _, identity := range unique {
-		keyBytes, err := key.NewSearchOutboxKey(
-			identity.ChannelID,
-			identity.ChannelType,
-			identity.MessageSeq,
-			identity.MessageID,
-		)
-		if err != nil {
-			return fmt.Errorf("build search outbox ack key: %w", err)
-		}
-		shardID := wk.GetChannelShardIndex(identity.ChannelID, identity.ChannelType)
-		if _, ok := acksByShard[shardID]; !ok {
-			shardIDs = append(shardIDs, shardID)
-		}
-		acksByShard[shardID] = append(acksByShard[shardID], searchOutboxAck{
-			identity: identity,
-			key:      keyBytes,
-		})
-	}
-	sort.Slice(shardIDs, func(left, right int) bool {
-		return shardIDs[left] < shardIDs[right]
-	})
-
-	for _, shardID := range shardIDs {
-		shardDB := wk.shardDBById(shardID)
-		keysToDelete := make([][]byte, 0, len(acksByShard[shardID]))
-		for _, ack := range acksByShard[shardID] {
-			value, closer, err := shardDB.Get(ack.key)
-			if errors.Is(err, pebble.ErrNotFound) {
-				continue
-			}
-			if err != nil {
-				return fmt.Errorf("load search outbox ack record: %w", err)
-			}
-			record, decodeErr := decodeSearchOutboxRecord(ack.key, value)
-			closeErr := closer.Close()
-			if decodeErr != nil {
-				return fmt.Errorf("validate search outbox ack: %w", decodeErr)
-			}
-			if closeErr != nil {
-				return fmt.Errorf("close search outbox ack record: %w", closeErr)
-			}
-			if record.Identity != ack.identity {
-				return errors.New("search outbox ack identity differs from stored record")
-			}
-			keysToDelete = append(keysToDelete, ack.key)
-		}
-		if len(keysToDelete) == 0 {
-			continue
-		}
-
-		batch := wk.shardBatchDBById(shardID).NewBatch()
-		for _, keyBytes := range keysToDelete {
-			batch.Delete(keyBytes)
-		}
-		if err := batch.CommitWait(); err != nil {
-			return fmt.Errorf("commit search outbox ack for shard %d: %w", shardID, err)
-		}
-	}
-	return nil
+	return ErrSearchOutboxEpochRequired
 }
 
 func (wk *wukongDB) PullSearchOutbox(limit int, maxBytes uint64) (SearchOutboxPullResult, error) {
@@ -143,43 +68,50 @@ func (wk *wukongDB) PullSearchOutbox(limit int, maxBytes uint64) (SearchOutboxPu
 	if maxBytes == 0 {
 		return SearchOutboxPullResult{}, errors.New("search outbox byte budget must be positive")
 	}
-
-	result := SearchOutboxPullResult{
-		Records: make([]SearchOutboxRecord, 0, limit),
-	}
+	result := SearchOutboxPullResult{Records: make([]SearchOutboxRecord, 0, limit)}
 	appliedByChannel := make(map[searchOutboxChannel]uint64)
-	var (
-		usedBytes      uint64
-		recordsStopped bool
-	)
+	var usedBytes uint64
+	recordsStopped := false
+	unknownOldest := false
 	for shardID := uint32(0); shardID < wk.shardNum; shardID++ {
-		iter := wk.shardDBById(shardID).NewIter(&pebble.IterOptions{
-			LowerBound: key.NewSearchOutboxLowKey(),
-			UpperBound: key.NewSearchOutboxHighKey(),
-		})
+		iter := wk.shardDBById(shardID).NewIter(&pebble.IterOptions{LowerBound: key.NewSearchOutboxLowKey(), UpperBound: key.NewSearchOutboxHighKey()})
 		for iter.First(); iter.Valid(); iter.Next() {
-			keyBytes := iter.Key()
+			rawKey := append([]byte(nil), iter.Key()...)
 			value := append([]byte(nil), iter.Value()...)
-			record, err := decodeSearchOutboxRecord(keyBytes, value)
-			if err != nil {
-				iter.Close()
-				return SearchOutboxPullResult{}, err
+			recordBytes := uint64(len(rawKey)) + uint64(len(value))
+			var record SearchOutboxRecord
+			var err error
+			reason := ""
+			// 在解析超大内容前先按固定上限隔离，保留原始数据但不继续占用正常页。
+			if recordBytes > MaxSearchOutboxRecordBytes {
+				reason = "source_oversize"
+			} else {
+				record, err = decodeSearchOutboxRecord(rawKey, value)
+				if err != nil {
+					reason = "invalid_record"
+				} else if record.Message.Timestamp <= 0 {
+					reason = "invalid_timestamp"
+				}
 			}
-			if record.Message.Timestamp <= 0 {
-				iter.Close()
-				return SearchOutboxPullResult{}, errors.New("search outbox record has no server timestamp")
+			if reason != "" {
+				removed, quarantineErr := wk.quarantineSearchOutboxCandidate(shardID, rawKey, value, reason)
+				if quarantineErr != nil {
+					iter.Close()
+					return SearchOutboxPullResult{}, quarantineErr
+				}
+				if !removed {
+					// 忙分片或过期快照未完成隔离，仍计入积压，不能冒充空队列。
+					result.Pending++
+					timestamp := int64(record.Message.Timestamp)
+					if err != nil || timestamp <= 0 {
+						unknownOldest = true
+					} else if result.OldestCreatedAt == 0 || timestamp < result.OldestCreatedAt {
+						result.OldestCreatedAt = timestamp
+					}
+				}
+				continue
 			}
-
-			result.Pending++
-			timestamp := int64(record.Message.Timestamp)
-			if result.OldestCreatedAt == 0 || timestamp < result.OldestCreatedAt {
-				result.OldestCreatedAt = timestamp
-			}
-
-			channel := searchOutboxChannel{
-				id:          record.Identity.ChannelID,
-				channelType: record.Identity.ChannelType,
-			}
+			channel := searchOutboxChannel{id: record.Identity.ChannelID, channelType: record.Identity.ChannelType}
 			applied, ok := appliedByChannel[channel]
 			if !ok {
 				applied, err = wk.GetChannelAppliedIndex(channel.id, channel.channelType)
@@ -189,38 +121,57 @@ func (wk *wukongDB) PullSearchOutbox(limit int, maxBytes uint64) (SearchOutboxPu
 				}
 				appliedByChannel[channel] = applied
 			}
-			if applied == 0 || applied < record.Identity.MessageSeq {
+			blocked := applied == 0 || applied < record.Identity.MessageSeq
+			result.Pending++
+			timestamp := int64(record.Message.Timestamp)
+			if result.OldestCreatedAt == 0 || timestamp < result.OldestCreatedAt {
+				result.OldestCreatedAt = timestamp
+			}
+			if blocked {
 				result.AppliedBlocked++
+				continue
+			}
+			// 单条仅超过调用者的小预算时继续找可容纳任务，不改变其持久状态。
+			if recordBytes > maxBytes {
 				continue
 			}
 			if recordsStopped {
 				continue
 			}
-			if len(result.Records) == limit {
+			if len(result.Records) == limit || recordBytes > maxBytes-usedBytes {
 				recordsStopped = true
 				continue
 			}
-
-			recordBytes := uint64(len(keyBytes)) + uint64(len(value))
-			if recordBytes > maxBytes-usedBytes {
-				if len(result.Records) == 0 {
-					iter.Close()
-					return SearchOutboxPullResult{}, ErrSearchOutboxByteBudget
-				}
-				recordsStopped = true
+			epoch, current, err := wk.pinSearchOutboxRecord(shardID, rawKey, value)
+			if err != nil {
+				iter.Close()
+				return SearchOutboxPullResult{}, err
+			}
+			if !current {
 				continue
 			}
 			record.AppliedIndex = applied
+			record.Epoch = epoch
 			result.Records = append(result.Records, record)
 			usedBytes += recordBytes
 		}
-		if err := iter.Error(); err != nil {
-			iter.Close()
-			return SearchOutboxPullResult{}, fmt.Errorf("iterate search outbox: %w", err)
+		iterErr := iter.Error()
+		closeErr := iter.Close()
+		if iterErr != nil {
+			return SearchOutboxPullResult{}, fmt.Errorf("iterate search outbox: %w", iterErr)
 		}
-		if err := iter.Close(); err != nil {
-			return SearchOutboxPullResult{}, fmt.Errorf("close search outbox iterator: %w", err)
+		if closeErr != nil {
+			return SearchOutboxPullResult{}, closeErr
 		}
+	}
+	quarantined, err := wk.countSearchOutboxQuarantine()
+	if err != nil {
+		return SearchOutboxPullResult{}, err
+	}
+	result.Quarantined = quarantined
+	// 任意待处理记录的时间未知时，不能用其他记录的最早时间代表整个队列。
+	if unknownOldest {
+		result.OldestCreatedAt = 0
 	}
 	return result, nil
 }
@@ -232,42 +183,59 @@ func (wk *wukongDB) ScanSearchOutboxChannels(ctx context.Context, visit func(Cha
 	if visit == nil {
 		return errors.New("search outbox visit function is nil")
 	}
-
-	visited := make(map[searchOutboxChannel]struct{})
-	for shardID := uint32(0); shardID < wk.shardNum; shardID++ {
-		iter := wk.shardDBById(shardID).NewIter(&pebble.IterOptions{
-			LowerBound: key.NewSearchOutboxLowKey(),
-			UpperBound: key.NewSearchOutboxHighKey(),
-		})
-		for iter.First(); iter.Valid(); iter.Next() {
-			if err := ctx.Err(); err != nil {
-				iter.Close()
-				return err
-			}
-			channelID, channelType, _, _, err := key.ParseSearchOutboxKey(iter.Key())
-			if err != nil {
-				iter.Close()
-				return fmt.Errorf("parse search outbox key: %w", err)
-			}
-			pending := searchOutboxChannel{id: channelID, channelType: channelType}
-			if _, ok := visited[pending]; ok {
-				continue
-			}
-			visited[pending] = struct{}{}
-			if err := visit(Channel{ChannelId: channelID, ChannelType: channelType}); err != nil {
-				iter.Close()
-				return err
-			}
+	channels, err := wk.searchOutboxChannels(ctx)
+	if err != nil {
+		return err
+	}
+	// 回调可能唤醒 Raft 或访问网络，必须在释放存储锁后执行。
+	for _, channel := range channels {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		if err := iter.Error(); err != nil {
-			iter.Close()
-			return fmt.Errorf("iterate search outbox channels: %w", err)
-		}
-		if err := iter.Close(); err != nil {
-			return fmt.Errorf("close search outbox iterator: %w", err)
+		if err := visit(channel); err != nil {
+			return err
 		}
 	}
 	return ctx.Err()
+}
+
+func (wk *wukongDB) searchOutboxChannels(ctx context.Context) ([]Channel, error) {
+	visited := make(map[searchOutboxChannel]struct{})
+	channels := make([]Channel, 0)
+	for shardID := uint32(0); shardID < wk.shardNum; shardID++ {
+		iter := wk.shardDBById(shardID).NewIter(&pebble.IterOptions{LowerBound: key.NewSearchOutboxLowKey(), UpperBound: key.NewSearchOutboxHighKey()})
+		for iter.First(); iter.Valid(); iter.Next() {
+			if err := ctx.Err(); err != nil {
+				iter.Close()
+				return nil, err
+			}
+			rawKey := append([]byte(nil), iter.Key()...)
+			channelID, channelType, _, _, err := key.ParseSearchOutboxKey(rawKey)
+			if err != nil {
+				value := append([]byte(nil), iter.Value()...)
+				if _, err := wk.quarantineSearchOutboxCandidate(shardID, rawKey, value, "invalid_record"); err != nil {
+					iter.Close()
+					return nil, err
+				}
+				continue
+			}
+			channel := searchOutboxChannel{id: channelID, channelType: channelType}
+			if _, ok := visited[channel]; ok {
+				continue
+			}
+			visited[channel] = struct{}{}
+			channels = append(channels, Channel{ChannelId: channelID, ChannelType: channelType})
+		}
+		iterErr := iter.Error()
+		closeErr := iter.Close()
+		if iterErr != nil {
+			return nil, fmt.Errorf("iterate search outbox channels: %w", iterErr)
+		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
+	}
+	return channels, nil
 }
 
 func (wk *wukongDB) GetSearchOutboxFloor(channelID string, channelType uint8) (floor uint64, enabled bool, err error) {
@@ -323,6 +291,17 @@ func (wk *wukongDB) writeSearchOutbox(message Message, batch *Batch) error {
 	keyBytes, err := key.NewSearchOutboxKey(identity.ChannelID, identity.ChannelType, identity.MessageSeq, identity.MessageID)
 	if err != nil {
 		return err
+	}
+	state, exists, err := wk.loadSearchOutboxState(wk.GetChannelShardIndex(identity.ChannelID, identity.ChannelType), keyBytes)
+	if err != nil {
+		return err
+	}
+	// 日志重放只重建原始聊天消息，不能复活已经隔离或确认完成的搜索任务。
+	if state.Status != searchOutboxActive {
+		return nil
+	}
+	if !exists {
+		batch.Set(key.NewSearchOutboxStateKey(keyBytes), state.marshal())
 	}
 	value, err := message.Marshal()
 	if err != nil {

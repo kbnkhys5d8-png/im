@@ -2,10 +2,77 @@ package wkcache
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
+	"sync"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestMessageEventCacheAppendDeltaRejectsFinalTextOverflowAtomically(t *testing.T) {
+	cache := NewMessageEventCache(nil)
+	defer cache.Close()
+	_, err := cache.UpsertSession(MessageEventSessionMeta{ClientMsgNo: "text-limit", ChannelId: "group", ChannelType: 2}, "main", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(map[string]any{"kind": "text", "delta": strings.Repeat("😀", 4999)})
+	if _, err := cache.AppendDelta("text-limit", "group", 2, "main", "initial", "stream.delta", "public", 1, payload); err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	errors := make(chan error, 2)
+	var workers sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		workers.Add(1)
+		go func(index int) {
+			defer workers.Done()
+			<-start
+			_, err := cache.AppendDelta("text-limit", "group", 2, "main", fmt.Sprint(index), "stream.delta", "public", 2, []byte(`{"kind":"text","delta":"中"}`))
+			errors <- err
+		}(i)
+	}
+	close(start)
+	workers.Wait()
+	close(errors)
+	accepted := 0
+	for err := range errors {
+		if err == nil {
+			accepted++
+		}
+	}
+	if accepted != 1 {
+		t.Fatalf("并发追加接受 %d 次，应该仅一次", accepted)
+	}
+	_, state, err := cache.BuildTerminalPayload("text-limit", "group", 2, "main", nil, "finish", "stream.close", "public", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count := utf8.RuneCountInString(state.TextSnapshot); count != 5000 {
+		t.Fatalf("最终快照字符数 = %d，应该为 5000", count)
+	}
+}
+
+func TestMessageEventCacheBuildTerminalRejectsOversizedSnapshotWithoutMutation(t *testing.T) {
+	cache := NewMessageEventCache(nil)
+	defer cache.Close()
+	_, err := cache.UpsertSession(MessageEventSessionMeta{ClientMsgNo: "snapshot-limit", ChannelId: "group", ChannelType: 2}, "main", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(map[string]any{"snapshot": map[string]any{"kind": "text", "text": strings.Repeat("中", 5001)}})
+	_, _, err = cache.BuildTerminalPayload("snapshot-limit", "group", 2, "main", payload, "bad", "stream.close", "public", 1)
+	if err == nil {
+		t.Fatal("终态完整正文超限应被拒绝")
+	}
+	cache.mu.RLock()
+	defer cache.mu.RUnlock()
+	if cache.sessions["snapshot-limit"].keyStates["main"].LastEventID != "" {
+		t.Fatal("拒绝事件不应修改缓存元信息")
+	}
+}
 
 func TestMessageEventCache_OpenDeltaTerminal(t *testing.T) {
 	cache := NewMessageEventCache(nil)

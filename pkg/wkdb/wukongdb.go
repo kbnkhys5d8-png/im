@@ -35,8 +35,10 @@ type wukongDB struct {
 	prmaryKeyGen *snowflake.Node // 消息ID生成器
 	noSync       *pebble.WriteOptions
 	dblock       *dblock
-	cancelCtx    context.Context
-	cancelFunc   context.CancelFunc
+	// 同分片任务校验与提交串行；慢分片不得阻塞其他分片的聊天存储。
+	searchOutboxMu []sync.Mutex
+	cancelCtx      context.Context
+	cancelFunc     context.CancelFunc
 
 	metrics trace.IDBMetrics
 
@@ -74,6 +76,7 @@ func NewWukongDB(opts *Options) DB {
 	wk := &wukongDB{
 		opts:                opts,
 		shardNum:            uint32(opts.ShardNum),
+		searchOutboxMu:      make([]sync.Mutex, opts.ShardNum),
 		prmaryKeyGen:        prmaryKeyGen,
 		endian:              endian,
 		cancelCtx:           cancelCtx,

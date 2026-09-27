@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/WuKongIM/WuKongIM/pkg/messagepayload"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"go.uber.org/zap"
@@ -289,8 +290,16 @@ func (c *MessageEventCache) AppendDelta(clientMsgNo, channelId string, channelTy
 	}
 
 	if textDelta := extractCacheTextDelta(payload); textDelta != "" {
-		ks.TextSnapshot += textDelta
+		// 在现有缓存锁内验证合成后的完整正文，避免并发追加分别通过检查后超限。
+		nextText := ks.TextSnapshot + textDelta
+		if err := messagepayload.ValidateTextContent(nextText); err != nil {
+			return nil, err
+		}
+		ks.TextSnapshot = nextText
 	} else if len(payload) > 0 {
+		if err := messagepayload.ValidateEventText(payload); err != nil {
+			return nil, err
+		}
 		ks.SnapshotPayload = append([]byte(nil), payload...)
 	}
 
@@ -327,6 +336,14 @@ func (c *MessageEventCache) BuildTerminalPayload(clientMsgNo, channelId string, 
 	if ks == nil {
 		return payload, nil, ErrMessageEventKeyNotFound
 	}
+	// 先合成并校验终态完整快照，拒绝时不修改缓存状态或事件元信息。
+	mergedPayload := payload
+	if ks.TextSnapshot != "" || len(ks.SnapshotPayload) > 0 {
+		mergedPayload = mergeTerminalPayloadWithSnapshot(payload, ks.TextSnapshot, ks.SnapshotPayload)
+	}
+	if err := messagepayload.ValidateEventText(mergedPayload); err != nil {
+		return nil, nil, err
+	}
 
 	ks.LastEventID = strings.TrimSpace(eventID)
 	ks.LastEventType = strings.TrimSpace(eventType)
@@ -335,10 +352,7 @@ func (c *MessageEventCache) BuildTerminalPayload(clientMsgNo, channelId string, 
 	ks.UpdatedAt = now
 	s.updatedAt = now
 
-	if ks.TextSnapshot == "" && len(ks.SnapshotPayload) == 0 {
-		return payload, cloneEventKeyState(ks), nil
-	}
-	return mergeTerminalPayloadWithSnapshot(payload, ks.TextSnapshot, ks.SnapshotPayload), cloneEventKeyState(ks), nil
+	return mergedPayload, cloneEventKeyState(ks), nil
 }
 
 func (c *MessageEventCache) MarkEventKeyPersisted(clientMsgNo, channelId string, channelType uint8, eventKey, status string, persistedSeq uint64) error {

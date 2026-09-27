@@ -11,6 +11,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/track"
 	"github.com/WuKongIM/WuKongIM/internal/types"
 	"github.com/WuKongIM/WuKongIM/internal/types/pluginproto"
+	"github.com/WuKongIM/WuKongIM/pkg/messagepayload"
 	"github.com/WuKongIM/WuKongIM/pkg/trace"
 	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
@@ -117,6 +118,10 @@ func (h *Handler) handleOnSend(event *eventbus.Event) {
 		// 如果禁用了加密，则直接使用原始 Payload，不做任何操作
 		// sendPacket.Payload 保持不变
 	}
+	// TCP/WSS 必须按解密后的正文校验，复用现有失败 ACK，不改变客户端协议。
+	if !validateSendText(event, sendPacket) {
+		return
+	}
 	if contentType, reserved := reservedWalletContentType(sendPacket.Payload); reserved {
 		h.Warn("client attempted to send reserved wallet content",
 			zap.String("uid", conn.Uid),
@@ -149,6 +154,10 @@ func (h *Handler) handleOnSend(event *eventbus.Event) {
 		eventbus.User.ConnWrite(event.ReqId, conn, sendack)
 		return
 	}
+	// 插件可能替换正文，最终入队内容必须再次验证。
+	if !validateSendText(event, sendPacket) {
+		return
+	}
 
 	trace.GlobalTrace.Metrics.App().SendPacketCountAdd(1)
 	trace.GlobalTrace.Metrics.App().SendPacketBytesAdd(sendPacket.GetFrameSize())
@@ -164,6 +173,17 @@ func (h *Handler) handleOnSend(event *eventbus.Event) {
 	// 推进
 	eventbus.Channel.Advance(fakeChannelId, channelType)
 
+}
+
+func validateSendText(event *eventbus.Event, packet *wkproto.SendPacket) bool {
+	if messagepayload.ValidateText(packet.Payload) == nil {
+		return true
+	}
+	eventbus.User.ConnWrite(event.ReqId, event.Conn, &wkproto.SendackPacket{
+		Framer: packet.Framer, MessageID: event.MessageId, ClientSeq: packet.ClientSeq,
+		ClientMsgNo: packet.ClientMsgNo, ReasonCode: wkproto.ReasonPayloadDecodeError,
+	})
+	return false
 }
 
 func resolveSendChannelID(channelID string, channelType uint8, uid string) (string, bool) {

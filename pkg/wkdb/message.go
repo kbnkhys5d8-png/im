@@ -16,6 +16,15 @@ import (
 )
 
 func (wk *wukongDB) AppendMessages(channelId string, channelType uint8, msgs []Message) error {
+	// 锁必须覆盖实际提交，不能只保护 writeSearchOutbox 中的批次构造。
+	for _, message := range msgs {
+		if message.SearchOutbox {
+			lock := &wk.searchOutboxMu[wk.GetChannelShardIndex(channelId, channelType)]
+			lock.Lock()
+			defer lock.Unlock()
+			break
+		}
+	}
 	for _, message := range msgs {
 		if message.ChannelID != channelId || message.ChannelType != channelType {
 			return fmt.Errorf(
@@ -534,6 +543,10 @@ func (wk *wukongDB) LoadNextRangeMsgsForSize(channelId string, channelType uint8
 }
 
 func (wk *wukongDB) TruncateLogTo(channelId string, channelType uint8, messageSeq uint64) error {
+	// 日志截断与显式恢复串行，避免恢复重新插入刚被截断的任务。
+	lock := &wk.searchOutboxMu[wk.GetChannelShardIndex(channelId, channelType)]
+	lock.Lock()
+	defer lock.Unlock()
 
 	wk.metrics.TruncateLogToAdd(1)
 

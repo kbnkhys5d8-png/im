@@ -15,6 +15,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/track"
 	"github.com/WuKongIM/WuKongIM/internal/types"
 	cluster "github.com/WuKongIM/WuKongIM/pkg/cluster/cluster"
+	"github.com/WuKongIM/WuKongIM/pkg/messagepayload"
 	"github.com/WuKongIM/WuKongIM/pkg/wkcache"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb/key"
@@ -236,6 +237,10 @@ func (m *message) requestSetSubscribersForTmpChannel(tmpChannelId string, uids [
 }
 
 func sendMessageToChannel(req messageSendReq, channelId string, channelType uint8, clientMsgNo string) (int64, error) {
+	// 内部调用也必须在入队和生成成功结果前校验，不能仅依赖 HTTP 请求层。
+	if err := messagepayload.ValidateText(req.Payload); err != nil {
+		return 0, err
+	}
 
 	// m.s.monitor.SendPacketInc(req.Header.NoPersist != 1)
 	// m.s.monitor.SendSystemMsgInc()
@@ -320,6 +325,10 @@ func (m *message) sendBatch(c *wkhttp.Context) {
 	}
 	if len(req.Payload) == 0 {
 		c.ResponseError(errors.New("payload不能为空！"))
+		return
+	}
+	if err := messagepayload.ValidateText(req.Payload); err != nil {
+		c.ResponseError(err)
 		return
 	}
 	failUids := make([]string, 0)
@@ -1040,7 +1049,15 @@ func (m *message) handleStreamPersist(c *wkhttp.Context, req *eventAppendReq, fa
 			eventKey, payload, req.EventID, eventType, req.Visibility, req.OccurredAt,
 		); err == nil {
 			payload = mergedPayload
+		} else if errors.Is(err, messagepayload.ErrTextTooLong) {
+			// 不能吞掉完整快照超限错误并把未合并事件提交到 Raft。
+			c.ResponseError(err)
+			return
 		}
+	}
+	if err := messagepayload.ValidateEventText(payload); err != nil {
+		c.ResponseError(err)
+		return
 	}
 
 	// raft 提案落盘

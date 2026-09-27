@@ -13,12 +13,20 @@ import (
 )
 
 type fakeSearchOutboxStore struct {
-	pullResult wkdb.SearchOutboxPullResult
-	pullErr    error
-	pullCalls  int
-	acked      []wkdb.SearchOutboxIdentity
-	ackErr     error
-	ackCalls   int
+	pullResult       wkdb.SearchOutboxPullResult
+	pullErr          error
+	pullCalls        int
+	acked            []wkdb.SearchOutboxIdentity
+	ackErr           error
+	ackCalls         int
+	tasks            []wkdb.SearchOutboxTask
+	quarantined      wkdb.SearchOutboxTask
+	quarantineReason string
+	quarantineCalls  int
+	quarantineErr    error
+	restored         wkdb.SearchOutboxTask
+	restoreCalls     int
+	restoreErr       error
 }
 
 func (s *fakeSearchOutboxStore) PullSearchOutbox(
@@ -29,12 +37,28 @@ func (s *fakeSearchOutboxStore) PullSearchOutbox(
 	return s.pullResult, s.pullErr
 }
 
-func (s *fakeSearchOutboxStore) AckSearchOutbox(
-	identities []wkdb.SearchOutboxIdentity,
+func (s *fakeSearchOutboxStore) AckSearchOutboxTasks(
+	tasks []wkdb.SearchOutboxTask,
 ) error {
 	s.ackCalls++
-	s.acked = append([]wkdb.SearchOutboxIdentity(nil), identities...)
+	s.tasks = append([]wkdb.SearchOutboxTask(nil), tasks...)
+	s.acked = nil
+	for _, task := range tasks {
+		s.acked = append(s.acked, task.Identity)
+	}
 	return s.ackErr
+}
+
+func (s *fakeSearchOutboxStore) QuarantineSearchOutbox(task wkdb.SearchOutboxTask, reason string) error {
+	s.quarantineCalls++
+	s.quarantined, s.quarantineReason = task, reason
+	return s.quarantineErr
+}
+
+func (s *fakeSearchOutboxStore) RestoreSearchOutbox(task wkdb.SearchOutboxTask) (uint64, error) {
+	s.restoreCalls++
+	s.restored = task
+	return task.Epoch + 1, s.restoreErr
 }
 
 func TestSearchOutboxPullReturnsStableAppliedRecords(t *testing.T) {
@@ -50,9 +74,9 @@ func TestSearchOutboxPullReturnsStableAppliedRecords(t *testing.T) {
 	}
 	store := &fakeSearchOutboxStore{pullResult: wkdb.SearchOutboxPullResult{
 		Records: []wkdb.SearchOutboxRecord{{
-			Identity: identity, Message: message, AppliedIndex: 9,
+			Identity: identity, Epoch: 3, Message: message, AppliedIndex: 9,
 		}},
-		Pending: 3, OldestCreatedAt: 1699999999, AppliedBlocked: 2,
+		Pending: 3, Quarantined: 5, OldestCreatedAt: 1699999999, AppliedBlocked: 2,
 	}}
 	rpc := testSearchOutboxRPC(store)
 	request := searchOutboxPullRequest{
@@ -74,13 +98,14 @@ func TestSearchOutboxPullReturnsStableAppliedRecords(t *testing.T) {
 		first.Version != searchOutboxProtocolVersion ||
 		first.NodeID != 9 ||
 		first.Pending != 3 ||
+		first.Quarantined != 5 ||
 		first.OldestCreatedAt != 1699999999 ||
 		first.AppliedBlocked != 2 ||
 		len(first.Records) != 1 {
 		t.Fatalf("pull response = %+v, calls=%d", first, store.pullCalls)
 	}
 	record := first.Records[0]
-	if record.Identity != identity || record.AppliedMessageSeq != 9 {
+	if record.Identity != identity || record.Epoch != 3 || record.AppliedMessageSeq != 9 {
 		t.Fatalf("record identity/applied = %+v", record)
 	}
 	got := record.Message
@@ -221,6 +246,7 @@ func TestSearchOutboxPullRejectsInvalidNodeTimestampAndAppliedState(t *testing.T
 		t.Run(test.name, func(t *testing.T) {
 			store := &fakeSearchOutboxStore{}
 			if test.storeCall {
+				test.record.Epoch = 1
 				store.pullResult.Records = []wkdb.SearchOutboxRecord{test.record}
 			}
 			rpc := testSearchOutboxRPC(store)
@@ -268,13 +294,16 @@ func TestSearchOutboxAckPassesOnlyExactIdentities(t *testing.T) {
 
 	response, err := rpc.searchOutboxAck(searchOutboxAckRequest{
 		Version: searchOutboxProtocolVersion,
-		NodeID:  9, Identities: identities,
+		NodeID:  9, Tasks: tasksFromIdentities(identities),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(store.acked, identities) {
 		t.Fatalf("acked identities = %+v, want %+v", store.acked, identities)
+	}
+	if !reflect.DeepEqual(store.tasks, tasksFromIdentities(identities)) {
+		t.Fatal("ack did not preserve epochs")
 	}
 	if response.Version != searchOutboxProtocolVersion ||
 		response.NodeID != 9 ||
@@ -289,10 +318,10 @@ func TestSearchOutboxAckRepeatIsSuccessful(t *testing.T) {
 	request := searchOutboxAckRequest{
 		Version: searchOutboxProtocolVersion,
 		NodeID:  9,
-		Identities: []wkdb.SearchOutboxIdentity{{
+		Tasks: tasksFromIdentities([]wkdb.SearchOutboxIdentity{{
 			ChannelID: "channel", ChannelType: 2,
 			MessageSeq: 1, MessageID: 11,
-		}},
+		}}),
 	}
 	for attempt := 0; attempt < 2; attempt++ {
 		if _, err := rpc.searchOutboxAck(request); err != nil {
@@ -391,6 +420,8 @@ func TestSearchOutboxAckRejectsInvalidVersionNodeAndIdentities(t *testing.T) {
 			if test.localNode != nil {
 				rpc.searchOutboxNodeID = test.localNode
 			}
+			test.req.Tasks = tasksFromIdentities(test.req.Identities)
+			test.req.Identities = nil
 			if _, err := rpc.searchOutboxAck(test.req); err == nil {
 				t.Fatal("invalid ack request was accepted")
 			}
@@ -399,6 +430,14 @@ func TestSearchOutboxAckRejectsInvalidVersionNodeAndIdentities(t *testing.T) {
 			}
 		})
 	}
+}
+
+func tasksFromIdentities(identities []wkdb.SearchOutboxIdentity) []wkdb.SearchOutboxTask {
+	tasks := make([]wkdb.SearchOutboxTask, 0, len(identities))
+	for _, identity := range identities {
+		tasks = append(tasks, wkdb.SearchOutboxTask{Identity: identity, Epoch: 3})
+	}
+	return tasks
 }
 
 func TestSearchOutboxRoutesRequireManagedLocalSearchPlugin(t *testing.T) {

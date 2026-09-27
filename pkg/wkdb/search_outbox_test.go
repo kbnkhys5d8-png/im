@@ -264,8 +264,8 @@ func TestPullSearchOutboxByteBudgetLeavesOversizedRecordPending(t *testing.T) {
 		t.Fatalf("raw record size = %d", recordBytes)
 	}
 
-	if _, err := db.PullSearchOutbox(10, recordBytes-1); !errors.Is(err, ErrSearchOutboxByteBudget) {
-		t.Fatalf("undersized budget error = %v, want ErrSearchOutboxByteBudget", err)
+	if page, err := db.PullSearchOutbox(10, recordBytes-1); err != nil || len(page.Records) != 0 || page.Pending != 1 {
+		t.Fatalf("undersized budget changed task state: %+v, %v", page, err)
 	}
 	result, err := db.PullSearchOutbox(10, recordBytes)
 	if err != nil {
@@ -328,15 +328,19 @@ func TestPullSearchOutboxOrdersShardIDsAscending(t *testing.T) {
 	}
 }
 
-func TestPullSearchOutboxRejectsCorruptKeyOrValue(t *testing.T) {
+func TestPullSearchOutboxQuarantinesCorruptKeyOrValue(t *testing.T) {
 	t.Run("key", func(t *testing.T) {
 		db := openSearchOutboxTestDB(t)
 		corruptKey := append(key.NewSearchOutboxLowKey(), byte(2))
 		if err := db.shardDBById(0).Set(corruptKey, []byte("value"), pebble.Sync); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := db.PullSearchOutbox(10, 1<<20); err == nil {
-			t.Fatal("PullSearchOutbox accepted a corrupt key")
+		if page, err := db.PullSearchOutbox(10, 1<<20); err != nil || len(page.Records) != 0 {
+			t.Fatalf("corrupt key pull = %+v, %v", page, err)
+		}
+		rows, err := db.ListSearchOutboxQuarantine(10)
+		if err != nil || len(rows) != 1 || !bytes.Equal(rows[0].RawKey, corruptKey) {
+			t.Fatalf("quarantine evidence = %+v, %v", rows, err)
 		}
 	})
 
@@ -347,13 +351,17 @@ func TestPullSearchOutboxRejectsCorruptKeyOrValue(t *testing.T) {
 		if err := db.shardDBById(0).Set(keyBytes, []byte("corrupt"), pebble.Sync); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := db.PullSearchOutbox(10, 1<<20); err == nil {
-			t.Fatal("PullSearchOutbox accepted a corrupt value")
+		if page, err := db.PullSearchOutbox(10, 1<<20); err != nil || len(page.Records) != 0 {
+			t.Fatalf("corrupt value pull = %+v, %v", page, err)
+		}
+		rows, err := db.ListSearchOutboxQuarantine(10)
+		if err != nil || len(rows) != 1 || !bytes.Equal(rows[0].RawValue, []byte("corrupt")) {
+			t.Fatalf("quarantine evidence = %+v, %v", rows, err)
 		}
 	})
 }
 
-func TestPullSearchOutboxRejectsMissingServerTimestamp(t *testing.T) {
+func TestPullSearchOutboxQuarantinesMissingServerTimestamp(t *testing.T) {
 	db := openSearchOutboxTestDB(t)
 	message := searchOutboxTestMessage(1, 213, true)
 	message.Timestamp = 0
@@ -361,8 +369,12 @@ func TestPullSearchOutboxRejectsMissingServerTimestamp(t *testing.T) {
 	if err := db.UpdateChannelAppliedIndex("channel", 2, 1); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.PullSearchOutbox(10, 1<<20); err == nil {
-		t.Fatal("PullSearchOutbox accepted a pending record without a server timestamp")
+	if page, err := db.PullSearchOutbox(10, 1<<20); err != nil || len(page.Records) != 0 {
+		t.Fatalf("missing timestamp pull = %+v, %v", page, err)
+	}
+	rows, err := db.ListSearchOutboxQuarantine(10)
+	if err != nil || len(rows) != 1 || rows[0].Reason != "invalid_timestamp" {
+		t.Fatalf("quarantine evidence = %+v, %v", rows, err)
 	}
 }
 
@@ -474,7 +486,7 @@ func TestAckSearchOutboxDeletesOnlyExactIdentity(t *testing.T) {
 		ChannelID: "channel", ChannelType: 2,
 		MessageSeq: 2, MessageID: 302,
 	}
-	if err := db.AckSearchOutbox([]SearchOutboxIdentity{ack}); err != nil {
+	if err := ackSearchOutboxFirstEpoch(db, []SearchOutboxIdentity{ack}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -492,7 +504,7 @@ func TestAckSearchOutboxIsIdempotent(t *testing.T) {
 	identity := searchOutboxIdentityFromMessage(message)
 
 	for attempt := 0; attempt < 2; attempt++ {
-		if err := db.AckSearchOutbox([]SearchOutboxIdentity{identity}); err != nil {
+		if err := ackSearchOutboxFirstEpoch(db, []SearchOutboxIdentity{identity}); err != nil {
 			t.Fatalf("attempt %d: %v", attempt, err)
 		}
 	}
@@ -505,7 +517,7 @@ func TestAckSearchOutboxRejectsKeyValueIdentityMismatch(t *testing.T) {
 	appendAppliedSearchOutboxMessages(t, db, message)
 	replaceRawOutboxValueWithDifferentMessage(t, db, message, 999)
 
-	if err := db.AckSearchOutbox([]SearchOutboxIdentity{
+	if err := ackSearchOutboxFirstEpoch(db, []SearchOutboxIdentity{
 		searchOutboxIdentityFromMessage(message),
 	}); err == nil {
 		t.Fatal("corrupt outbox identity was acknowledged")
@@ -519,7 +531,7 @@ func TestAckSearchOutboxDeduplicatesIdentities(t *testing.T) {
 	appendAppliedSearchOutboxMessages(t, db, message)
 	identity := searchOutboxIdentityFromMessage(message)
 
-	if err := db.AckSearchOutbox([]SearchOutboxIdentity{
+	if err := ackSearchOutboxFirstEpoch(db, []SearchOutboxIdentity{
 		identity,
 		identity,
 		identity,
@@ -535,7 +547,7 @@ func TestAckSearchOutboxValidatesWholeListBeforeDeleting(t *testing.T) {
 	second := searchOutboxTestMessage(2, 308, true)
 	appendAppliedSearchOutboxMessages(t, db, first, second)
 
-	err := db.AckSearchOutbox([]SearchOutboxIdentity{
+	err := ackSearchOutboxFirstEpoch(db, []SearchOutboxIdentity{
 		searchOutboxIdentityFromMessage(first),
 		{ChannelID: "", ChannelType: 2, MessageSeq: 2, MessageID: 308},
 	})
@@ -545,16 +557,16 @@ func TestAckSearchOutboxValidatesWholeListBeforeDeleting(t *testing.T) {
 	requireRawSearchOutboxRecordCount(t, db, "channel", 2, 2)
 }
 
-func TestAckSearchOutboxSameSequenceDifferentMessageIDIsNoOp(t *testing.T) {
+func TestAckSearchOutboxSameSequenceDifferentMessageIDIsRejected(t *testing.T) {
 	db := openSearchOutboxTestDB(t)
 	message := searchOutboxTestMessage(1, 309, true)
 	appendAppliedSearchOutboxMessages(t, db, message)
 
-	if err := db.AckSearchOutbox([]SearchOutboxIdentity{{
+	if err := ackSearchOutboxFirstEpoch(db, []SearchOutboxIdentity{{
 		ChannelID: message.ChannelID, ChannelType: message.ChannelType,
 		MessageSeq: uint64(message.MessageSeq), MessageID: message.MessageID + 1,
-	}}); err != nil {
-		t.Fatal(err)
+	}}); !errors.Is(err, ErrSearchOutboxState) {
+		t.Fatalf("unknown identity ack = %v", err)
 	}
 	requireRawSearchOutboxRecordCount(t, db, "channel", 2, 1)
 }
@@ -569,7 +581,7 @@ func TestAckSearchOutboxDeletesIdentitiesAcrossShards(t *testing.T) {
 	second.ChannelID = channel1
 	appendAppliedSearchOutboxMessages(t, db, first, second)
 
-	if err := db.AckSearchOutbox([]SearchOutboxIdentity{
+	if err := ackSearchOutboxFirstEpoch(db, []SearchOutboxIdentity{
 		searchOutboxIdentityFromMessage(second),
 		searchOutboxIdentityFromMessage(first),
 	}); err != nil {
@@ -595,13 +607,13 @@ func TestAckSearchOutboxRetryConvergesAfterLaterShardFailure(t *testing.T) {
 		searchOutboxIdentityFromMessage(second),
 		searchOutboxIdentityFromMessage(first),
 	}
-	if err := db.AckSearchOutbox(identities); !errors.Is(err, injected) {
+	if err := ackSearchOutboxFirstEpoch(db, identities); !errors.Is(err, injected) {
 		t.Fatalf("first AckSearchOutbox error = %v, want %v", err, injected)
 	}
 	requireNoRawSearchOutboxRecords(t, db, channel0, 2)
 	requireRawSearchOutboxRecordCount(t, db, channel1, 2, 1)
 
-	if err := db.AckSearchOutbox(identities); err != nil {
+	if err := ackSearchOutboxFirstEpoch(db, identities); err != nil {
 		t.Fatalf("retry AckSearchOutbox: %v", err)
 	}
 	requireNoRawSearchOutboxRecords(t, db, channel0, 2)
@@ -627,7 +639,7 @@ func TestSearchOutboxThreeReplicasShareIdentityAndAckLocally(t *testing.T) {
 	if identities[0] != identities[1] || identities[1] != identities[2] {
 		t.Fatalf("replica identities = %+v", identities)
 	}
-	if err := replicas[0].AckSearchOutbox(
+	if err := ackSearchOutboxFirstEpoch(replicas[0],
 		[]SearchOutboxIdentity{identities[0]},
 	); err != nil {
 		t.Fatal(err)
@@ -1110,4 +1122,13 @@ func requireMessageMissing(t *testing.T, db *wukongDB, channelID string, channel
 	if _, err := db.LoadMsg(channelID, channelType, sequence); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("LoadMsg error = %v, want ErrNotFound", err)
 	}
+}
+
+// 第一代旧用例通过第二版入口验证原有精确身份及分片原子性，不再调用无代次 ACK。
+func ackSearchOutboxFirstEpoch(db *wukongDB, identities []SearchOutboxIdentity) error {
+	tasks := make([]SearchOutboxTask, len(identities))
+	for i, identity := range identities {
+		tasks[i] = SearchOutboxTask{Identity: identity, Epoch: 1}
+	}
+	return db.AckSearchOutboxTasks(tasks)
 }

@@ -3,6 +3,7 @@ package store
 import (
 	"strings"
 
+	"github.com/WuKongIM/WuKongIM/pkg/messagepayload"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 )
 
@@ -13,6 +14,11 @@ func (s *Store) AppendMessageEventWithState(channelId string, channelType uint8,
 	}
 	if strings.TrimSpace(channelId) == "" {
 		return nil, nil, wkdb.ErrNotFound
+	}
+	// 新事件在 Raft 持久化前校验完整快照；apply 不加新限制，避免历史重放被阻断。
+	// 当前对外 delta 路径只走缓存，此处接收快照替换或合并后的终态正文。
+	if err := messagepayload.ValidateEventText(event.Payload); err != nil {
+		return nil, nil, err
 	}
 
 	// Ensure channel info is set on the event before encoding.

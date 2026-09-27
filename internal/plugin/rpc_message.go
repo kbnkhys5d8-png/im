@@ -11,6 +11,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/service"
 	"github.com/WuKongIM/WuKongIM/internal/track"
 	"github.com/WuKongIM/WuKongIM/internal/types/pluginproto"
+	"github.com/WuKongIM/WuKongIM/pkg/messagepayload"
 	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"github.com/WuKongIM/wkrpc"
@@ -25,6 +26,11 @@ func (a *rpc) messageSend(c *wkrpc.Context) {
 		c.WriteErr(err)
 		return
 	}
+	a.messageSendRequest(c, req)
+}
+
+// messageSendRequest 处理已解码请求，确保任何插件发送都先校验再入队。
+func (a *rpc) messageSendRequest(c *wkrpc.Context, req *pluginproto.SendReq) {
 	if strings.TrimSpace(req.FromUid) == "" {
 		req.FromUid = options.G.SystemUID
 	}
@@ -32,6 +38,10 @@ func (a *rpc) messageSend(c *wkrpc.Context) {
 	if len(req.Payload) <= 0 {
 		a.Error("SendReq payload is empty")
 		c.WriteErr(errors.New("payload is empty"))
+		return
+	}
+	if err := messagepayload.ValidateText(req.Payload); err != nil {
+		c.WriteErr(err)
 		return
 	}
 	channelId := req.ChannelId

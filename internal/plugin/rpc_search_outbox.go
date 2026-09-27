@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	searchOutboxProtocolVersion = 1
+	searchOutboxProtocolVersion = 2
 	searchOutboxMaxAckCount     = 500
 )
 
@@ -33,9 +33,9 @@ type searchOutboxStore interface {
 		limit int,
 		maxBytes uint64,
 	) (wkdb.SearchOutboxPullResult, error)
-	AckSearchOutbox(
-		identities []wkdb.SearchOutboxIdentity,
-	) error
+	AckSearchOutboxTasks([]wkdb.SearchOutboxTask) error
+	QuarantineSearchOutbox(wkdb.SearchOutboxTask, string) error
+	RestoreSearchOutbox(wkdb.SearchOutboxTask) (uint64, error)
 }
 
 type liveSearchOutboxStore struct{}
@@ -56,13 +56,39 @@ func (liveSearchOutboxStore) PullSearchOutbox(
 	return service.Store.DB().PullSearchOutbox(limit, maxBytes)
 }
 
-func (liveSearchOutboxStore) AckSearchOutbox(
-	identities []wkdb.SearchOutboxIdentity,
-) error {
-	if service.Store == nil {
-		return errSearchOutboxStore
+func (liveSearchOutboxStore) AckSearchOutboxTasks(tasks []wkdb.SearchOutboxTask) error {
+	store, err := liveSearchOutboxTaskStore()
+	if err != nil {
+		return err
 	}
-	return service.Store.DB().AckSearchOutbox(identities)
+	return store.AckSearchOutboxTasks(tasks)
+}
+
+func (liveSearchOutboxStore) QuarantineSearchOutbox(task wkdb.SearchOutboxTask, reason string) error {
+	store, err := liveSearchOutboxTaskStore()
+	if err != nil {
+		return err
+	}
+	return store.QuarantineSearchOutbox(task, reason)
+}
+
+func (liveSearchOutboxStore) RestoreSearchOutbox(task wkdb.SearchOutboxTask) (uint64, error) {
+	store, err := liveSearchOutboxTaskStore()
+	if err != nil {
+		return 0, err
+	}
+	return store.RestoreSearchOutbox(task)
+}
+
+func liveSearchOutboxTaskStore() (wkdb.SearchOutboxTaskStore, error) {
+	if service.Store == nil {
+		return nil, errSearchOutboxStore
+	}
+	store, ok := service.Store.DB().(wkdb.SearchOutboxTaskStore)
+	if !ok {
+		return nil, errSearchOutboxStore
+	}
+	return store, nil
 }
 
 type searchOutboxPullRequest struct {
@@ -86,6 +112,7 @@ type searchOutboxMessage struct {
 
 type searchOutboxRPCRecord struct {
 	Identity          wkdb.SearchOutboxIdentity `json:"identity"`
+	Epoch             uint64                    `json:"epoch"`
 	Message           searchOutboxMessage       `json:"message"`
 	AppliedMessageSeq uint64                    `json:"applied_message_seq"`
 }
@@ -94,6 +121,7 @@ type searchOutboxPullResponse struct {
 	Version         int                     `json:"version"`
 	NodeID          uint64                  `json:"node_id"`
 	Pending         uint64                  `json:"pending"`
+	Quarantined     uint64                  `json:"quarantined"`
 	OldestCreatedAt int64                   `json:"oldest_created_at"`
 	AppliedBlocked  uint64                  `json:"applied_blocked"`
 	Records         []searchOutboxRPCRecord `json:"records"`
@@ -103,6 +131,7 @@ type searchOutboxAckRequest struct {
 	Version    int                         `json:"version"`
 	NodeID     uint64                      `json:"node_id"`
 	Identities []wkdb.SearchOutboxIdentity `json:"identities"`
+	Tasks      []wkdb.SearchOutboxTask     `json:"tasks"`
 }
 
 type searchOutboxAckResponse struct {
@@ -173,6 +202,7 @@ func (a *rpc) searchOutboxPull(
 		Version:         searchOutboxProtocolVersion,
 		NodeID:          nodeID,
 		Pending:         result.Pending,
+		Quarantined:     result.Quarantined,
 		OldestCreatedAt: result.OldestCreatedAt,
 		AppliedBlocked:  result.AppliedBlocked,
 		Records:         make([]searchOutboxRPCRecord, 0, len(result.Records)),
@@ -187,6 +217,7 @@ func (a *rpc) searchOutboxPull(
 		}
 		response.Records = append(response.Records, searchOutboxRPCRecord{
 			Identity:          record.Identity,
+			Epoch:             record.Epoch,
 			Message:           message,
 			AppliedMessageSeq: record.AppliedIndex,
 		})
@@ -210,30 +241,31 @@ func (a *rpc) searchOutboxAck(
 	if req.NodeID == 0 || req.NodeID != nodeID {
 		return searchOutboxAckResponse{}, errSearchOutboxNode
 	}
-	if len(req.Identities) == 0 ||
-		len(req.Identities) > searchOutboxMaxAckCount {
+	// v2 不能接受不带处理代次的旧身份列表，否则迟到的 ACK 会删除恢复后的任务。
+	if len(req.Identities) != 0 || len(req.Tasks) == 0 ||
+		len(req.Tasks) > searchOutboxMaxAckCount {
 		return searchOutboxAckResponse{}, errSearchOutboxAckCount
 	}
-	seen := make(map[wkdb.SearchOutboxIdentity]struct{}, len(req.Identities))
-	for _, identity := range req.Identities {
-		if err := identity.Validate(); err != nil {
+	seen := make(map[wkdb.SearchOutboxIdentity]struct{}, len(req.Tasks))
+	for _, task := range req.Tasks {
+		if err := validateSearchOutboxTask(task); err != nil {
 			return searchOutboxAckResponse{}, err
 		}
-		if _, ok := seen[identity]; ok {
+		if _, ok := seen[task.Identity]; ok {
 			return searchOutboxAckResponse{}, errSearchOutboxDuplicateIdentity
 		}
-		seen[identity] = struct{}{}
+		seen[task.Identity] = struct{}{}
 	}
 	if a.searchOutboxStore == nil {
 		return searchOutboxAckResponse{}, errSearchOutboxStore
 	}
-	if err := a.searchOutboxStore.AckSearchOutbox(req.Identities); err != nil {
+	if err := a.searchOutboxStore.AckSearchOutboxTasks(req.Tasks); err != nil {
 		return searchOutboxAckResponse{}, err
 	}
 	return searchOutboxAckResponse{
 		Version:      searchOutboxProtocolVersion,
 		NodeID:       nodeID,
-		Acknowledged: len(req.Identities),
+		Acknowledged: len(req.Tasks),
 	}, nil
 }
 
@@ -256,6 +288,9 @@ func (a *rpc) validSearchOutboxNodeID() (uint64, error) {
 }
 
 func validateSearchOutboxRecord(record wkdb.SearchOutboxRecord) error {
+	if record.Epoch == 0 {
+		return wkdb.ErrSearchOutboxEpochRequired
+	}
 	if err := record.Identity.Validate(); err != nil {
 		return err
 	}
@@ -270,6 +305,13 @@ func validateSearchOutboxRecord(record wkdb.SearchOutboxRecord) error {
 		return errSearchOutboxApplied
 	}
 	return nil
+}
+
+func validateSearchOutboxTask(task wkdb.SearchOutboxTask) error {
+	if task.Epoch == 0 {
+		return wkdb.ErrSearchOutboxEpochRequired
+	}
+	return task.Identity.Validate()
 }
 
 func searchOutboxMessageFromDB(

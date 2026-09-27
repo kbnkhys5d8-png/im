@@ -60,5 +60,8 @@ func (a *rpc) routes() {
 	// ------------------- 本地搜索发件箱 -------------------
 	a.s.rpcServer.Route("/search/outbox/pull", a.requireSearchOutboxAuthorization(a.searchOutboxPullRoute))
 	a.s.rpcServer.Route("/search/outbox/ack", a.requireSearchOutboxAuthorization(a.searchOutboxAckRoute))
+	a.s.rpcServer.Route("/search/outbox/capabilities", a.requireSearchOutboxAuthorization(a.searchOutboxCapabilitiesRoute))
+	a.s.rpcServer.Route("/search/outbox/quarantine", a.requireSearchOutboxAuthorization(a.searchOutboxQuarantineRoute))
+	a.s.rpcServer.Route("/search/outbox/restore", a.requireSearchOutboxAuthorization(a.searchOutboxRestoreRoute))
 
 }
