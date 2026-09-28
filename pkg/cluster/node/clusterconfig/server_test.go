@@ -2,6 +2,7 @@ package clusterconfig_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -9,6 +10,38 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/stretchr/testify/assert"
 )
+
+func TestServerStartConcurrentLeaderRead(t *testing.T) {
+	transport := newTestTransport()
+	s := clusterconfig.New(newTestOptions(t, 1, map[uint64]string{1: ""}, clusterconfig.WithTransport(transport)))
+	transport.serverMap[1] = s
+	started := make(chan struct{})
+	done := make(chan struct{})
+	var readers sync.WaitGroup
+	readers.Add(1)
+	go func() {
+		defer readers.Done()
+		close(started)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				s.LeaderId()
+				s.IsLeader()
+			}
+		}
+	}()
+	<-started
+	// 模拟事件循环在配置服务启动期间查询领导者。
+	err := s.Start()
+	close(done)
+	readers.Wait()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Stop()
+}
 
 func TestServerPropose(t *testing.T) {
 	s1, s2 := newTwoNodes(t)

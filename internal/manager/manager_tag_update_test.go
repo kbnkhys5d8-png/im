@@ -156,15 +156,15 @@ func TestRetiredTagReadDoesNotRefreshActiveExpiryTimestamp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("make tag: %v", err)
 	}
-	lastGetTime := tag.LastGetTime
+	lastGetTime := tag.LastGetTime.Load()
 
 	manager.RetireTag(tag.Key)
 	time.Sleep(time.Millisecond)
 	if got := manager.Get(tag.Key); got != tag {
 		t.Fatalf("expected retired tag to remain readable, got %#v", got)
 	}
-	if !tag.LastGetTime.Equal(lastGetTime) {
-		t.Fatalf("retired snapshot read changed LastGetTime: got %v want %v", tag.LastGetTime, lastGetTime)
+	if got := tag.LastGetTime.Load(); !got.Equal(lastGetTime) {
+		t.Fatalf("retired snapshot read changed LastGetTime: got %v want %v", got, lastGetTime)
 	}
 }
 

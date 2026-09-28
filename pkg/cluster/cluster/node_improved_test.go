@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -188,7 +189,8 @@ func TestImprovedNode_ConcurrentSend(t *testing.T) {
 	const messagesPerGoroutine = 100
 
 	var wg sync.WaitGroup
-	var successCount, errorCount int64
+	// 并发发送的结果使用原子计数，避免测试统计自身产生竞争。
+	var successCount, errorCount atomic.Int64
 
 	// 启动多个goroutine并发发送
 	for i := 0; i < numGoroutines; i++ {
@@ -203,9 +205,9 @@ func TestImprovedNode_ConcurrentSend(t *testing.T) {
 
 				err := node.SendWithPriority(msg, j%10 == 0) // 10%高优先级
 				if err != nil {
-					errorCount++
+					errorCount.Add(1)
 				} else {
-					successCount++
+					successCount.Add(1)
 				}
 			}
 		}(i)
@@ -218,13 +220,15 @@ func TestImprovedNode_ConcurrentSend(t *testing.T) {
 	totalDropped := stats["perf_total_dropped"].(uint64)
 
 	t.Logf("Concurrent send results:")
-	t.Logf("  Success: %d, Errors: %d", successCount, errorCount)
+	t.Logf("  Success: %d, Errors: %d", successCount.Load(), errorCount.Load())
 	t.Logf("  Total sent: %d, Total dropped: %d", totalSent, totalDropped)
 	t.Logf("  Queue capacity: %d",
 		stats["queue_current_capacity"].(int))
 
 	// 验证大部分消息成功发送
 	assert.Greater(t, totalSent, uint64(numGoroutines*messagesPerGoroutine/2))
+	// 每次发送必须且只能计入一种结果，确保并发统计没有丢失。
+	assert.Equal(t, int64(numGoroutines*messagesPerGoroutine), successCount.Load()+errorCount.Load())
 }
 
 func TestImprovedNode_BackpressureStrategies(t *testing.T) {

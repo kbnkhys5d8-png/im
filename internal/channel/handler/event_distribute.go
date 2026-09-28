@@ -9,7 +9,6 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/service"
 	"github.com/WuKongIM/WuKongIM/internal/track"
 	"github.com/WuKongIM/WuKongIM/internal/types"
-	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"go.uber.org/zap"
 )
@@ -17,14 +16,8 @@ import (
 // 跳过会话更新的频道类型
 var skipConversationUpdateChannelTypes = []uint8{wkproto.ChannelTypeData, wkproto.ChannelTypeTemp, wkproto.ChannelTypeLive}
 
-// 消息分发
-// 流程1：（分发在频道的槽领导的节点上进行的）
-// 1. 获取或创建tag（tag记录了用户所属节点）
-// 2. 打上tagKey
-// 3. 根据tag push消息（如果用户在本节点上则处理，不在本节点上则转发到对应节点）
-// 流程2: (分发在用户所属的节点上进行的)
-// 1. 通过tagKey获取tag或者向频道的槽领导请求tag（不能创建tag，只有频道槽领导有权限创建）
-// 2. 根据tag push消息（只处理本节点上的用户，不需要转发）
+// 普通频道在 distributeInitial 完成全局路由后，此处只投递本节点接收者。
+// 在线命令继续沿用既有全局/局部分发路径，不改变显式订阅者标签的处理。
 func (h *Handler) distribute(ctx *eventbus.ChannelContext) {
 
 	// 记录消息轨迹
@@ -61,8 +54,8 @@ func (h *Handler) distributeCommon(ctx *eventbus.ChannelContext) {
 	for _, event := range ctx.Events {
 		event.TagKey = tag.Key
 	}
-	// 分发
-	h.distributeByTag(ctx.SlotLeaderId, tag, ctx.ChannelId, ctx.ChannelType, ctx.Events)
+	// 普通分发事件已经完成全局路由，即使本节点刚成为槽领导也只处理本地接收者。
+	h.distributeLocalByTag(tag, ctx.ChannelId, ctx.ChannelType, ctx.Events)
 }
 
 // cmd消息分发
@@ -122,84 +115,41 @@ func (h *Handler) distributeByTag(slotLeaderId uint64, tag *types.Tag, channelId
 		}
 	}
 
-	// 本地分发 （分发本节点上的用户）
-	var offlineUids []string // 需要推离线的用户
-	var pubshEvents []*eventbus.Event
+	// 会话和整组转发只执行一次；每个接收者独立恢复并保留进程内待办。
+	h.distributeLocalByTag(tag, channelId, channelType, events)
+}
+
+func (h *Handler) distributeLocalByTag(tag *types.Tag, channelId string, channelType uint8, events []*eventbus.Event) {
 	localHasEvent := false
+	for _, node := range tag.Nodes {
+		if node.LeaderId == options.G.Cluster.NodeId && len(node.Uids) > 0 {
+			localHasEvent = true
+			break
+		}
+	}
+	if !localHasEvent {
+		return
+	}
+	if !h.isSkipConversationUpdate(channelType) {
+		h.conversation(channelId, channelType, tag.Key, events)
+	}
+	pendingEvents := cloneDeliveryEvents(events)
+	offline := newOfflineDeliveryBatch(pendingEvents)
+	seen := make(map[string]struct{})
 	for _, node := range tag.Nodes {
 		if node.LeaderId != options.G.Cluster.NodeId {
 			continue
 		}
-		if len(node.Uids) > 0 {
-			localHasEvent = true
-		}
 		for _, uid := range node.Uids {
-			if options.G.IsSystemUid(uid) {
+			if _, exists := seen[uid]; exists {
 				continue
 			}
-			isOnline, masterIsOnline := h.deviceOnlineStatus(uid)
-			if !masterIsOnline && channelType != wkproto.ChannelTypeAgent { // agent不需要触发离线的webhook
-				if offlineUids == nil {
-					offlineUids = make([]string, 0, len(node.Uids))
-				}
-				offlineUids = append(offlineUids, uid)
-			}
-			if !isOnline {
-				continue
-			}
-
-			for _, event := range events {
-
-				if pubshEvents == nil {
-					pubshEvents = make([]*eventbus.Event, 0, len(events)*len(node.Uids))
-				}
-				cloneMsg := event.Clone()
-				cloneMsg.ToUid = uid
-				cloneMsg.ChannelId = channelId
-				cloneMsg.ChannelType = channelType
-				cloneMsg.Type = eventbus.EventPushOnline
-				pubshEvents = append(pubshEvents, cloneMsg)
-
+			seen[uid] = struct{}{}
+			if err := h.enqueueDeliveryWithOffline(channelId, channelType, uid, pendingEvents, offline.add); err != nil {
+				h.Warn("接收者分发未入队", zap.String("uid", uid), zap.Error(err))
 			}
 		}
 	}
-
-	if localHasEvent {
-		// 更新最近会话
-		if !h.isSkipConversationUpdate(channelType) {
-			h.conversation(channelId, channelType, tag.Key, events)
-		}
-	}
-
-	if len(pubshEvents) > 0 {
-		id := eventbus.Pusher.AddEvents(pubshEvents)
-		eventbus.Pusher.Advance(id)
-	}
-	if len(offlineUids) > 0 {
-		offlineEvents := make([]*eventbus.Event, 0, len(events))
-		for _, event := range events {
-			if event.Frame == nil || event.Frame.GetFrameType() == wkproto.EVENT {
-				continue // 不处理event类型的事件
-			}
-			// 过滤发送者
-			filteredOfflineUids := make([]string, 0, len(offlineUids))
-			for _, offlineUid := range offlineUids {
-				if offlineUid != event.Conn.Uid {
-					filteredOfflineUids = append(filteredOfflineUids, offlineUid)
-				}
-			}
-			// 移除重复的离线用户
-			filteredOfflineUids = wkutil.RemoveRepeatedElement(filteredOfflineUids)
-
-			cloneEvent := event.Clone()
-			cloneEvent.OfflineUsers = filteredOfflineUids
-			cloneEvent.Type = eventbus.EventPushOffline
-			offlineEvents = append(offlineEvents, cloneEvent)
-		}
-		_ = eventbus.Pusher.AddEvents(offlineEvents)
-		// eventbus.Pusher.Advance(id) // 不需要推进，因为是离线消息
-	}
-
 }
 
 // 是否跳过会话更新
@@ -397,17 +347,4 @@ func (h *Handler) getCmdSubscribers(channelId string, channelType uint8) ([]stri
 		}
 	}
 	return subscribers, nil
-}
-
-// 用户的设备在线状态
-func (h *Handler) deviceOnlineStatus(uid string) (bool, bool) {
-	toConns := eventbus.User.AuthedConnsByUid(uid)
-	masterIsOnline := false
-	for _, conn := range toConns {
-		if conn.DeviceLevel == wkproto.DeviceLevelMaster {
-			masterIsOnline = true
-			break
-		}
-	}
-	return len(toConns) > 0, masterIsOnline
 }

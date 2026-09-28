@@ -17,11 +17,6 @@ import (
 func TestEngine(t *testing.T) {
 	e := NewEngine()
 
-	e.Start()
-	defer e.Stop()
-
-	timeoutCtx, cancel := context.WithTimeout(context.Background(), time.Second*5)
-	defer cancel()
 	clientCount := 100
 	clientMsgCount := 5
 
@@ -73,6 +68,13 @@ func TestEngine(t *testing.T) {
 
 		return nil
 	})
+
+	// 先注册数据回调，再启动事件循环，避免并发读写回调。
+	e.Start()
+	defer e.Stop()
+
+	timeoutCtx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	defer cancel()
 
 	time.Sleep(time.Millisecond * 100)
 	for i := 0; i < clientCount; i++ {

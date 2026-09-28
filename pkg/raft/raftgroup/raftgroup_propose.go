@@ -27,12 +27,12 @@ func (rg *RaftGroup) ProposeUntilApplied(raftKey string, id uint64, data []byte)
 	timeoutCtx, cancel := context.WithTimeout(context.Background(), rg.opts.ProposeTimeout)
 	defer cancel()
 
-	resps, err := rg.ProposeBatchUntilAppliedTimeout(timeoutCtx, raftKey, types.ProposeReqSet{
+	resps, err := rg.proposeBatchUntilAppliedTimeout(timeoutCtx, raftKey, types.ProposeReqSet{
 		{
 			Id:   id,
 			Data: data,
 		},
-	})
+	}, true)
 	if err != nil {
 		return nil, err
 	}
@@ -70,12 +70,16 @@ func (rg *RaftGroup) ProposeBatchTimeout(ctx context.Context, raftKey string, re
 
 // ProposeBatchUntilAppliedTimeout 批量提案（等待应用）
 func (rg *RaftGroup) ProposeBatchUntilAppliedTimeout(ctx context.Context, raftKey string, reqs types.ProposeReqSet) (types.ProposeRespSet, error) {
+	return rg.proposeBatchUntilAppliedTimeout(ctx, raftKey, reqs, false)
+}
+
+func (rg *RaftGroup) proposeBatchUntilAppliedTimeout(ctx context.Context, raftKey string, reqs types.ProposeReqSet, forwardLocalRejection bool) (types.ProposeRespSet, error) {
 	// 等待应用
 	var (
-		applyProcess *progress
-		resps        []*types.ProposeResp
-		err          error
-		needWait     = true
+		applyProcess   *progress
+		resps          []*types.ProposeResp
+		err            error
+		alreadyApplied bool
 	)
 	raft := rg.raftList.get(raftKey)
 	if raft == nil {
@@ -83,6 +87,13 @@ func (rg *RaftGroup) ProposeBatchUntilAppliedTimeout(ctx context.Context, raftKe
 	}
 
 	raft.KeepAlive()
+	waitForApply := func(maxLogIndex uint64) {
+		applyProcess = rg.wait.waitApply(raftKey, maxLogIndex, func() uint64 {
+			appliedIndex := raft.AppliedIndex()
+			alreadyApplied = appliedIndex >= maxLogIndex
+			return appliedIndex
+		})
+	}
 
 	if !raft.IsLeader() {
 		if raft.LeaderId() == 0 {
@@ -94,50 +105,60 @@ func (rg *RaftGroup) ProposeBatchUntilAppliedTimeout(ctx context.Context, raftKe
 			return nil, err
 		}
 		maxLogIndex := resps[len(resps)-1].Index
-		// 如果最大的日志下标大于已应用的日志下标，则不需要等待
-		// 如果最大的日志下标大于已应用的日志下标，则不需要等待
-		if raft.AppliedIndex() >= maxLogIndex {
-			needWait = false
-		}
-		if needWait {
-			applyProcess = rg.wait.waitApply(raftKey, maxLogIndex)
-		}
+		waitForApply(maxLogIndex)
 	} else {
 		resps, err = rg.proposeBatchTimeout(ctx, raft, reqs, func(logs []types.Log) {
 			maxLogIndex := logs[len(logs)-1].Index
-
-			// 如果最大的日志下标大于已应用的日志下标，则不需要等待
-			if raft.AppliedIndex() >= maxLogIndex {
-				needWait = false
-			}
-			if needWait {
-				applyProcess = rg.wait.waitApply(raftKey, maxLogIndex)
-			}
-
+			waitForApply(maxLogIndex)
 		})
 		if err != nil {
 			if applyProcess != nil {
 				rg.wait.put(applyProcess)
+				applyProcess = nil
 			}
-			return nil, err
+			// 仅槽单请求入口处理明确未追加日志的换主拒绝，批量入口保留原错误语义。
+			// 超时及其他错误可能已接纳提案，不能据此重复发送。
+			if !forwardLocalRejection || err != types.ErrNotLeader {
+				return nil, err
+			}
+			leaderID := raft.Config().Leader
+			if leaderID == 0 || leaderID == raft.NodeId() {
+				return nil, err
+			}
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			select {
+			case <-rg.stopper.ShouldStop():
+				return nil, ErrGroupStopped
+			default:
+			}
+			// 复用原请求和剩余期限，定向转发一次；必须按新领导返回的索引重新等待。
+			alreadyApplied = false
+			resps, err = rg.fowardProposeTo(ctx, raft, reqs, leaderID)
+			if err != nil {
+				return nil, err
+			}
+			waitForApply(resps[len(resps)-1].Index)
 		}
 	}
 
-	if needWait {
-		select {
-		case <-applyProcess.waitC:
-			rg.wait.put(applyProcess)
-			return resps, nil
-		case <-ctx.Done():
-			rg.Error("propose batch until applied timeout", zap.String("raftKey", raftKey), zap.Uint64("leader", raft.LeaderId()), zap.Any("resps", resps), zap.String("progress", applyProcess.String()))
-			// rg.wait.put(applyProcess) // 这里不需要put，因为如果这里put了，那么在waitApply中wait会出现close of nil channel
-			return nil, ctx.Err()
-		case <-rg.stopper.ShouldStop():
-			rg.Error("propose batch until applied stopped", zap.String("raftKey", raftKey), zap.Any("resps", resps), zap.String("progress", applyProcess.String()))
-			return nil, ErrGroupStopped
-		}
-	} else {
+	// 仅登记时已应用保留原有直接成功路径，稍后完成仍参与原等待竞争。
+	if alreadyApplied {
+		rg.wait.put(applyProcess)
 		return resps, nil
+	}
+	select {
+	case <-applyProcess.waitC:
+		rg.wait.put(applyProcess)
+		return resps, nil
+	case <-ctx.Done():
+		rg.Error("propose batch until applied timeout", zap.String("raftKey", raftKey), zap.Uint64("leader", raft.LeaderId()), zap.Any("resps", resps), zap.String("progress", applyProcess.String()))
+		// rg.wait.put(applyProcess) // 这里不需要put，因为如果这里put了，那么在waitApply中wait会出现close of nil channel
+		return nil, ctx.Err()
+	case <-rg.stopper.ShouldStop():
+		rg.Error("propose batch until applied stopped", zap.String("raftKey", raftKey), zap.Any("resps", resps), zap.String("progress", applyProcess.String()))
+		return nil, ErrGroupStopped
 	}
 }
 
@@ -197,6 +218,10 @@ func (rg *RaftGroup) proposeBatchTimeout(ctx context.Context, raft IRaft, reqs [
 }
 
 func (rg *RaftGroup) fowardPropose(ctx context.Context, raft IRaft, reqs types.ProposeReqSet) ([]*types.ProposeResp, error) {
+	return rg.fowardProposeTo(ctx, raft, reqs, 0)
+}
+
+func (rg *RaftGroup) fowardProposeTo(ctx context.Context, raft IRaft, reqs types.ProposeReqSet, leaderID uint64) ([]*types.ProposeResp, error) {
 	data, err := reqs.Marshal()
 	if err != nil {
 		return nil, err
@@ -205,9 +230,13 @@ func (rg *RaftGroup) fowardPropose(ctx context.Context, raft IRaft, reqs types.P
 	key := fmt.Sprintf("%d", reqs[len(reqs)-1].Id)
 	waitC := rg.fowardProposeWait.Register(key)
 
+	// 普通转发保持原时机，在序列化和登记后读取领导；明确拒绝后的转发才固定目标。
+	if leaderID == 0 {
+		leaderID = raft.LeaderId()
+	}
 	rg.opts.Transport.Send(raft.Key(), types.Event{
 		From: raft.NodeId(),
-		To:   raft.LeaderId(),
+		To:   leaderID,
 		Type: types.SendPropose,
 		Logs: []types.Log{
 			{

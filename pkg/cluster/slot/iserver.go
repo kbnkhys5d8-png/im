@@ -149,6 +149,12 @@ func (s *Server) MustWaitAllSlotsReady(timeout time.Duration) {
 					ready = false
 					break
 				}
+				// 配置先落库再异步交给槽处理，必须等待本地任期和领导者一并收敛。
+				localConfig := slotRaft.Config()
+				if localConfig.Leader != slotConfig.Leader || localConfig.Term != slotConfig.Term {
+					ready = false
+					break
+				}
 			}
 			if ready {
 				return

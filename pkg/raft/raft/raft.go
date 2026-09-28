@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
@@ -18,14 +17,15 @@ import (
 )
 
 type Raft struct {
-	stopper  *syncutil.Stopper
-	opts     *Options
-	node     *Node
-	advanceC chan struct{}
-	stepC    chan stepReq
+	stopper     *syncutil.Stopper
+	opts        *Options
+	node        *Node
+	advanceC    chan struct{}
+	stepC       chan stepReq
+	nodeActionC chan nodeActionReq
+	started     atomic.Bool
 	wklog.Log
-	pause     atomic.Bool // 是否暂停
-	pauseCond *sync.Cond
+	pause atomic.Bool // 是否暂停
 
 	wait *wait
 
@@ -57,8 +57,8 @@ func New(opts *Options) *Raft {
 		node:              NewNode(lastTermStartLogIndex, raftState, opts),
 		advanceC:          make(chan struct{}, 1),
 		stepC:             make(chan stepReq, 1024),
+		nodeActionC:       make(chan nodeActionReq),
 		Log:               wklog.NewWKLog("raft"),
-		pauseCond:         sync.NewCond(&sync.Mutex{}),
 		wait:              newWait("raft"),
 		fowardProposeWait: wt.New(),
 		pool:              pool,
@@ -69,6 +69,7 @@ func New(opts *Options) *Raft {
 }
 
 func (r *Raft) Start() error {
+	r.started.Store(true)
 	r.stopper.RunWorker(r.loop)
 
 	return nil
@@ -81,17 +82,14 @@ func (r *Raft) Stop() {
 // Pause 暂停服务
 func (r *Raft) Pause() {
 	r.pause.Store(true)
-
+	r.advance()
 }
 
 // Resume 恢复服务
 func (r *Raft) Resume() {
 	r.pause.Store(false)
 
-	// 唤醒等待中的 loop
-	r.pauseCond.L.Lock()
-	r.pauseCond.Signal() // 唤醒一个等待的 Goroutine
-	r.pauseCond.L.Unlock()
+	r.advance()
 }
 
 func (r *Raft) Step(e types.Event) {
@@ -170,7 +168,7 @@ func (r *Raft) WaitUtilCommit(ctx context.Context, index uint64) error {
 			return ctx.Err()
 		default:
 		}
-		if r.node.queue.committedIndex >= index {
+		if r.node.CommittedIndex() >= index {
 			return nil
 		}
 		time.Sleep(time.Millisecond * 10)
@@ -178,24 +176,79 @@ func (r *Raft) WaitUtilCommit(ctx context.Context, index uint64) error {
 }
 
 func (r *Raft) BecomeLeader(term uint32) {
-	r.node.BecomeLeader(term)
+	if !r.started.Load() {
+		r.node.BecomeLeader(term)
+		return
+	}
+	_ = r.withNode(context.Background(), func() error {
+		r.node.BecomeLeader(term)
+		return nil
+	})
 }
 
 func (r *Raft) BecomeFollower(term uint32, leader uint64) {
-	r.node.BecomeFollower(term, leader)
+	if !r.started.Load() {
+		r.node.BecomeFollower(term, leader)
+		return
+	}
+	_ = r.withNode(context.Background(), func() error {
+		r.node.BecomeFollower(term, leader)
+		return nil
+	})
 }
 
 func (r *Raft) KeepAlive() {
-	r.node.KeepAlive()
+	if !r.started.Load() {
+		r.node.KeepAlive()
+		return
+	}
+	_ = r.withNode(context.Background(), func() error {
+		r.node.KeepAlive()
+		return nil
+	})
+}
+
+func (r *Raft) withNode(ctx context.Context, action func() error) error {
+	req := nodeActionReq{action: action, resp: make(chan error, 1)}
+	select {
+	case r.nodeActionC <- req:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-r.stopper.ShouldStop():
+		return types.ErrStopped
+	}
+	select {
+	case err := <-req.resp:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-r.stopper.ShouldStop():
+		return types.ErrStopped
+	}
+}
+
+func (r *Raft) step(e types.Event) error {
+	err := r.node.Step(e)
+	if err == nil && e.Type == types.ApplyResp && e.Reason == types.ReasonOk {
+		// 应用下标更新与等待注册由同一个循环串行完成，避免漏掉完成通知。
+		r.wait.didApply(r.node.queue.appliedIndex)
+	}
+	return err
 }
 
 func (r *Raft) loop() {
 	tk := time.NewTicker(r.opts.TickInterval)
+	defer tk.Stop()
 	for {
 		if r.pause.Load() {
-			r.pauseCond.L.Lock()
-			r.pauseCond.Wait() // 会在某个条件满足时被唤醒
-			r.pauseCond.L.Unlock()
+			// 暂停复制与时钟，但继续响应角色操作、恢复和停止。
+			select {
+			case req := <-r.nodeActionC:
+				req.resp <- req.action()
+			case <-r.advanceC:
+			case <-r.stopper.ShouldStop():
+				return
+			}
 			continue
 		}
 
@@ -206,10 +259,12 @@ func (r *Raft) loop() {
 			r.node.Tick()
 		case <-r.advanceC:
 		case req := <-r.stepC:
-			err := r.node.Step(req.event)
+			err := r.step(req.event)
 			if req.resp != nil {
 				req.resp <- err
 			}
+		case req := <-r.nodeActionC:
+			req.resp <- req.action()
 		case <-r.stopper.ShouldStop():
 			return
 		}
@@ -250,7 +305,7 @@ func (r *Raft) readyEvents() {
 		}
 
 		if e.To == types.LocalNode || e.To == r.opts.NodeId {
-			err := r.node.Step(e)
+			err := r.step(e)
 			if err != nil {
 				r.node.Error("step error", zap.Error(err))
 			}
@@ -430,8 +485,6 @@ func (r *Raft) handleApplyReq(e types.Event) {
 			Reason: types.ReasonOk,
 			Index:  lastLogIndex,
 		}}
-		// 已应用
-		r.wait.didApply(lastLogIndex)
 	})
 	if err != nil {
 		r.Error("submit apply logs failed", zap.Error(err))

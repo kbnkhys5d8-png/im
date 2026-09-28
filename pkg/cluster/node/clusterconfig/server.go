@@ -7,6 +7,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
 	pb "github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
@@ -20,11 +21,11 @@ import (
 
 type Server struct {
 	opts      *Options
-	raft      *raft.Raft             // raft算法
-	config    *Config                // 分布式配置对象
-	storage   *PebbleShardLogStorage // 配置日志存储
-	cfgGenId  *snowflake.Node        // 配置ID生成器
-	listeners []IEvent               // 事件监听器
+	raft      atomic.Pointer[raft.Raft] // 完成初始化后原子发布，供事件循环并发读取
+	config    *Config                   // 分布式配置对象
+	storage   *PebbleShardLogStorage    // 配置日志存储
+	cfgGenId  *snowflake.Node           // 配置ID生成器
+	listeners []IEvent                  // 事件监听器
 	wklog.Log
 }
 
@@ -75,7 +76,7 @@ func (s *Server) Start() error {
 	if err != nil {
 		return err
 	}
-	return s.raft.Start()
+	return s.raft.Load().Start()
 }
 
 func (s *Server) Options() *Options {
@@ -120,23 +121,24 @@ func (s *Server) initRaft() error {
 		}
 	}
 
-	s.raft = raft.New(raft.NewOptions(
+	raftServer := raft.New(raft.NewOptions(
 		raft.WithKey("clusterconfig"),
 		raft.WithNodeId(s.opts.NodeId),
 		raft.WithTransport(newRaftTransport(s)),
 		raft.WithStorage(s.storage),
 		raft.WithElectionOn(true),
 	))
-	s.raft.Step(rafttypes.Event{
+	raftServer.Step(rafttypes.Event{
 		Type:   rafttypes.ConfChange,
 		Config: raftConfig,
 	})
+	s.raft.Store(raftServer)
 
 	return nil
 }
 
 func (s *Server) Stop() {
-	s.raft.Stop()
+	s.raft.Load().Stop()
 	s.storage.Close()
 }
 
@@ -160,63 +162,64 @@ func (s *Server) NotifyConfigChangeEvent() {
 }
 
 func (s *Server) Propose(id uint64, data []byte) (*rafttypes.ProposeResp, error) {
-	return s.raft.Propose(id, data)
+	return s.raft.Load().Propose(id, data)
 }
 
 func (s *Server) ProposeUntilAppliedTimeout(ctx context.Context, id uint64, data []byte) (*rafttypes.ProposeResp, error) {
 
-	return s.raft.ProposeUntilAppliedTimeout(ctx, id, data)
+	return s.raft.Load().ProposeUntilAppliedTimeout(ctx, id, data)
 }
 
 func (s *Server) ProposeUntilApplied(id uint64, data []byte) (*rafttypes.ProposeResp, error) {
-	return s.raft.ProposeUntilApplied(id, data)
+	return s.raft.Load().ProposeUntilApplied(id, data)
 }
 
 func (s *Server) ProposeBatchTimeout(ctx context.Context, reqs []rafttypes.ProposeReq) ([]*rafttypes.ProposeResp, error) {
-	return s.raft.ProposeBatchTimeout(ctx, reqs)
+	return s.raft.Load().ProposeBatchTimeout(ctx, reqs)
 }
 
 func (s *Server) ProposeBatchUntilAppliedTimeout(ctx context.Context, reqs []rafttypes.ProposeReq) ([]*rafttypes.ProposeResp, error) {
-	return s.raft.ProposeBatchUntilAppliedTimeout(ctx, reqs)
+	return s.raft.Load().ProposeBatchUntilAppliedTimeout(ctx, reqs)
 }
 
 func (s *Server) StepRaftEvent(e rafttypes.Event) {
-	if s.raft == nil {
+	raftServer := s.raft.Load()
+	if raftServer == nil {
 		return
 	}
-	s.raft.Step(e)
+	raftServer.Step(e)
 }
 
 func (s *Server) switchConfig(cfg *Config) {
-	if s.raft == nil {
+	raftServer := s.raft.Load()
+	if raftServer == nil {
 		return
 	}
 
-	s.raft.Step(rafttypes.Event{
+	raftServer.Step(rafttypes.Event{
 		Type:   rafttypes.ConfChange,
 		Config: s.configToRaftConfig(cfg),
 	})
 }
 
 func (s *Server) IsLeader() bool {
-	if s.raft == nil {
+	raftServer := s.raft.Load()
+	if raftServer == nil {
 		return false
 	}
-	return s.raft.IsLeader()
+	return raftServer.IsLeader()
 }
 
 func (s *Server) LeaderId() uint64 {
-	if s.raft == nil {
+	raftServer := s.raft.Load()
+	if raftServer == nil {
 		return 0
 	}
-	return s.raft.LeaderId()
+	return raftServer.LeaderId()
 }
 
 func (s *Server) GetClusterConfig() *types.Config {
-	if s.config.cfg == nil {
-		return nil
-	}
-	return s.config.cfg
+	return s.config.config()
 }
 
 // 是否已初始化
@@ -289,7 +292,7 @@ func (s *Server) SlotReplicaCount() uint32 {
 
 // NodeConfigVersionFromLeader 获取节点的配置版本（只有主节点才有这个信息）
 func (s *Server) NodeConfigVersionFromLeader(nodeId uint64) uint64 {
-	return s.raft.GetReplicaLastLogIndex(nodeId)
+	return s.raft.Load().GetReplicaLastLogIndex(nodeId)
 }
 
 // GetLogsByLimit 分页获取日志（升序）
@@ -317,11 +320,12 @@ func (s *Server) genConfigId() uint64 {
 
 func (s *Server) configToRaftConfig(cfg *Config) rafttypes.Config {
 
-	nodes := cfg.nodes()
+	snapshot := cfg.config()
+	nodes := snapshot.Nodes
 
 	replicas := make([]uint64, 0, len(nodes))
 	for _, node := range nodes {
-		if node.AllowVote && node.Role == pb.NodeRole_NodeRoleReplica && !wkutil.ArrayContainsUint64(cfg.cfg.Learners, node.Id) {
+		if node.AllowVote && node.Role == pb.NodeRole_NodeRoleReplica && !wkutil.ArrayContainsUint64(snapshot.Learners, node.Id) {
 			replicas = append(replicas, node.Id)
 			continue
 		}
@@ -334,9 +338,9 @@ func (s *Server) configToRaftConfig(cfg *Config) rafttypes.Config {
 
 	return rafttypes.Config{
 		Replicas:    replicas,
-		MigrateFrom: cfg.cfg.MigrateFrom,
-		MigrateTo:   cfg.cfg.MigrateTo,
-		Learners:    cfg.cfg.Learners,
+		MigrateFrom: snapshot.MigrateFrom,
+		MigrateTo:   snapshot.MigrateTo,
+		Learners:    snapshot.Learners,
 		Leader:      leader,
 		// Term:        cfg.cfg.Term, // 不需要设置term，不设置表示使用当前term，Config的term只是应用的最新的term，不表示是日志的term
 	}

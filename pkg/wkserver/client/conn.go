@@ -30,12 +30,13 @@ const (
 )
 
 type conn struct {
-	status      atomic.Value // 是否已认证
-	c           *Client
-	addr        string // 服务端地址
-	gc          gnet.Conn
-	idleTick    int // 空闲tick数
-	timeoutTick int
+	status atomic.Value // 是否已认证
+	c      *Client
+	addr   string // 服务端地址
+	gc     gnet.Conn
+	// 定时器、网络事件和工作池均会更新计数，单个计数必须原子读写。
+	idleTick    atomic.Int64 // 空闲tick数
+	timeoutTick atomic.Int64
 
 	no string // 唯一编号，每次重连都会变
 
@@ -144,17 +145,17 @@ func (c *conn) sendAuth() error {
 }
 
 func (c *conn) tick() {
-	c.idleTick++
+	c.idleTick.Inc()
 
 	// 定时发送心跳
-	if c.idleTick >= c.c.opts.HeartbeatTick {
-		c.idleTick = 0
+	if c.idleTick.Load() >= int64(c.c.opts.HeartbeatTick) {
+		c.idleTick.Store(0)
 		c.sendHeartbeat()
 	}
 
-	c.timeoutTick++
-	if c.timeoutTick >= c.c.opts.HeartbeatTimeoutTick {
-		c.timeoutTick = 0
+	c.timeoutTick.Inc()
+	if c.timeoutTick.Load() >= int64(c.c.opts.HeartbeatTimeoutTick) {
+		c.timeoutTick.Store(0)
 		c.Foucs("node client heartbeat timeout,reconnect")
 		c.reconnect()
 	}

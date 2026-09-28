@@ -1,6 +1,7 @@
 package eventbus
 
 import (
+	"bytes"
 	"fmt"
 	"sync/atomic"
 
@@ -31,6 +32,8 @@ type Conn struct {
 	NodeId uint64
 	// 连接id
 	ConnId int64
+	// 接入节点为真实连接生成的会话标识，不属于客户端协议。
+	SessionId string
 	// 对应设备的id
 	DeviceId string
 	// 对应设备的标记
@@ -52,6 +55,8 @@ type Conn struct {
 
 	// 不参与编码
 	LastActive uint64 // 最后一次活动时间单位秒
+	// 仅 owner 内存保存接入时配置版本，回传认证结果不得覆盖它。
+	AdmissionVersion uint64
 
 	IsJsonRpc bool // 是否是jsonrpc连接
 }
@@ -71,6 +76,9 @@ func (c *Conn) Encode() ([]byte, error) {
 	enc.WriteUint64(c.Uptime)
 	enc.WriteUint8(wkutil.BoolToUint8(c.IsJsonRpc))
 	enc.WriteUint8(wkutil.BoolToUint8(c.Internal))
+	if c.SessionId != "" {
+		enc.WriteString(c.SessionId)
+	}
 	return enc.Bytes(), nil
 }
 
@@ -136,12 +144,33 @@ func (c *Conn) Decode(data []byte) error {
 		}
 		c.Internal = wkutil.Uint8ToBool(internal)
 	}
+	// 旧节点没有会话标识；允许解码，但连接恢复不能将空标识视为新会话。
+	c.SessionId = ""
+	if dec.Len() > 0 {
+		if c.SessionId, err = dec.String(); err != nil {
+			return err
+		}
+	}
 
 	return nil
 }
 
 func (c *Conn) Size() uint64 {
-	return uint64(8 + len(c.Uid) + len(c.DeviceId) + 1 + 1 + 8 + 1 + len(c.AesIV) + len(c.AesKey) + 1 + 1)
+	size := uint64(8 + len(c.Uid) + len(c.DeviceId) + 1 + 1 + 8 + 1 + len(c.AesIV) + len(c.AesKey) + 1 + 1)
+	if c.SessionId != "" {
+		size += uint64(2 + len(c.SessionId))
+	}
+	return size
+}
+
+// SameSession 比较会话身份，不比较活跃时间或统计数据，防止旧快照命中复用的连接。
+func (c *Conn) SameSession(other *Conn) bool {
+	return c != nil && other != nil &&
+		c.SessionId == other.SessionId &&
+		c.Uid == other.Uid && c.NodeId == other.NodeId && c.ConnId == other.ConnId &&
+		c.Uptime == other.Uptime && c.DeviceId == other.DeviceId && c.DeviceFlag == other.DeviceFlag &&
+		c.IsJsonRpc == other.IsJsonRpc && c.ProtoVersion == other.ProtoVersion &&
+		bytes.Equal(c.AesIV, other.AesIV) && bytes.Equal(c.AesKey, other.AesKey)
 }
 
 func (c *Conn) Equal(cn *Conn) bool {

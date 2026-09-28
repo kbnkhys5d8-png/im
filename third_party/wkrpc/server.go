@@ -20,8 +20,13 @@ import (
 )
 
 type Server struct {
-	proto  proto.Protocol
-	engine gnet.Engine
+	proto       proto.Protocol
+	engine      *gnet.Engine
+	lifecycleMu sync.Mutex
+	started     bool
+	stopping    bool
+	stopOnce    sync.Once
+	runDone     chan struct{}
 	gnet.BuiltinEventEngine
 	opts         *Options
 	routeMapLock sync.RWMutex
@@ -52,6 +57,7 @@ func New(addr string, ops ...Option) *Server {
 
 	s := &Server{
 		proto:       proto.New(),
+		runDone:     make(chan struct{}),
 		opts:        opts,
 		routeMap:    make(map[string]Handler),
 		Log:         wklog.NewWKLog("Server"),
@@ -97,6 +103,15 @@ func New(addr string, ops ...Option) *Server {
 }
 
 func (s *Server) Start() error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.stopping {
+		return fmt.Errorf("rpc server is stopped")
+	}
+	if s.started {
+		return nil
+	}
+	s.started = true
 
 	s.timingWheel.Start()
 
@@ -105,6 +120,7 @@ func (s *Server) Start() error {
 	})
 
 	go func() {
+		defer close(s.runDone)
 		err := gnet.Run(s, s.opts.Addr, gnet.WithTicker(true), gnet.WithReuseAddr(true))
 		if err != nil {
 			s.Panic("gnet run error", zap.Error(err))
@@ -115,14 +131,32 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) Stop() {
-	s.stopper.Stop()
-	s.timingWheel.Stop()
-	timeCtx, cancel := context.WithTimeout(context.Background(), time.Second*5)
-	defer cancel()
-	err := s.engine.Stop(timeCtx)
-	if err != nil {
-		s.Warn("stop is error", zap.Error(err))
-	}
+	s.stopOnce.Do(func() {
+		// 先阻止晚到的 OnBoot，再取得已完整发布的引擎；等待退出时不持有此锁。
+		s.lifecycleMu.Lock()
+		s.stopping = true
+		engine, started := s.engine, s.started
+		s.lifecycleMu.Unlock()
+
+		s.stopper.Stop()
+		s.timingWheel.Stop()
+		if !started {
+			return
+		}
+		timeCtx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+		defer cancel()
+		if engine != nil {
+			if err := engine.Stop(timeCtx); err != nil {
+				s.Warn("stop is error", zap.Error(err))
+			}
+		}
+		// 未进入 OnBoot 的引擎会返回 Shutdown；共用原有五秒预算等待监听器释放。
+		select {
+		case <-s.runDone:
+		case <-timeCtx.Done():
+			s.Warn("wait for rpc shutdown is error", zap.Error(timeCtx.Err()))
+		}
+	})
 }
 
 // Schedule 延迟任务

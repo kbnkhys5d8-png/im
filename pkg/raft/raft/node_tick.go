@@ -6,10 +6,11 @@ import (
 )
 
 func (n *Node) Tick() {
-	n.idleTick++
+	defer n.publishReadState()
+	idleTick := n.idleTick.Add(1)
 	if n.opts.AutoDestory {
-		if n.idleTick > n.opts.DestoryAfterIdleTick {
-			n.idleTick = 0
+		// 并发保活已清零时，不再按本轮旧计数触发销毁。
+		if idleTick > int64(n.opts.DestoryAfterIdleTick) && n.idleTick.CompareAndSwap(idleTick, 0) {
 			n.Debug("auto destory")
 			n.sendDestory()
 		}
@@ -142,7 +143,7 @@ func (n *Node) resetRandomizedElectionTimeout() {
 
 // 开始选举
 func (n *Node) campaign() {
-	if n.IsLeader() {
+	if n.cfg.Leader == n.opts.NodeId {
 		// 如果当前是领导，先变成follower
 		n.BecomeFollower(n.cfg.Term, 0)
 	} else {

@@ -125,8 +125,15 @@ func (e *EventPool) AllConnCount() int {
 
 func (e *EventPool) RemoveConn(conn *eventbus.Conn) {
 	e.pollerByUid(conn.Uid).removeConn(conn)
+	if !options.G.IsLocalNode(conn.NodeId) || service.ConnManager == nil {
+		return
+	}
 	realConn := service.ConnManager.GetConn(conn.ConnId)
 	if realConn != nil {
+		current, ok := realConn.Context().(*eventbus.Conn)
+		if !ok || !current.SameSession(conn) {
+			return
+		}
 		service.ConnManager.RemoveConn(realConn)
 	}
 }

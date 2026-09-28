@@ -467,7 +467,14 @@ func (c *Client) readLoop() {
 	var remainingData []byte
 	var packetData []byte
 	tmpBuff := make([]byte, 0)
-	for !c.isClosed() {
+	for {
+		// 状态读取与关闭共用锁，网络读不能持锁阻塞关闭。
+		c.mu.RLock()
+		closed := c.isClosed()
+		c.mu.RUnlock()
+		if closed {
+			break
+		}
 		buf, err := br.Read()
 		if err == nil {
 			// With websocket, it is possible that there is no error but
@@ -781,6 +788,8 @@ func (c *Client) isConnected() bool {
 }
 
 func (c *Client) IsConnected() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.isConnected()
 }
 

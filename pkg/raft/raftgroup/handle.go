@@ -198,8 +198,6 @@ func (rg *RaftGroup) handleApplyReq(r IRaft, e types.Event) {
 			Reason: types.ReasonOk,
 			Index:  lastLogIndex,
 		})
-		// 已应用
-		rg.wait.didApply(r.Key(), lastLogIndex)
 		rg.Advance()
 	})
 	if err != nil {

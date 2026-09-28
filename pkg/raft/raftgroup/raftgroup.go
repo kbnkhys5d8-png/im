@@ -222,6 +222,10 @@ func (rg *RaftGroup) handleReceivedEvents() bool {
 		if err != nil {
 			rg.Error("step failed", zap.Error(err), zap.String("handleKey", raft.Key()))
 		}
+		if err == nil && e.Type == types.ApplyResp && e.Reason == types.ReasonOk {
+			// Step 已发布应用进度后才能唤醒等待者，工作线程入队不代表进度可见。
+			rg.wait.didApply(e.RaftKey, raft.AppliedIndex())
+		}
 		if e.WaitC != nil {
 			e.WaitC <- err
 		}

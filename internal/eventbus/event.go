@@ -2,6 +2,7 @@ package eventbus
 
 import (
 	"fmt"
+	"slices"
 
 	"github.com/WuKongIM/WuKongIM/internal/track"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
@@ -34,7 +35,7 @@ const (
 	_eventChannelOnStreamRemoved // 已移除，保留占位以维持iota值
 	// EventChannelWebhook 频道webhook
 	EventChannelWebhook
-	// EventChannelDistribute 频道消息分发
+	// EventChannelDistribute 普通频道节点局部分发；在线命令仍沿用既有流程。
 	EventChannelDistribute
 
 	// =================== Pusher ===================
@@ -42,6 +43,8 @@ const (
 	EventPushOnline
 	// EventPushOffline push离线消息
 	EventPushOffline
+	// EventChannelDistributeInitial 普通频道的首次全局分发，追加编号以保持既有编码。
+	EventChannelDistributeInitial
 )
 
 func (e EventType) String() string {
@@ -64,6 +67,8 @@ func (e EventType) String() string {
 		return "EventChannelWebhook"
 	case EventChannelDistribute:
 		return "EventChannelDistribute"
+	case EventChannelDistributeInitial:
+		return "EventChannelDistributeInitial"
 	case EventPushOnline:
 		return "EventPushOnline"
 	case EventPushOffline:
@@ -80,39 +85,45 @@ type Event struct {
 	Type         EventType
 	Conn         *Conn
 	Frame        wkproto.Frame
-	MessageId  int64
-	MessageSeq uint64
-	ReasonCode wkproto.ReasonCode
+	MessageId    int64
+	MessageSeq   uint64
+	ReasonCode   wkproto.ReasonCode
 	TagKey       string // tag的key
 	ToUid        string // 发送事件的目标用户
 	SourceNodeId uint64 // 事件发起源节点
 	// 事件记录
 	Track track.Message
 	// 不需要编码
-	Index        uint64
-	OfflineUsers []string // 离线用户集合
-	ChannelId    string   // 频道ID
-	ChannelType  uint8    // 频道类型
-	ReqId        string   // 请求ID(非必填)(jsonrpc)
+	Index             uint64
+	OfflineUsers      []string        // 离线用户集合
+	ToConns           []*Conn         // 仅进程内定向补投；nil 沿用全部连接，非 nil 空集合不投递。
+	TakeOfflineEvents func() []*Event // 仅进程内离线聚合 token，出队时提取当前已确认的接收者。
+	OfflineBatchSize  uint64          // 仅进程内离线 token 的原批次预算，不进入节点间编码。
+	ChannelId         string          // 频道ID
+	ChannelType       uint8           // 频道类型
+	ReqId             string          // 请求ID(非必填)(jsonrpc)
 }
 
 func (e *Event) Clone() *Event {
 	return &Event{
-		Type:         e.Type,
-		Conn:         e.Conn,
-		Frame:        e.Frame,
-		MessageId:  e.MessageId,
-		MessageSeq: e.MessageSeq,
-		ReasonCode: e.ReasonCode,
-		TagKey:       e.TagKey,
-		ToUid:        e.ToUid,
-		SourceNodeId: e.SourceNodeId,
-		Track:        e.Track.Clone(),
-		Index:        e.Index,
-		OfflineUsers: e.OfflineUsers,
-		ChannelId:    e.ChannelId,
-		ChannelType:  e.ChannelType,
-		ReqId:        e.ReqId,
+		Type:              e.Type,
+		Conn:              e.Conn,
+		Frame:             e.Frame,
+		MessageId:         e.MessageId,
+		MessageSeq:        e.MessageSeq,
+		ReasonCode:        e.ReasonCode,
+		TagKey:            e.TagKey,
+		ToUid:             e.ToUid,
+		SourceNodeId:      e.SourceNodeId,
+		Track:             e.Track.Clone(),
+		Index:             e.Index,
+		OfflineUsers:      e.OfflineUsers,
+		ToConns:           slices.Clone(e.ToConns),
+		TakeOfflineEvents: e.TakeOfflineEvents,
+		OfflineBatchSize:  e.OfflineBatchSize,
+		ChannelId:         e.ChannelId,
+		ChannelType:       e.ChannelType,
+		ReqId:             e.ReqId,
 	}
 }
 
@@ -126,12 +137,12 @@ func (e *Event) Size() uint64 {
 	if e.hasFrame() == 1 {
 		size += 4 + uint64(e.Frame.GetFrameSize())
 	}
-	size += 8 // message id
-	size += 8 // message seq
-	size += 1 // reason code
-	size += uint64(2 + len(e.TagKey))   // tag key
-	size += uint64(2 + len(e.ToUid))    // to uid
-	size += 8                           // source node id
+	size += 8                         // message id
+	size += 8                         // message seq
+	size += 1                         // reason code
+	size += uint64(2 + len(e.TagKey)) // tag key
+	size += uint64(2 + len(e.ToUid))  // to uid
+	size += 8                         // source node id
 
 	if e.hasTrack() == 1 {
 		size += e.Track.Size()
@@ -144,6 +155,10 @@ func (e *Event) Size() uint64 {
 
 	if e.hasReqId() == 1 {
 		size += uint64(2 + len(e.ReqId)) // req id
+	}
+	if e.Type == EventPushOffline && e.TakeOfflineEvents != nil {
+		// token 展开前也应承担原消息批次预算，不能以空壳大小绕过队列软上限。
+		return max(size, e.OfflineBatchSize)
 	}
 
 	return size

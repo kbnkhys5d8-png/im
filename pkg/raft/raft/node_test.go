@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"sync"
 	"testing"
 
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
@@ -192,4 +193,113 @@ func TestTermStartIndex_Tracking(t *testing.T) {
 	n.updateLastTermStartIndex(5, 100)
 	assert.Equal(t, uint32(5), n.lastTermStartIndex.Term)
 	assert.Equal(t, uint64(100), n.lastTermStartIndex.Index)
+}
+
+func TestNodeConcurrentStateReads(t *testing.T) {
+	n := newTestNode(1, []uint64{1, 2})
+	start := make(chan struct{})
+	var readers sync.WaitGroup
+	readers.Add(1)
+	go func() {
+		defer readers.Done()
+		<-start
+		for i := 0; i < 1000; i++ {
+			n.LeaderId()
+			n.IsLeader()
+			n.Config()
+			n.GetReplicaLastLogIndex(2)
+			n.LastLogIndex()
+			n.LastLogTerm()
+			n.LastTerm()
+			n.CommittedIndex()
+			n.AppliedIndex()
+		}
+	}()
+	close(start)
+	// 模拟事件循环独占写入，外部协程同时查询角色、配置和副本进度。
+	for i := uint32(1); i <= 1000; i++ {
+		n.BecomeLeader(i)
+		if err := n.Step(types.Event{Type: types.SyncReq, From: 2, Index: 1}); err != nil {
+			t.Fatal(err)
+		}
+		n.Ready()
+		n.Tick()
+		n.BecomeFollower(i, 2)
+	}
+	readers.Wait()
+	if got := n.LeaderId(); got != 2 {
+		t.Fatalf("leader = %d, want 2", got)
+	}
+}
+
+func TestNodeConfigReturnsIndependentCopy(t *testing.T) {
+	n := newTestNode(1, []uint64{1, 2})
+	cfg := n.Config()
+	cfg.Replicas[0] = 99
+	if got := n.Config().Replicas[0]; got != 1 {
+		t.Fatalf("修改返回配置影响了节点副本列表: got %d, want 1", got)
+	}
+}
+
+func TestNodeIdleReadStateDoesNotAllocate(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(*Node)
+	}{
+		{name: "tick", run: (*Node).Tick},
+		{name: "ready", run: func(n *Node) { n.Ready() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			n := newTestNode(1, []uint64{1})
+			// 空闲节点的公开状态没有变化，不应为每次时钟或查询重复分配快照。
+			if allocs := testing.AllocsPerRun(1000, func() { tc.run(n) }); allocs != 0 {
+				t.Fatalf("空闲操作分配次数 = %v, want 0", allocs)
+			}
+		})
+	}
+}
+
+func TestNodeConcurrentKeepAlive(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(*Node) error
+	}{
+		{name: "领导者同步请求", run: func(n *Node) error {
+			return n.Step(types.Event{
+				Type: types.SyncReq, From: 2, To: 1, Term: 1,
+				Index: 1, Reason: types.ReasonOnlySync,
+			})
+		}},
+		{name: "空闲时钟", run: func(n *Node) error {
+			n.Tick()
+			return nil
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			n := newTestNode(1, []uint64{1, 2})
+			makeLeader(n, 1)
+			start := make(chan struct{})
+			var writers sync.WaitGroup
+			writers.Add(1)
+			go func() {
+				defer writers.Done()
+				<-start
+				for i := 0; i < 1024; i++ {
+					// 复现外部提案持锁保活，事件线程不持同一把锁的调用边界。
+					n.Lock()
+					n.KeepAlive()
+					n.Unlock()
+				}
+			}()
+			defer writers.Wait()
+			close(start)
+			// 只有当前协程消费事件和时钟，不能用并发 Step/Tick 制造无效场景。
+			for i := 0; i < 1024; i++ {
+				if err := tc.run(n); err != nil {
+					t.Fatal(err)
+				}
+				n.Ready()
+			}
+		})
+	}
 }

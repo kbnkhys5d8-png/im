@@ -6,6 +6,7 @@ import (
 )
 
 func (n *Node) BecomeCandidate() {
+	defer n.publishReadState()
 	if n.cfg.Role == types.RoleLeader {
 		n.Panic("invalid transition [leader -> candidate]")
 	}
@@ -20,6 +21,7 @@ func (n *Node) BecomeCandidate() {
 }
 
 func (n *Node) BecomeFollower(term uint32, leaderId uint64) {
+	defer n.publishReadState()
 	n.cfg.Term = term
 	n.stepFunc = n.stepFollower
 	n.reset()
@@ -37,6 +39,7 @@ func (n *Node) BecomeFollower(term uint32, leaderId uint64) {
 }
 
 func (n *Node) BecomeLeader(term uint32) {
+	defer n.publishReadState()
 	n.cfg.Term = term
 	n.stepFunc = n.stepLeader
 	n.reset()
@@ -53,6 +56,7 @@ func (n *Node) BecomeLeader(term uint32) {
 }
 
 func (n *Node) BecomeLearner(term uint32, leaderId uint64) {
+	defer n.publishReadState()
 	n.cfg.Term = term
 	n.stepFunc = n.stepLearner
 	n.reset()

@@ -115,8 +115,8 @@ func TestStep_HighTerm_Learner_StaysLearner(t *testing.T) {
 func TestStep_HighTerm_Learner_OtherEvent_LeaderNone(t *testing.T) {
 	n := newTestNode(1, []uint64{1, 2, 3})
 	makeLearner(n, 3, 2)
-	// High term non-Ping for learner → BecomeLearner(newTerm, None)
-	n.Step(types.Event{Type: types.NotifySync, Term: 5, From: 3})
+	// 任期反馈不代表发送方是领导，学习者应保留未知领导状态。
+	n.Step(types.Event{Type: types.TermResp, Term: 5, From: 3})
 	assert.Equal(t, types.RoleLearner, n.cfg.Role)
 	assert.Equal(t, uint32(5), n.cfg.Term)
 	assert.Equal(t, uint64(0), n.cfg.Leader)

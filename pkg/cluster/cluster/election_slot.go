@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
@@ -128,6 +129,8 @@ func (s *Server) handleSlotElection(slots []*types.Slot) error {
 // 请求槽的日志高度
 func (s *Server) requestSlotInfos(waitElectionSlots map[uint64][]uint32) ([]*SlotLogInfoResp, error) {
 	slotInfoResps := make([]*SlotLogInfoResp, 0, len(waitElectionSlots))
+	// 本地结果和并发 RPC 结果共享切片，仅在追加时加锁。
+	var resultsMu sync.Mutex
 	timeoutCtx, cancel := context.WithTimeout(context.Background(), time.Second*4)
 	defer cancel()
 	requestGroup, _ := errgroup.WithContext(timeoutCtx)
@@ -138,10 +141,12 @@ func (s *Server) requestSlotInfos(waitElectionSlots map[uint64][]uint32) ([]*Slo
 				s.Error("get slot infos error", zap.Error(err))
 				continue
 			}
+			resultsMu.Lock()
 			slotInfoResps = append(slotInfoResps, &SlotLogInfoResp{
 				NodeId: nodeId,
 				Slots:  slotInfos,
 			})
+			resultsMu.Unlock()
 			continue
 		} else {
 			requestGroup.Go(func(nID uint64, sids []uint32) func() error {
@@ -153,7 +158,9 @@ func (s *Server) requestSlotInfos(waitElectionSlots map[uint64][]uint32) ([]*Slo
 						s.Warn("request slot log info error", zap.Error(err))
 						return nil
 					}
+					resultsMu.Lock()
 					slotInfoResps = append(slotInfoResps, resp)
+					resultsMu.Unlock()
 					return nil
 				}
 			}(nodeId, slotIds))

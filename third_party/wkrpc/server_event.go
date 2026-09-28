@@ -310,7 +310,12 @@ func (s *Server) Send(uid string, msg *proto.Message) error {
 }
 
 func (s *Server) OnBoot(eng gnet.Engine) (action gnet.Action) {
-	s.engine = eng
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.stopping {
+		return gnet.Shutdown
+	}
+	s.engine = &eng
 	return
 }
 

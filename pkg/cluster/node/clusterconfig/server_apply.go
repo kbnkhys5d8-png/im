@@ -32,8 +32,10 @@ func (s *Server) applyLog(log types.Log) error {
 		s.Panic("handle cmd failed", zap.Error(err))
 		return err
 	}
+	s.config.mu.Lock()
 	s.config.cfg.Term = log.Term
 	s.config.cfg.Version = log.Index
+	s.config.mu.Unlock()
 
 	// fmt.Println("apply log", log.Index, log.Term, cmd.CmdType.String())
 	err = s.config.saveConfig()
@@ -126,12 +128,14 @@ func (s *Server) handleNodeJoin(cmd *CMD) error {
 	s.config.addOrUpdateNode(newNode)
 
 	// 将新节点加入学习者列表
+	s.config.mu.Lock()
 	if !wkutil.ArrayContainsUint64(s.config.cfg.Learners, newNode.Id) {
 		s.config.cfg.Learners = append(s.config.cfg.Learners, newNode.Id)
 		// 如果是新加入的节点，就是从自己迁移到自己
 		s.config.cfg.MigrateFrom = newNode.Id
 		s.config.cfg.MigrateTo = newNode.Id
 	}
+	s.config.mu.Unlock()
 	s.switchConfig(s.config)
 	return nil
 }

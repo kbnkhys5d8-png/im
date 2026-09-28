@@ -170,7 +170,8 @@ func testConcurrentOperations(t *testing.T, queue *AdaptiveSendQueue) {
 	defer cancel()
 
 	var wg sync.WaitGroup
-	var totalSent, totalReceived int64
+	// 多个生产者和消费者并发更新计数，使用原子操作避免竞争和丢计数。
+	var totalSent, totalReceived atomic.Int64
 
 	// 启动生产者
 	for i := 0; i < numProducers; i++ {
@@ -181,7 +182,7 @@ func testConcurrentOperations(t *testing.T, queue *AdaptiveSendQueue) {
 				msg := &proto.Message{MsgType: uint32(producerID*1000 + j)}
 				err := queue.Send(msg, j%10 == 0) // 10%高优先级
 				if err == nil {
-					totalSent++
+					totalSent.Add(1)
 				}
 			}
 		}(i)
@@ -199,7 +200,7 @@ func testConcurrentOperations(t *testing.T, queue *AdaptiveSendQueue) {
 				default:
 					_, ok := queue.Receive(ctx)
 					if ok {
-						totalReceived++
+						totalReceived.Add(1)
 					}
 				}
 			}
@@ -211,9 +212,9 @@ func testConcurrentOperations(t *testing.T, queue *AdaptiveSendQueue) {
 	cancel()
 	wg.Wait()
 
-	t.Logf("Concurrent test: sent %d, received %d", totalSent, totalReceived)
-	assert.Greater(t, totalSent, int64(0))
-	assert.Greater(t, totalReceived, int64(0))
+	t.Logf("Concurrent test: sent %d, received %d", totalSent.Load(), totalReceived.Load())
+	assert.Greater(t, totalSent.Load(), int64(0))
+	assert.Greater(t, totalReceived.Load(), int64(0))
 }
 
 func testPerformanceMonitoring(t *testing.T, node *ImprovedNode) {

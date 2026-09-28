@@ -7,7 +7,19 @@ import (
 )
 
 func (h *Handler) pushOffline(ctx *eventbus.PushContext) {
-	for _, e := range ctx.Events {
+	// 聚合 token 只在本地出队时展开，普通离线事件仍沿用原流程。
+	events := make([]*eventbus.Event, 0, len(ctx.Events))
+	for _, event := range ctx.Events {
+		if event.TakeOfflineEvents == nil {
+			events = append(events, event)
+			continue
+		}
+		events = append(events, event.TakeOfflineEvents()...)
+	}
+	if len(events) == 0 {
+		return
+	}
+	for _, e := range events {
 
 		for _, toUid := range e.OfflineUsers {
 			fromUid := e.Conn.Uid
@@ -18,5 +30,5 @@ func (h *Handler) pushOffline(ctx *eventbus.PushContext) {
 			}
 		}
 	}
-	service.Webhook.NotifyOfflineMsg(ctx.Events)
+	service.Webhook.NotifyOfflineMsg(events)
 }

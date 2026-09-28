@@ -22,8 +22,8 @@ func newWait() *wait {
 	return w
 }
 
-func (m *wait) waitApply(key string, maxIndex uint64) *progress {
-	return m.buckets[m.bucketIndex(key)].waitApply(key, maxIndex)
+func (m *wait) waitApply(key string, maxIndex uint64, appliedIndex ...func() uint64) *progress {
+	return m.buckets[m.bucketIndex(key)].waitApply(key, maxIndex, appliedIndex...)
 }
 
 func (m *wait) didApply(key string, maxLogIndex uint64) {
@@ -72,7 +72,7 @@ func newWaitBucket(i int) *waitBucket {
 	}
 }
 
-func (m *waitBucket) waitApply(key string, maxIndex uint64) *progress {
+func (m *waitBucket) waitApply(key string, maxIndex uint64, appliedIndex ...func() uint64) *progress {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	progress := m.progressPool.Get().(*progress)
@@ -81,6 +81,12 @@ func (m *waitBucket) waitApply(key string, maxIndex uint64) *progress {
 	progress.waitApplied = true
 	progress.done = false
 	progress.waitC = make(chan struct{}, 1)
+	// 在通知共用的锁内读取已发布进度，避免应用完成后才登记而漏掉通知。
+	if len(appliedIndex) > 0 && appliedIndex[0] != nil && appliedIndex[0]() >= maxIndex {
+		progress.done = true
+		progress.waitC <- struct{}{}
+		return progress
+	}
 	m.progresses = append(m.progresses, progress)
 	return progress
 

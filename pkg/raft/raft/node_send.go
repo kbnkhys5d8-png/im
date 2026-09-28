@@ -100,7 +100,7 @@ func (n *Node) sendTermResp(to uint64) {
 }
 
 func (n *Node) sendPing(to uint64) {
-	if !n.IsLeader() {
+	if n.cfg.Leader != n.opts.NodeId {
 		return
 	}
 	if to != All {

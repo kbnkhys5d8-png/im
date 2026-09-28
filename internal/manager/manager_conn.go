@@ -86,7 +86,10 @@ func (c *connBlucket) addConn(conn wknet.Conn) {
 func (c *connBlucket) removeConn(conn wknet.Conn) {
 	c.Lock()
 	defer c.Unlock()
-	delete(c.connMap, conn.ID())
+	// 同一 ConnId 被新 socket 复用时，迟到的旧关闭不能删除新连接。
+	if c.connMap[conn.ID()] == conn {
+		delete(c.connMap, conn.ID())
+	}
 }
 
 func (c *connBlucket) connCount() int {

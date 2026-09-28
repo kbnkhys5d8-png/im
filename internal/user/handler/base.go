@@ -192,8 +192,32 @@ func (h *Handler) onForwardUserEvent(m *proto.Message) {
 		// 替换成本地的连接
 		if e.Conn != nil {
 			conn := eventbus.User.ConnById(e.Conn.Uid, e.Conn.NodeId, e.Conn.ConnId)
-			if conn != nil {
-				e.Conn = conn
+			canInvalidate := e.Type == eventbus.EventOnSend && e.Conn.Auth &&
+				!e.Conn.Internal && e.Conn.SessionId != ""
+			unknownSession := canInvalidate && (conn == nil || !conn.SameSession(e.Conn))
+			if unknownSession {
+				// 转发认证状态只能使缓存失效；保留会话身份，由可信快照恢复目录。
+				eventbus.User.InvalidateConnRecovery(e.Conn)
+			}
+			if conn != nil && !unknownSession {
+				// 握手回执沿用原流程；写入、关闭和移除不能把旧会话替换成新会话。
+				switch e.Type {
+				case eventbus.EventConnack:
+					// 握手可改变密钥和协议版本，但不能跨真实连接代次。
+					if e.Conn.SessionId != conn.SessionId {
+						continue
+					}
+				case eventbus.EventConnWriteFrame, eventbus.EventConnClose, eventbus.EventConnRemove, eventbus.EventConnLeaderRemove:
+					if !e.Conn.SameSession(conn) {
+						continue
+					}
+				}
+				// 新握手必须保留接入节点的会话代次，不能继承复用连接号的旧目录和认证状态。
+				newConnectSession := e.Type == eventbus.EventConnect && e.Conn.SessionId != "" &&
+					e.Conn.SessionId != conn.SessionId
+				if !newConnectSession {
+					e.Conn = conn
+				}
 			}
 
 		}

@@ -29,7 +29,7 @@ func (h *Handler) processChannelPush(events []*eventbus.Event) {
 		}
 
 		fromUid := h.getDisplayFromUid(e.Conn.Uid)
-		toConns := eventbus.User.AuthedConnsByUid(e.ToUid)
+		toConns := h.onlinePushConns(e)
 		if len(toConns) == 0 {
 			continue
 		}
@@ -48,6 +48,36 @@ func (h *Handler) processChannelPush(events []*eventbus.Event) {
 		}
 
 	}
+}
+
+func (h *Handler) onlinePushConns(e *eventbus.Event) []*eventbus.Conn {
+	if e.ToConns == nil {
+		return eventbus.User.AuthedConnsByUid(e.ToUid)
+	}
+	// 显式目标只与当前已认证目录取交集；空集合不能回退成全量推送。
+	selected := make([]*eventbus.Conn, 0, len(e.ToConns))
+	if len(e.ToConns) == 0 {
+		return selected
+	}
+	for _, current := range eventbus.User.AuthedConnsByUid(e.ToUid) {
+		if current == nil {
+			continue
+		}
+		if !current.Auth || current.Uid != e.ToUid {
+			continue
+		}
+		for _, target := range e.ToConns {
+			if target == nil || !target.Auth {
+				continue
+			}
+			if target.Uid == e.ToUid && current.SameSession(target) {
+				// 使用当前目录指针，每个会话最多选一次，旧代次不得命中复用的连接。
+				selected = append(selected, current)
+				break
+			}
+		}
+	}
+	return selected
 }
 
 // shouldProcessEvent 检查事件是否应该被处理
@@ -300,8 +330,8 @@ func (h *Handler) getAIPluginNo(uid string) (string, error) {
 func encryptMessagePayload(payload []byte, conn *eventbus.Conn) ([]byte, error) {
 	aesKey, aesIV := conn.AesKey, conn.AesIV
 
-	// 加密payload
-	payloadEnc, err := wkutil.AesEncryptPkcs7Base64(payload, aesKey, aesIV)
+	// 限制容量，让 PKCS7 填充使用独立缓冲区，避免并行推送改写共享消息。
+	payloadEnc, err := wkutil.AesEncryptPkcs7Base64(payload[:len(payload):len(payload)], aesKey, aesIV)
 	if err != nil {
 		return nil, err
 	}

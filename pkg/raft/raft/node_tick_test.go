@@ -26,6 +26,45 @@ func TestTick_AutoDestroy_Timeout_DestoryEvent(t *testing.T) {
 	assert.True(t, ok)
 }
 
+func TestTickKeepAliveRestartsIdleTimeout(t *testing.T) {
+	n := NewNode(0, types.RaftState{}, NewOptions(
+		WithNodeId(1), WithReplicas([]uint64{1}),
+		WithElectionOn(false), WithAdvance(func() {}), WithKey("keepalive-timeout"),
+		WithAutoDestory(true), WithDestoryAfterIdleTick(5),
+	))
+	clearEvents(n)
+	checkTicks := func(ticks, wantDestroys int) {
+		t.Helper()
+		tickN(n, ticks)
+		if got := countEvents(collectEvents(n), types.Destory); got != wantDestroys {
+			t.Fatalf("执行 %d 次时钟后销毁事件数 = %d, want %d", ticks, got, wantDestroys)
+		}
+	}
+	checkTicks(5, 0)
+	n.KeepAlive()
+	// 保活即时清零，仍需严格超过原阈值才能销毁。
+	checkTicks(5, 0)
+	checkTicks(1, 1)
+	// 销毁事件发出后也沿用原来的清零规则。
+	checkTicks(5, 0)
+	checkTicks(1, 1)
+}
+
+func TestTickAutoDestroyDisabled(t *testing.T) {
+	n := NewNode(0, types.RaftState{}, NewOptions(
+		WithNodeId(1), WithReplicas([]uint64{1}),
+		WithElectionOn(false), WithAdvance(func() {}), WithKey("keepalive-disabled"),
+		WithAutoDestory(false), WithDestoryAfterIdleTick(5),
+	))
+	clearEvents(n)
+	tickN(n, 20)
+	n.KeepAlive()
+	tickN(n, 20)
+	if got := countEvents(collectEvents(n), types.Destory); got != 0 {
+		t.Fatalf("未启用自动销毁时产生 %d 个销毁事件", got)
+	}
+}
+
 func TestTick_Follower_ElectionTimeout_Campaign(t *testing.T) {
 	opts := NewOptions(
 		WithNodeId(1),

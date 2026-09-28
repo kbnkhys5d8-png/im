@@ -15,15 +15,34 @@ type Tag struct {
 	Nodes       []*Node `json:"nodes"`
 	// 创建时间
 	CreatedAt time.Time `json:"created_at"`
-	// 最后一次获取时间
-	LastGetTime time.Time     `json:"last_get_time"`
+	// 最后一次获取时间，消息读取、过期清理及管理接口须原子读写。
+	LastGetTime tagAccessTime `json:"last_get_time"`
 	NodeVersion uint64        `json:"node_version"` // 生成tag时的当前节点版本号，如果当前节点版本号大于生成tag时的节点版本号，则tag失效
 	GetCount    atomic.Uint64 `json:"get_count"`    // 获取次数
 }
 
+// tagAccessTime 保留 time.Time 的 JSON 格式及单调时钟信息，不暴露原子容器的内部表示。
+type tagAccessTime struct {
+	atomic.Time
+}
+
+func (t *tagAccessTime) MarshalJSON() ([]byte, error) {
+	return t.Load().MarshalJSON()
+}
+
+func (t *tagAccessTime) UnmarshalJSON(data []byte) error {
+	if string(data) == "null" {
+		return nil
+	}
+	value := t.Load()
+	err := value.UnmarshalJSON(data)
+	t.Store(value)
+	return err
+}
+
 func (t *Tag) String() string {
 
-	return fmt.Sprintf("Tag{Key:%s, Nodes:%v, LastGetTime:%v}", t.Key, t.Nodes, t.LastGetTime)
+	return fmt.Sprintf("Tag{Key:%s, Nodes:%v, LastGetTime:%v}", t.Key, t.Nodes, t.LastGetTime.Load())
 }
 
 type Node struct {

@@ -184,13 +184,14 @@ func newTagResp(tag *types.Tag) *tagResp {
 		createdAtFormat = wkutil.ToyyyyMMddHHmm(tag.CreatedAt)
 	}
 
+	lastGetTime := tag.LastGetTime.Load()
 	var expireAt string
-	if !tag.LastGetTime.IsZero() {
-		expireAt = wkutil.ToyyyyMMddHHmm(tag.LastGetTime.Add(options.G.Tag.Expire))
+	if !lastGetTime.IsZero() {
+		expireAt = wkutil.ToyyyyMMddHHmm(lastGetTime.Add(options.G.Tag.Expire))
 	}
 	var lastGetAt string
-	if !tag.LastGetTime.IsZero() {
-		lastGetAt = wkutil.ToyyyyMMddHHmm(tag.LastGetTime)
+	if !lastGetTime.IsZero() {
+		lastGetAt = wkutil.ToyyyyMMddHHmm(lastGetTime)
 	}
 
 	return &tagResp{

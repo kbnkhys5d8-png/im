@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"sync"
 
 	"github.com/WuKongIM/WuKongIM/internal/common"
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
@@ -15,8 +16,11 @@ import (
 
 type Handler struct {
 	wklog.Log
-	client        *ingress.Client
-	commonService *common.Service
+	client          *ingress.Client
+	commonService   *common.Service
+	deliveryMu      sync.Mutex
+	deliveryQueue   *deliveryQueue
+	deliveryStopped bool
 }
 
 func NewHandler() *Handler {
@@ -37,6 +41,8 @@ func (h *Handler) routes() {
 	eventbus.RegisterChannelHandlers(eventbus.EventChannelWebhook, h.webhook)
 	// 分发消息
 	eventbus.RegisterChannelHandlers(eventbus.EventChannelDistribute, h.distribute)
+	// 首次分发只入可重试队列，不能走普通的单向跨节点转发。
+	eventbus.RegisterChannelHandlers(eventbus.EventChannelDistributeInitial, h.distributeInitial)
 
 }
 
@@ -67,7 +73,8 @@ func (h *Handler) OnEvent(ctx *eventbus.ChannelContext) {
 func (h *Handler) notForwardToLeader(eventType eventbus.EventType) bool {
 	switch eventType {
 	case eventbus.EventChannelWebhook,
-		eventbus.EventChannelDistribute:
+		eventbus.EventChannelDistribute,
+		eventbus.EventChannelDistributeInitial:
 		return true
 	}
 	return false

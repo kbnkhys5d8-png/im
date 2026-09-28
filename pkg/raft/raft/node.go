@@ -2,7 +2,9 @@ package raft
 
 import (
 	"fmt"
+	"slices"
 	"sync"
+	"sync/atomic"
 
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
@@ -25,6 +27,8 @@ type syncState struct {
 // }
 
 type Node struct {
+	// 可变状态由事件循环独占，外部查询只读取事件处理完成后发布的快照。
+	readState   atomic.Pointer[nodeReadState]
 	events      []types.Event
 	opts        *Options
 	syncElapsed int // 同步计数
@@ -46,10 +50,76 @@ type Node struct {
 
 	suspend bool // 挂起
 
-	idleTick int // 服务空闲计数
+	// 外部提案可并发保活，空闲计数不能仅依赖事件循环独占。
+	idleTick atomic.Int64
 
 	syncing             bool // 正在同步
 	syncRespTimeoutTick int  // 同步响应超时计数
+}
+
+type nodeReadState struct {
+	cfg             types.Config
+	lastLogIndex    uint64
+	lastLogTerm     uint32
+	committedIndex  uint64
+	appliedIndex    uint64
+	replicaLogIndex map[uint64]uint64
+}
+
+func (n *Node) publishReadState() {
+	previous := n.readState.Load()
+	sameConfig, sameReplicas := false, false
+	if previous != nil {
+		cfg := previous.cfg
+		sameConfig = cfg.MigrateFrom == n.cfg.MigrateFrom && cfg.MigrateTo == n.cfg.MigrateTo &&
+			cfg.Role == n.cfg.Role && cfg.Term == n.cfg.Term && cfg.Version == n.cfg.Version &&
+			cfg.Leader == n.cfg.Leader && slices.Equal(cfg.Replicas, n.cfg.Replicas) &&
+			slices.Equal(cfg.Learners, n.cfg.Learners)
+		sameReplicas = len(previous.replicaLogIndex) == len(n.replicaSync)
+		if sameReplicas {
+			for id, info := range n.replicaSync {
+				var index uint64
+				if info != nil && info.LastSyncIndex > 0 {
+					index = info.LastSyncIndex - 1
+				}
+				if oldIndex, ok := previous.replicaLogIndex[id]; !ok || oldIndex != index {
+					sameReplicas = false
+					break
+				}
+			}
+		}
+		// 时钟计数等内部状态变化不需要重新分配对外快照。
+		if sameConfig && sameReplicas && previous.lastLogIndex == n.queue.lastLogIndex &&
+			previous.lastLogTerm == n.lastTermStartIndex.Term &&
+			previous.committedIndex == n.queue.committedIndex && previous.appliedIndex == n.queue.appliedIndex {
+			return
+		}
+	}
+	state := &nodeReadState{
+		lastLogIndex:   n.queue.lastLogIndex,
+		lastLogTerm:    n.lastTermStartIndex.Term,
+		committedIndex: n.queue.committedIndex,
+		appliedIndex:   n.queue.appliedIndex,
+	}
+	// 未变化的配置与副本进度保持不可变，可在新快照中安全复用。
+	if sameConfig {
+		state.cfg = previous.cfg
+	} else {
+		state.cfg = n.cfg.Clone()
+	}
+	if sameReplicas {
+		state.replicaLogIndex = previous.replicaLogIndex
+	} else {
+		state.replicaLogIndex = make(map[uint64]uint64, len(n.replicaSync))
+		for id, info := range n.replicaSync {
+			var index uint64
+			if info != nil && info.LastSyncIndex > 0 {
+				index = info.LastSyncIndex - 1
+			}
+			state.replicaLogIndex[id] = index
+		}
+	}
+	n.readState.Store(state)
 }
 
 func NewNode(lastTermStartLogIndex uint64, raftState types.RaftState, opts *Options) *Node {
@@ -98,6 +168,7 @@ func NewNode(lastTermStartLogIndex uint64, raftState types.RaftState, opts *Opti
 		}
 	}
 
+	n.publishReadState()
 	return n
 }
 
@@ -107,17 +178,17 @@ func (n *Node) Key() string {
 
 // LastLogIndex 获取最后一条日志下标
 func (n *Node) LastLogIndex() uint64 {
-	return n.queue.lastLogIndex
+	return n.readState.Load().lastLogIndex
 }
 
 // LastLogTerm 获取最后一条日志任期
 func (n *Node) LastLogTerm() uint32 {
-	return n.lastTermStartIndex.Term
+	return n.readState.Load().lastLogTerm
 }
 
 // LastTerm 当前领导任期
 func (n *Node) LastTerm() uint32 {
-	return n.cfg.Term
+	return n.readState.Load().cfg.Term
 }
 
 // HasReady 是否有待处理的事件
@@ -138,6 +209,7 @@ func (n *Node) Suspend() bool {
 
 // Ready 获取待处理的事件
 func (n *Node) Ready() []types.Event {
+	defer n.publishReadState()
 
 	if n.queue.hasNextStoreLogs() {
 		logs := n.queue.nextStoreLogs(0)
@@ -170,15 +242,15 @@ func (n *Node) Ready() []types.Event {
 }
 
 func (n *Node) LeaderId() uint64 {
-	return n.cfg.Leader
+	return n.readState.Load().cfg.Leader
 }
 
 func (n *Node) Config() types.Config {
-	return n.cfg
+	return n.readState.Load().cfg.Clone()
 }
 
 func (n *Node) IsLeader() bool {
-	return n.cfg.Leader == n.opts.NodeId
+	return n.LeaderId() == n.opts.NodeId
 }
 
 func (n *Node) isLearner(nodeId uint64) bool {
@@ -194,11 +266,11 @@ func (n *Node) isLearner(nodeId uint64) bool {
 }
 
 func (n *Node) CommittedIndex() uint64 {
-	return n.queue.committedIndex
+	return n.readState.Load().committedIndex
 }
 
 func (n *Node) AppliedIndex() uint64 {
-	return n.queue.appliedIndex
+	return n.readState.Load().appliedIndex
 }
 
 func (n *Node) NodeId() uint64 {
@@ -207,18 +279,15 @@ func (n *Node) NodeId() uint64 {
 
 // 获取某个副本的最新日志下标（领导节点才有这个信息）
 func (n *Node) GetReplicaLastLogIndex(replicaId uint64) uint64 {
+	state := n.readState.Load()
 	if replicaId == n.opts.NodeId {
-		return n.LastLogIndex()
+		return state.lastLogIndex
 	}
-	syncInfo := n.replicaSync[replicaId]
-	if syncInfo != nil && syncInfo.LastSyncIndex > 0 {
-		return syncInfo.LastSyncIndex - 1
-	}
-	return 0
+	return state.replicaLogIndex[replicaId]
 }
 
 func (n *Node) KeepAlive() {
-	n.idleTick = 0
+	n.idleTick.Store(0)
 }
 func (n *Node) advance() {
 	if n.opts.Advance != nil {

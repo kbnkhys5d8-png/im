@@ -63,13 +63,32 @@ func (s *Server) Step(event types.Event) {
 
 }
 
+func (s *Server) stopping() bool {
+	select {
+	case <-s.stopper.ShouldStop():
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *Server) loopEvent() {
 	tk := time.NewTicker(time.Millisecond * 200)
 	defer tk.Stop()
 	for {
+		// 停机时先退出，不再启动下一轮配置事件。
+		if s.stopping() {
+			return
+		}
 		s.handleEvents()
+		if s.stopping() {
+			return
+		}
 		select {
 		case <-tk.C:
+			if s.stopping() {
+				return
+			}
 			s.tick()
 		case <-s.advanceC:
 		case <-s.stopper.ShouldStop():
@@ -119,8 +138,15 @@ func (s *Server) handleEvents() {
 }
 
 func (s *Server) tick() {
+	if s.stopping() {
+		return
+	}
 	if s.cfgServer.IsLeader() {
 		for _, node := range s.cfgServer.Nodes() {
+			// 一笔上下线及其槽调整保持原流程；停机后不处理下一个节点。
+			if s.stopping() {
+				return
+			}
 			if node.Id == s.cfgOptions.NodeId {
 				continue
 			}

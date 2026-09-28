@@ -5,6 +5,8 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -12,19 +14,43 @@ import (
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
-var logger *zap.Logger      // info日志
-var traceLogger *zap.Logger // 轨迹日志
-var errorLogger *zap.Logger // 错误日志
-var warnLogger *zap.Logger  // 警告日志
-var panicLogger *zap.Logger // panic日志
-var focusLogger *zap.Logger // focus日志
-var atom = zap.NewAtomicLevel()
+// 日志实例与配置整体发布，发布后只读，避免并发调用看到初始化到一半的状态。
+type loggerState struct {
+	logger      *zap.Logger
+	traceLogger *zap.Logger
+	errorLogger *zap.Logger
+	warnLogger  *zap.Logger
+	panicLogger *zap.Logger
+	focusLogger *zap.Logger
+	opts        Options
+}
 
-var opts *Options
+var activeLoggers atomic.Pointer[loggerState]
+var configureMu sync.Mutex
 
 func Configure(op *Options) {
-	atom.SetLevel(op.Level)
-	opts = op
+	configureMu.Lock()
+	defer configureMu.Unlock()
+	configureLocked(op)
+}
+
+func currentLoggers() *loggerState {
+	if state := activeLoggers.Load(); state != nil {
+		return state
+	}
+	configureMu.Lock()
+	defer configureMu.Unlock()
+	// 与显式配置共用锁并再次检查，默认初始化不能覆盖已生效的业务配置。
+	if activeLoggers.Load() == nil {
+		configureLocked(NewOptions())
+	}
+	return activeLoggers.Load()
+}
+
+func configureLocked(op *Options) {
+	state := &loggerState{opts: *op}
+	opts := &state.opts
+	atom := zap.NewAtomicLevelAt(opts.Level)
 
 	loggerOpts := make([]zap.Option, 0)
 	if opts.LineNum {
@@ -48,7 +74,7 @@ func Configure(op *Options) {
 		zapcore.NewMultiWriteSyncer(append(writers, zapcore.AddSync(infoWriter))...),
 		atom,
 	)
-	logger = zap.New(core, loggerOpts...)
+	state.logger = zap.New(core, loggerOpts...)
 
 	// ====================== trace ==========================
 	traceWriter := zapcore.AddSync(&lumberjack.Logger{
@@ -62,7 +88,7 @@ func Configure(op *Options) {
 		zapcore.NewMultiWriteSyncer(append(writers, zapcore.AddSync(traceWriter))...),
 		atom,
 	)
-	traceLogger = zap.New(core, loggerOpts...)
+	state.traceLogger = zap.New(core, loggerOpts...)
 
 	// ====================== error ==========================
 	errorWriter := zapcore.AddSync(&lumberjack.Logger{
@@ -76,7 +102,7 @@ func Configure(op *Options) {
 		zapcore.NewMultiWriteSyncer(append(writers, zapcore.AddSync(errorWriter))...),
 		zap.ErrorLevel,
 	)
-	errorLogger = zap.New(core, loggerOpts...)
+	state.errorLogger = zap.New(core, loggerOpts...)
 
 	// ====================== warn ==========================
 	warnWriter := zapcore.AddSync(&lumberjack.Logger{
@@ -90,7 +116,7 @@ func Configure(op *Options) {
 		zapcore.NewMultiWriteSyncer(append(writers, zapcore.AddSync(warnWriter))...),
 		zap.WarnLevel,
 	)
-	warnLogger = zap.New(core, loggerOpts...)
+	state.warnLogger = zap.New(core, loggerOpts...)
 
 	// ====================== panic ==========================
 	panicWriter := zapcore.AddSync(&lumberjack.Logger{
@@ -104,7 +130,7 @@ func Configure(op *Options) {
 		zapcore.NewMultiWriteSyncer(append(writers, zapcore.AddSync(panicWriter))...),
 		zap.PanicLevel,
 	)
-	panicLogger = zap.New(core, append(loggerOpts, zap.AddStacktrace(zapcore.PanicLevel))...)
+	state.panicLogger = zap.New(core, append(loggerOpts, zap.AddStacktrace(zapcore.PanicLevel))...)
 
 	// ====================== focus ==========================
 	focusWriter := zapcore.AddSync(&lumberjack.Logger{
@@ -118,13 +144,14 @@ func Configure(op *Options) {
 		zapcore.NewMultiWriteSyncer(append(writers, zapcore.AddSync(focusWriter))...),
 		zap.InfoLevel,
 	)
-	focusLogger = zap.New(core, loggerOpts...)
+	state.focusLogger = zap.New(core, loggerOpts...)
+	activeLoggers.Store(state)
 
 }
 
 func Level() zapcore.Level {
 
-	return opts.Level
+	return currentLoggers().opts.Level
 }
 
 func newEncoderConfig() zapcore.EncoderConfig {
@@ -156,89 +183,66 @@ func newEncoderConfig() zapcore.EncoderConfig {
 // Info Info
 func Info(msg string, fields ...zap.Field) {
 
-	if logger == nil {
-		Configure(NewOptions())
-	}
-	logger.Info(msg, fields...)
+	currentLoggers().logger.Info(msg, fields...)
 
 }
 
 // Trace Trace
 func Trace(msg string, fields ...zap.Field) {
 
-	if traceLogger == nil {
-		Configure(NewOptions())
-	}
-	traceLogger.Info(msg, fields...)
+	currentLoggers().traceLogger.Info(msg, fields...)
 
 }
 
 // Debug Debug
 func Debug(msg string, fields ...zap.Field) {
 
-	if logger == nil {
-		Configure(NewOptions())
-	}
-	logger.Debug(msg, fields...)
+	currentLoggers().logger.Debug(msg, fields...)
 
 }
 
 // Error Error
 func Error(msg string, fields ...zap.Field) {
 
-	if errorLogger == nil {
-		Configure(NewOptions())
-	}
-	errorLogger.Error(msg, fields...)
+	currentLoggers().errorLogger.Error(msg, fields...)
 
 }
 
 func Fatal(msg string, fields ...zap.Field) {
 
-	if panicLogger == nil {
-		Configure(NewOptions())
-	}
-	panicLogger.Fatal(msg, fields...)
+	currentLoggers().panicLogger.Fatal(msg, fields...)
 }
 func Panic(msg string, fields ...zap.Field) {
 
-	if panicLogger == nil {
-		Configure(NewOptions())
-	}
-	panicLogger.Panic(msg, fields...)
+	currentLoggers().panicLogger.Panic(msg, fields...)
 }
 
 // Warn Warn
 func Warn(msg string, fields ...zap.Field) {
 
-	if warnLogger == nil {
-		Configure(NewOptions())
-	}
-	warnLogger.Warn(msg, fields...)
+	currentLoggers().warnLogger.Warn(msg, fields...)
 }
 
 func Foucs(msg string, fields ...zap.Field) {
 
-	if focusLogger == nil {
-		Configure(NewOptions())
-	}
-	focusLogger.Info(msg, fields...)
+	currentLoggers().focusLogger.Info(msg, fields...)
 }
 
 func Sync() error {
-	err := panicLogger.Sync()
+	state := currentLoggers()
+	err := state.panicLogger.Sync()
 	if err != nil {
 		fmt.Println("panicLogger sync error", err)
 	}
-	err = errorLogger.Sync()
+	err = state.errorLogger.Sync()
 	if err != nil {
 		fmt.Println("errorLogger sync error", err)
 	}
-	err = warnLogger.Sync()
+	err = state.warnLogger.Sync()
 	if err != nil {
 		fmt.Println("warnLogger sync error", err)
 	}
-	err = logger.Sync()
+	err = state.logger.Sync()
 	if err != nil {
 		fmt.Println("logger sync error", err)
 	}
@@ -281,7 +285,8 @@ func (t *WKLog) Info(msg string, fields ...zap.Field) {
 
 // Trace Trace
 func (t *WKLog) Trace(msg string, action string, fields ...zap.Field) {
-	if !opts.TraceOn {
+	state := currentLoggers()
+	if !state.opts.TraceOn {
 		return
 	}
 
@@ -291,16 +296,17 @@ func (t *WKLog) Trace(msg string, action string, fields ...zap.Field) {
 	b.WriteString("】")
 	b.WriteString(msg)
 	if len(fields) == 0 {
-		Trace(b.String(), zap.Int("trace", 1), zap.String("action", action))
+		state.trace(b.String(), zap.Int("trace", 1), zap.String("action", action))
 	} else {
 		fields = append(fields, zap.Int("trace", 1), zap.String("action", action))
-		Trace(b.String(), fields...)
+		state.trace(b.String(), fields...)
 	}
 }
 
 func (t *WKLog) MessageTrace(msg string, no string, action string, fields ...zap.Field) {
 
-	if !opts.TraceOn {
+	state := currentLoggers()
+	if !state.opts.TraceOn {
 		return
 	}
 
@@ -310,12 +316,17 @@ func (t *WKLog) MessageTrace(msg string, no string, action string, fields ...zap
 	b.WriteString("】")
 	b.WriteString(msg)
 	if len(fields) == 0 {
-		Trace(b.String(), zap.Int("trace", 1), zap.String("no", no), zap.String("action", action))
+		state.trace(b.String(), zap.Int("trace", 1), zap.String("no", no), zap.String("action", action))
 	} else {
 		fields = append(fields, zap.Int("trace", 1), zap.String("no", no), zap.String("action", action))
-		Trace(b.String(), fields...)
+		state.trace(b.String(), fields...)
 	}
 
+}
+
+// 保持原包级 Trace 的调用深度，且开关检查与写入使用同一份配置快照。
+func (s *loggerState) trace(msg string, fields ...zap.Field) {
+	s.traceLogger.Info(msg, fields...)
 }
 
 // Debug Debug

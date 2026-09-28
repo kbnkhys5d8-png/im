@@ -1156,6 +1156,11 @@ func (m *message) sendEvent(req *eventAppendReq, fakeChannelID string, eventKey 
 		Timestamp: req.OccurredAt,
 		Data:      data,
 	}
+	distributionType := eventbus.EventChannelDistributeInitial
+	if options.G.IsOnlineCmdChannel(fakeChannelID) {
+		// 显式在线订阅者仍沿用原有内存标签路径，不纳入普通频道交接。
+		distributionType = eventbus.EventChannelDistribute
+	}
 
 	eventbus.Channel.SendMessage(fakeChannelID, req.ChannelType, &eventbus.Event{
 		Conn: &eventbus.Conn{
@@ -1163,7 +1168,7 @@ func (m *message) sendEvent(req *eventAppendReq, fakeChannelID string, eventKey 
 			DeviceId: options.G.SystemDeviceId,
 			Internal: true,
 		},
-		Type:      eventbus.EventChannelDistribute,
+		Type:      distributionType,
 		Frame:     event,
 		MessageId: messageId,
 	})

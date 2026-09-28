@@ -71,17 +71,21 @@ func (r *Raft) ProposeBatchUntilAppliedTimeout(ctx context.Context, reqs []types
 			return nil, err
 		}
 		maxLogIndex := resps[len(resps)-1].Index
-		// 如果最大的日志下标大于已应用的日志下标，则不需要等待
-		if r.node.queue.appliedIndex >= maxLogIndex {
-			needWait = false
-		}
-		if needWait {
-			applyProcess = r.wait.waitApply(maxLogIndex)
+		err = r.withNode(ctx, func() error {
+			// 检查应用进度和注册等待必须与 ApplyResp 串行，防止丢失通知。
+			needWait = r.node.queue.appliedIndex < maxLogIndex
+			if needWait {
+				applyProcess = r.wait.waitApply(maxLogIndex)
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
 		}
 	} else {
 		resps, err = r.proposeBatch(ctx, reqs, func(logs []types.Log) {
 			maxLogIndex := logs[len(logs)-1].Index
-			// 如果最大的日志下标大于已应用的日志下标，则不需要等待
+			// 当前日志已经应用时，无需再次注册等待。
 			if r.node.queue.appliedIndex >= maxLogIndex {
 				needWait = false
 			}
@@ -110,41 +114,40 @@ func (r *Raft) ProposeBatchUntilAppliedTimeout(ctx context.Context, reqs []types
 }
 
 func (r *Raft) proposeBatch(ctx context.Context, reqs types.ProposeReqSet, stepBefore func(logs []types.Log)) ([]*types.ProposeResp, error) {
-
-	r.node.Lock()
-	defer r.node.Unlock()
-	lastLogIndex := r.node.queue.lastLogIndex
-	logs := make([]types.Log, 0, len(reqs))
+	if r.pause.Load() {
+		return nil, types.ErrPaused
+	}
+	logs := make([]types.Log, len(reqs))
 	for i, req := range reqs {
-		logIndex := lastLogIndex + 1 + uint64(i)
-		logs = append(logs, types.Log{
-			Id:    req.Id,
-			Term:  r.node.cfg.Term,
-			Index: logIndex,
-			Data:  req.Data,
-		})
+		logs[i] = types.Log{Id: req.Id, Data: req.Data}
 	}
-
-	if stepBefore != nil {
-		stepBefore(logs)
-	}
-
-	err := r.StepWait(ctx, types.Event{
-		Type: types.Propose,
-		Logs: logs,
+	var resps []*types.ProposeResp
+	err := r.withNode(ctx, func() error {
+		if r.pause.Load() {
+			return types.ErrPaused
+		}
+		// 在事件循环内分配下标和任期，避免与追加日志、角色切换并发。
+		lastLogIndex := r.node.queue.lastLogIndex
+		for i := range logs {
+			logs[i].Term = r.node.cfg.Term
+			logs[i].Index = lastLogIndex + 1 + uint64(i)
+		}
+		if stepBefore != nil {
+			stepBefore(logs)
+		}
+		if err := r.step(types.Event{Type: types.Propose, Logs: logs}); err != nil {
+			return err
+		}
+		resps = make([]*types.ProposeResp, 0, len(logs))
+		for _, log := range logs {
+			resps = append(resps, &types.ProposeResp{Id: log.Id, Index: log.Index})
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	resps := make([]*types.ProposeResp, 0, len(reqs))
-	for i, req := range reqs {
-		logIndex := lastLogIndex + 1 + uint64(i)
-		resps = append(resps, &types.ProposeResp{
-			Id:    req.Id,
-			Index: logIndex,
-		})
-	}
 	return resps, nil
 }
 

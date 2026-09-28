@@ -2,8 +2,10 @@ package cluster
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"testing"
 
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/channel"
@@ -128,10 +130,18 @@ func newSearchOutboxRecoveryServer(
 		clusterconfig.WithSlotCount(1),
 		clusterconfig.WithConfigPath(t.TempDir()+"/cluster.json"),
 	)
+	// 通过配置文件初始化测试状态，不修改 getter 返回的快照。
+	configData, err := json.Marshal(&clustertypes.Config{
+		SlotCount: 1,
+		Slots:     []*clustertypes.Slot{{Id: 0, Leader: 1, Replicas: []uint64{1}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configOptions.ConfigPath, configData, 0600); err != nil {
+		t.Fatal(err)
+	}
 	configServer := clusterconfig.New(configOptions)
-	configServer.GetClusterConfig().Slots = []*clustertypes.Slot{{
-		Id: 0, Leader: 1, Replicas: []uint64{1},
-	}}
 	channelServer := channel.NewServer(channel.NewOptions(
 		channel.WithNodeId(1),
 		channel.WithGroupCount(1),

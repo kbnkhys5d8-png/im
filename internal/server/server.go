@@ -25,6 +25,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/service"
 	userevent "github.com/WuKongIM/WuKongIM/internal/user/event"
 	userhandler "github.com/WuKongIM/WuKongIM/internal/user/handler"
+	"github.com/WuKongIM/WuKongIM/internal/user/recovery"
 	"github.com/WuKongIM/WuKongIM/internal/webhook"
 	cluster "github.com/WuKongIM/WuKongIM/pkg/cluster/cluster"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/clusterconfig"
@@ -73,6 +74,7 @@ type Server struct {
 	// 用户事件池
 	userHandler   *userhandler.Handler
 	userEventPool *userevent.EventPool
+	connRecovery  *recovery.Recovery
 
 	// 频道事件池
 	channelHandler   *channelhandler.Handler
@@ -223,6 +225,8 @@ func New(opts *options.Options) *Server {
 	s.clusterServer = clusterServer
 
 	service.Store = clusterServer.GetStore()
+	s.connRecovery = recovery.New(s.opts.Cluster.NodeId, clusterServer, eventbus.User, service.ConnManager)
+	service.ConnRecovery = s.connRecovery
 
 	clusterServer.OnMessage(func(fromNodeId uint64, msg *proto.Message) {
 		s.handleClusterMessage(fromNodeId, msg)
@@ -275,6 +279,8 @@ func (s *Server) Start() error {
 	}
 
 	s.ingress.SetRoutes()
+	s.connRecovery.SetRoutes()
+	s.channelHandler.SetRoutes()
 
 	// 重试管理
 	if err = s.retryManager.Start(); err != nil {
@@ -367,6 +373,9 @@ func (s *Server) Stop() error {
 	s.cancel()
 
 	s.pluginServer.Stop()
+
+	// 先取消进程内补投，避免其在用户事件池关闭后继续写入事件。
+	s.channelHandler.Stop()
 
 	s.userEventPool.Stop()
 

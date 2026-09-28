@@ -94,10 +94,10 @@ func (t *TagManager) MakeTagNotCacheWithTagKey(tagKey string, uids []string) (*t
 	nw := time.Now()
 	tag := &types.Tag{
 		Key:         tagKey,
-		LastGetTime: nw,
 		NodeVersion: t.nodeVersion(),
 		CreatedAt:   nw,
 	}
+	tag.LastGetTime.Store(nw)
 
 	nodes, err := t.calcUsersInNode(uids)
 	if err != nil {
@@ -244,7 +244,7 @@ func (t *TagManager) Get(tagKey string) *types.Tag {
 		return nil
 	}
 	if active {
-		tag.LastGetTime = time.Now()
+		tag.LastGetTime.Store(time.Now())
 	}
 	tag.GetCount.Inc()
 	return tag
@@ -263,7 +263,7 @@ func (t *TagManager) RenameTag(oldTagKey, newTagKey string) error {
 		return errors.TagNotExist(oldTagKey)
 	}
 	tag.Key = newTagKey
-	tag.LastGetTime = time.Now()
+	tag.LastGetTime.Store(time.Now())
 	t.removeRetiredTag(oldTagKey)
 	t.removeRetiredTag(newTagKey)
 	t.setTag(tag)

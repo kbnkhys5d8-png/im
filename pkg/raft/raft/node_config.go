@@ -25,14 +25,31 @@ func (n *Node) switchConfig(newCfg types.Config) error {
 		newCfg.Term = oldCfg.Term
 	}
 
+	if newCfg.Role == types.RoleUnknown {
+		// 仅更新成员时保留当前选举结果，学习者转副本时同步更新本地角色。
+		newCfg.Role = oldCfg.Role
+		if newCfg.Leader == 0 && wkutil.ArrayContainsUint64(newCfg.Replicas, oldCfg.Leader) {
+			newCfg.Leader = oldCfg.Leader
+		}
+		if wkutil.ArrayContainsUint64(newCfg.Learners, n.opts.NodeId) {
+			newCfg.Role = types.RoleLearner
+		} else if oldCfg.Role == types.RoleLearner && wkutil.ArrayContainsUint64(newCfg.Replicas, n.opts.NodeId) {
+			newCfg.Role = types.RoleFollower
+		} else if oldCfg.Role == types.RoleLeader && newCfg.Leader != n.opts.NodeId {
+			// 已移除自身或显式指定其他领导时，不再沿用旧领导角色。
+			newCfg.Role = types.RoleFollower
+		}
+	}
+
 	n.votes = make(map[uint64]bool)
 	n.replicaSync = make(map[uint64]*SyncInfo)
 	n.resetRandomizedElectionTimeout()
 
+	// 先安装成员配置，避免覆盖角色转换后写入的角色和领导者。
+	n.cfg = newCfg
+
 	// 比较角色是否发生变化
 	n.roleChangeIfNeed(oldCfg, newCfg)
-
-	n.cfg = newCfg
 
 	return nil
 }

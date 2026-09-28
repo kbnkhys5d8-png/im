@@ -119,7 +119,15 @@ func (c *Config) nodes() []*types.Node {
 func (c *Config) slots() []*types.Slot {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.cfg.Slots
+	// 调用方会在锁外读取槽及其副本列表，必须一起复制。
+	if c.cfg.Slots == nil {
+		return nil
+	}
+	slots := make([]*types.Slot, len(c.cfg.Slots))
+	for i, slot := range c.cfg.Slots {
+		slots[i] = slot.Clone()
+	}
+	return slots
 }
 
 // 判断是否有slot
@@ -295,7 +303,11 @@ func (c *Config) updateNodeStatus(nodeId uint64, status types.NodeStatus) {
 func (c *Config) config() *types.Config {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.cfg
+	if c.cfg == nil {
+		return nil
+	}
+	// 在读锁内生成完整快照，避免返回后与配置应用共享可变字段。
+	return c.cfg.Clone()
 }
 
 // 获取slot数量
@@ -418,7 +430,7 @@ func (c *Config) node(id uint64) *types.Node {
 	defer c.mu.RUnlock()
 	for _, n := range c.cfg.Nodes {
 		if n.Id == id {
-			return n
+			return n.Clone()
 		}
 	}
 	return nil

@@ -1,6 +1,8 @@
 package eventbus
 
 import (
+	"errors"
+
 	"github.com/WuKongIM/WuKongIM/internal/options"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 )
@@ -11,6 +13,17 @@ func RegisterUser(user IUser) {
 }
 
 var User *userPlus
+
+var ErrConnRecoveryUnsupported = errors.New("user connection recovery unsupported")
+
+// IConnRecovery 是可选的连接恢复能力，不改变现有 IUser 合同。
+type IConnRecovery interface {
+	BeginConnRecovery(uid string, version uint64) (apply func([]*Conn) bool, needed bool)
+}
+
+type IConnRecoveryInvalidator interface {
+	InvalidateConnRecovery(conn *Conn) bool
+}
 
 type IUser interface {
 	// AddEvent 添加事件
@@ -73,6 +86,28 @@ func (u *userPlus) AddEvents(uid string, events []*Event) {
 
 func (u *userPlus) Advance(uid string) {
 	u.user.Advance(uid)
+}
+
+// BeginConnRecovery 在远程取快照前捕获本地目录代次；调用方须在锁外取快照。
+func (u *userPlus) BeginConnRecovery(uid string, version uint64) (func([]*Conn) bool, bool, error) {
+	if u == nil {
+		return nil, false, ErrConnRecoveryUnsupported
+	}
+	recovery, ok := u.user.(IConnRecovery)
+	if !ok {
+		return nil, false, ErrConnRecoveryUnsupported
+	}
+	apply, needed := recovery.BeginConnRecovery(uid, version)
+	return apply, needed, nil
+}
+
+// InvalidateConnRecovery 仅提示真实快照可能过期，不采信转发事件登记连接。
+func (u *userPlus) InvalidateConnRecovery(conn *Conn) bool {
+	if u == nil {
+		return false
+	}
+	invalidator, ok := u.user.(IConnRecoveryInvalidator)
+	return ok && invalidator.InvalidateConnRecovery(conn)
 }
 
 // ========================================== conn ==========================================

@@ -107,6 +107,10 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 		}
 		cloneEvent := e.Clone()
 		cloneEvent.Type = eventbus.EventChannelDistribute
+		if !options.G.IsOnlineCmdChannel(ctx.ChannelId) {
+			// 已保存消息只交接首次分发，换主后不能再次执行持久化和回执。
+			cloneEvent.Type = eventbus.EventChannelDistributeInitial
+		}
 		eventbus.Channel.AddEvent(ctx.ChannelId, ctx.ChannelType, cloneEvent)
 	}
 

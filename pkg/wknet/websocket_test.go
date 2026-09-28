@@ -19,8 +19,6 @@ import (
 
 func TestWebsocket(t *testing.T) {
 	e := NewEngine(WithWSAddr("ws://0.0.0.0:0"))
-	e.Start()
-	defer e.Stop()
 
 	var wg sync.WaitGroup
 	wg.Add(1) // 1 for upgrade, 1 for data
@@ -34,6 +32,10 @@ func TestWebsocket(t *testing.T) {
 		wg.Done()
 		return nil
 	})
+
+	// 先注册数据回调，再启动事件循环，避免并发读写回调。
+	e.Start()
+	defer e.Stop()
 
 	u := url.URL{Scheme: "ws", Host: e.WSRealListenAddr().String(), Path: "/"}
 
@@ -50,10 +52,6 @@ func TestWebsocket(t *testing.T) {
 
 func TestBatchWSConn(t *testing.T) {
 	e := NewEngine(WithWSAddr("ws://0.0.0.0:0"))
-	e.Start()
-	defer e.Stop()
-
-	time.Sleep(time.Millisecond * 200)
 
 	cliCount := 100 // 客户端数量
 	msgCount := 200 // 每个客户端发送的消息数量
@@ -90,6 +88,11 @@ func TestBatchWSConn(t *testing.T) {
 		}
 		return nil
 	})
+
+	e.Start()
+	defer e.Stop()
+
+	time.Sleep(time.Millisecond * 200)
 
 	done := make(chan struct{})
 	go func() {
@@ -145,9 +148,6 @@ func TestWebsocketWSS(t *testing.T) {
 	}
 
 	e := NewEngine(WithWSSAddr("wss://0.0.0.0:0"), WithWSTLSConfig(tlsConfig))
-	err = e.Start()
-	assert.NoError(t, err)
-	defer e.Stop()
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -159,6 +159,10 @@ func TestWebsocketWSS(t *testing.T) {
 		}
 		return nil
 	})
+
+	err = e.Start()
+	assert.NoError(t, err)
+	defer e.Stop()
 
 	dialer := websocket.DefaultDialer
 
@@ -187,10 +191,6 @@ func TestBatchWSSConn(t *testing.T) {
 	}
 
 	e := NewEngine(WithWSSAddr("wss://0.0.0.0:0"), WithWSTLSConfig(tlsConfig))
-	e.Start()
-	defer e.Stop()
-
-	time.Sleep(time.Millisecond * 200)
 
 	cliCount := 100 // 客户端数量
 	msgCount := 200 // 每个客户端发送的消息数量
@@ -227,6 +227,11 @@ func TestBatchWSSConn(t *testing.T) {
 		}
 		return nil
 	})
+
+	e.Start()
+	defer e.Stop()
+
+	time.Sleep(time.Millisecond * 200)
 
 	done := make(chan struct{})
 	go func() {

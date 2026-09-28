@@ -61,9 +61,6 @@ func TestTlsConn(t *testing.T) {
 	}
 
 	e := NewEngine(WithAddr("tcp://0.0.0.0:0"), WithTCPTLSConfig(tlsConfig))
-	err = e.Start()
-	assert.NoError(t, err)
-	defer e.Stop()
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -76,6 +73,11 @@ func TestTlsConn(t *testing.T) {
 		}
 		return nil
 	})
+
+	// 先注册数据回调，再启动事件循环，避免并发读写回调。
+	err = e.Start()
+	assert.NoError(t, err)
+	defer e.Stop()
 
 	conn, err := tls.Dial("tcp", e.TCPRealListenAddr().String(), &tls.Config{
 		InsecureSkipVerify: true,
@@ -104,11 +106,6 @@ func TestBatchTlsConn(t *testing.T) {
 	}
 
 	e := NewEngine(WithAddr("tcp://0.0.0.0:0"), WithTCPTLSConfig(tlsConfig))
-	err = e.Start()
-	assert.NoError(t, err)
-	defer e.Stop()
-
-	time.Sleep(time.Millisecond * 200)
 
 	cliCount := 100 // 客户端数量
 	msgCount := 100 // 每个客户端发送的消息数量
@@ -156,6 +153,12 @@ func TestBatchTlsConn(t *testing.T) {
 		}
 		return nil
 	})
+
+	err = e.Start()
+	assert.NoError(t, err)
+	defer e.Stop()
+
+	time.Sleep(time.Millisecond * 200)
 
 	done := make(chan struct{})
 	go func() {

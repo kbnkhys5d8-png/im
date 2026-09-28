@@ -7,6 +7,7 @@ import (
 )
 
 func (n *Node) Step(e types.Event) error {
+	defer n.publishReadState()
 	// n.Info("step event", zap.Uint64("from", e.From), zap.Uint64("to", e.To), zap.Uint32("term", e.Term), zap.Uint64("index", e.Index), zap.String("type", e.Type.String()))
 	switch {
 	case e.Term == 0: // 本地消息
@@ -23,7 +24,8 @@ func (n *Node) Step(e types.Event) error {
 		if n.cfg.Term > 0 {
 			n.Info("received event with higher term", zap.Uint32("term", n.cfg.Term), zap.Uint32("currentTerm", e.Term), zap.Uint64("from", e.From), zap.Uint64("to", e.To), zap.String("type", e.Type.String()))
 		}
-		if e.Type == types.Ping || e.Type == types.SyncResp {
+		// 同步通知也由领导发送，切换任期时保留其身份，避免向空领导发起同步。
+		if e.Type == types.Ping || e.Type == types.SyncResp || e.Type == types.NotifySync {
 			if n.cfg.Role == types.RoleLearner {
 				n.BecomeLearner(e.Term, e.From)
 			} else {
@@ -105,7 +107,7 @@ func (n *Node) stepLeader(e types.Event) error {
 			n.Foucs("stop propose", zap.String("key", n.Key()))
 			return types.ErrProposalDropped
 		}
-		n.idleTick = 0
+		n.idleTick.Store(0)
 		err := n.queue.append(e.Logs...)
 		if err != nil {
 			return err
@@ -115,7 +117,7 @@ func (n *Node) stepLeader(e types.Event) error {
 		// }
 		n.advance()
 	case types.SyncReq: // 同步
-		n.idleTick = 0
+		n.idleTick.Store(0)
 		isLearner := n.isLearner(e.From) // 当前同步节点是否是学习者
 		n.updateSyncInfo(e)              // 更新副本同步信息
 		if !isLearner {
@@ -217,7 +219,7 @@ func (n *Node) stepFollower(e types.Event) error {
 			n.BecomeFollower(e.Term, e.From)
 		}
 		n.updateFollowCommittedIndex(e.CommittedIndex) // 更新提交索引
-		n.idleTick = 0
+		n.idleTick.Store(0)
 		// 如果领导的配置版本大于本地配置版本，那么请求配置
 		if e.ConfigVersion > n.cfg.Version {
 			n.sendConfigReq()
@@ -226,13 +228,13 @@ func (n *Node) stepFollower(e types.Event) error {
 		// if n.Key() == "2&ch1" {
 		// 	n.Info("NotifySync...", zap.Uint64("from", e.From), zap.Uint64("index", e.Index))
 		// }
-		n.idleTick = 0
+		n.idleTick.Store(0)
 		n.suspend = false // 解除挂起
 		n.sendSyncReq()
 		n.advance()
 	case types.SyncResp: // 同步返回
 		n.electionElapsed = 0
-		n.idleTick = 0
+		n.idleTick.Store(0)
 		n.syncRespTimeoutTick = 0
 		n.syncing = false
 		if !n.onlySync {
@@ -295,6 +297,8 @@ func (n *Node) stepFollower(e types.Event) error {
 	case types.ConfigResp: // 配置返回
 		// 切换配置
 		e.Config.Term = n.cfg.Term
+		// 响应中的角色属于发送节点，本地角色须按接收节点的成员身份计算。
+		e.Config.Role = types.RoleUnknown
 		n.switchConfig(e.Config)
 
 	}
@@ -326,18 +330,18 @@ func (n *Node) stepLearner(e types.Event) error {
 			n.BecomeLearner(e.Term, e.From)
 		}
 		n.updateFollowCommittedIndex(e.CommittedIndex) // 更新提交索引
-		n.idleTick = 0
+		n.idleTick.Store(0)
 		// 如果领导的配置版本大于本地配置版本，那么请求配置
 		if e.ConfigVersion > n.cfg.Version {
 			n.sendConfigReq()
 		}
 	case types.NotifySync:
-		n.idleTick = 0
+		n.idleTick.Store(0)
 		n.sendSyncReq()
 		n.advance()
 	case types.SyncResp: // 同步返回
 		n.electionElapsed = 0
-		n.idleTick = 0
+		n.idleTick.Store(0)
 		n.syncRespTimeoutTick = 0
 		n.syncing = false
 		if !n.onlySync {
@@ -397,6 +401,8 @@ func (n *Node) stepLearner(e types.Event) error {
 	case types.ConfigResp: // 配置返回
 		// 切换配置
 		e.Config.Term = n.cfg.Term
+		// 响应中的角色属于发送节点，本地角色须按接收节点的成员身份计算。
+		e.Config.Role = types.RoleUnknown
 		n.switchConfig(e.Config)
 
 	}

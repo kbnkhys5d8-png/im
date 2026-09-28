@@ -103,7 +103,10 @@ func (p *poller) tick() {
 	p.waitlist.readHandlers(&p.tmpHandlers)
 
 	for _, h := range p.tmpHandlers {
+		// 避免旧目录的空闲检查跨过恢复应用后再补排关闭事件。
+		p.RLock()
 		h.tick()
+		p.RUnlock()
 	}
 	if p.tickCount%options.G.Poller.ClearIntervalTick == 0 {
 		p.tickCount = 0
@@ -185,7 +188,7 @@ func (p *poller) connsByUid(uid string) []*eventbus.Conn {
 	if h == nil {
 		return nil
 	}
-	return h.conns.conns
+	return h.conns.allConns()
 }
 func (p *poller) authedConnsByUid(uid string) []*eventbus.Conn {
 	h := p.handler(uid)
@@ -242,7 +245,7 @@ func (p *poller) allConn() []*eventbus.Conn {
 	tmpHandlers := make([]*userHandler, 0)
 	p.waitlist.readHandlers(&tmpHandlers)
 	for _, h := range tmpHandlers {
-		conns = append(conns, h.conns.conns...)
+		conns = append(conns, h.conns.allConns()...)
 	}
 	return conns
 }

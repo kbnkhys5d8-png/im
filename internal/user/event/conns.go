@@ -8,7 +8,10 @@ import (
 )
 
 type conns struct {
-	conns []*eventbus.Conn // 一个用户有多个连接
+	conns            []*eventbus.Conn // 一个用户有多个连接
+	revision         uint64
+	recoveredVersion uint64
+	hasRecovered     bool
 	sync.RWMutex
 }
 
@@ -20,6 +23,7 @@ func (c *conns) add(cn *eventbus.Conn) {
 	c.Lock()
 	defer c.Unlock()
 	c.conns = append(c.conns, cn)
+	c.revision++
 }
 
 // 添加或更新
@@ -38,13 +42,16 @@ func (c *conns) addOrUpdateConn(conn *eventbus.Conn) {
 	if !exist {
 		c.conns = append(c.conns, conn)
 	}
+	c.revision++
 }
 
 func (c *conns) remove(cn *eventbus.Conn) {
 	c.Lock()
 	defer c.Unlock()
+	// 尚未进入目录的关闭也要使在途快照失效。
+	c.revision++
 	for i, conn := range c.conns {
-		if conn.ConnId == cn.ConnId && conn.NodeId == cn.NodeId {
+		if conn.ConnId == cn.ConnId && conn.NodeId == cn.NodeId && conn.SameSession(cn) {
 			c.conns = append(c.conns[:i], c.conns[i+1:]...)
 			return
 		}
@@ -59,6 +66,7 @@ func (c *conns) removeConnByNodeId(nodeId uint64) {
 		if c.conns[i].NodeId == nodeId {
 			// 删除当前元素并检查下一元素
 			c.conns = append(c.conns[:i], c.conns[i+1:]...)
+			c.revision++
 			i-- // 回退索引以便检查新的当前元素
 		}
 	}
@@ -81,6 +89,7 @@ func (c *conns) updateConnAuth(nodeId uint64, connId int64, auth bool) {
 	for i, conn := range c.conns {
 		if conn.ConnId == connId && conn.NodeId == nodeId {
 			c.conns[i].Auth = auth
+			c.revision++
 			return
 		}
 	}
@@ -92,6 +101,7 @@ func (c *conns) updateConn(connId int64, nodeId uint64, newConn *eventbus.Conn) 
 	for i, conn := range c.conns {
 		if conn.ConnId == connId && conn.NodeId == nodeId {
 			c.conns[i] = newConn
+			c.revision++
 			return
 		}
 	}
@@ -106,7 +116,7 @@ func (c *conns) len() int {
 func (c *conns) allConns() []*eventbus.Conn {
 	c.RLock()
 	defer c.RUnlock()
-	return c.conns
+	return append([]*eventbus.Conn(nil), c.conns...)
 }
 
 func (c *conns) authedConns() []*eventbus.Conn {
@@ -193,4 +203,5 @@ func (c *conns) reset() {
 	c.Lock()
 	defer c.Unlock()
 	c.conns = nil
+	c.revision++
 }

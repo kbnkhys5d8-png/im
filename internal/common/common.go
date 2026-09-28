@@ -169,6 +169,13 @@ func CheckConnValidAndGetRealConn(conn *eventbus.Conn) (wknet.Conn, error) {
 		// connId与fd不一致，说明连接已经关闭
 		return nil, fmt.Errorf("context not match, connId: %d, fd: %d", conn.ConnId, connfd)
 	}
+	if conn.SessionId != "" {
+		// 新 socket 可能尚未收到 CONNECT，不能让旧会话绕过空上下文检查。
+		eventConn, ok := ctxByFd.(*eventbus.Conn)
+		if !ok || eventConn == nil {
+			return nil, fmt.Errorf("connection session context missing, connId: %d", conn.ConnId)
+		}
+	}
 
 	// 2. 验证连接的fd和connId是否一致
 	if ctxByFd != nil {
@@ -176,6 +183,10 @@ func CheckConnValidAndGetRealConn(conn *eventbus.Conn) (wknet.Conn, error) {
 		if ok && eventConn != nil {
 			if eventConn.ConnId != conn.ConnId {
 				return nil, fmt.Errorf("connId not match, connId: %d, realConnId: %d", conn.ConnId, eventConn.ConnId)
+			}
+			// 连接 ID 可能在接入节点重启后复用，不能将旧会话的写入或关闭作用于新连接。
+			if !eventConn.SameSession(conn) {
+				return nil, fmt.Errorf("connection session not match, connId: %d", conn.ConnId)
 			}
 		}
 	}

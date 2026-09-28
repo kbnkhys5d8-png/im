@@ -20,7 +20,9 @@ type userHandler struct {
 	lastActive atomic.Uint64 // 最后活跃时间
 	pending    struct {
 		sync.RWMutex
-		eventQueue *eventbus.EventQueue
+		eventQueue   *eventbus.EventQueue
+		connRevision uint64
+		connEvents   uint64
 	}
 	poller  *poller
 	handler eventbus.UserEventHandler
@@ -58,6 +60,11 @@ func (u *userHandler) addEvent(event *eventbus.Event) {
 	defer u.pending.Unlock()
 	event.Index = u.pending.eventQueue.LastIndex() + 1
 	u.pending.eventQueue.Append(event)
+	if affectsConnDirectory(event.Type) {
+		// 排队中的关闭或重连必须使正在拉取的旧快照失效。
+		u.pending.connRevision++
+		u.pending.connEvents++
+	}
 
 	u.lastActive.Store(fasttime.UnixTimestamp())
 
@@ -101,6 +108,13 @@ func (u *userHandler) events() []*eventbus.Event {
 // 推进事件
 func (u *userHandler) advanceEvents(events []*eventbus.Event) {
 	defer func() {
+		u.pending.Lock()
+		for _, event := range events {
+			if affectsConnDirectory(event.Type) {
+				u.pending.connEvents--
+			}
+		}
+		u.pending.Unlock()
 		u.finishProcessing()
 		if u.hasEvent() {
 			u.poller.advance()
@@ -137,6 +151,16 @@ func (u *userHandler) advanceEvents(events []*eventbus.Event) {
 		u.poller.putContext(ctx)
 	}
 
+}
+
+func affectsConnDirectory(eventType eventbus.EventType) bool {
+	switch eventType {
+	case eventbus.EventConnect, eventbus.EventConnack, eventbus.EventConnClose,
+		eventbus.EventConnRemove, eventbus.EventConnLeaderRemove:
+		return true
+	default:
+		return false
+	}
 }
 
 func (u *userHandler) tick() {

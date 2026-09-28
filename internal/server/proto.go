@@ -15,6 +15,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/jsonrpc"
 	"github.com/WuKongIM/WuKongIM/pkg/wknet"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
+	"github.com/google/uuid"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 )
@@ -270,12 +271,16 @@ func (s *Server) handleUnauthenticatedConn(conn wknet.Conn, buff []byte, isJson 
 	connCtx := &eventbus.Conn{
 		NodeId:       s.opts.Cluster.NodeId,
 		ConnId:       conn.ID(),
+		SessionId:    uuid.NewString(),
 		Uid:          connectPacket.UID,
 		DeviceId:     connectPacket.DeviceID,
 		DeviceFlag:   wkproto.DeviceFlag(connectPacket.DeviceFlag),
 		ProtoVersion: connectPacket.Version,
 		Uptime:       fasttime.UnixTimestamp(),
 		IsJsonRpc:    isJson,
+	}
+	if s.clusterServer != nil {
+		connCtx.AdmissionVersion = s.clusterServer.NodeVersion()
 	}
 	conn.SetContext(connCtx)
 

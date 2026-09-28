@@ -2,6 +2,8 @@ package raft_test
 
 import (
 	"context"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -120,9 +122,9 @@ func TestPropose(t *testing.T) {
 	raft2.WaitUtilCommit(timeoutCtx, 1)
 	raft3.WaitUtilCommit(timeoutCtx, 1)
 
-	node1Logs := raft1.Options().Storage.(*testStorage).logs
-	node2Logs := raft2.Options().Storage.(*testStorage).logs
-	node3Logs := raft3.Options().Storage.(*testStorage).logs
+	node1Logs := raft1.Options().Storage.(*testStorage).snapshotLogs()
+	node2Logs := raft2.Options().Storage.(*testStorage).snapshotLogs()
+	node3Logs := raft3.Options().Storage.(*testStorage).snapshotLogs()
 
 	assert.Equal(t, 1, len(node1Logs))
 	assert.Equal(t, 1, len(node2Logs))
@@ -200,14 +202,17 @@ func TestLogConflict1(t *testing.T) {
 
 	time.Sleep(time.Millisecond * 400)
 
+	node1Logs := s1Storage.snapshotLogs()
+	node2Logs := s2Storage.snapshotLogs()
+	node3Logs := s3Storage.snapshotLogs()
 	for i := 0; i < 2; i++ {
-		assert.Equal(t, s1Storage.logs[i].Data, s2Storage.logs[i].Data)
-		assert.Equal(t, s1Storage.logs[i].Term, s2Storage.logs[i].Term)
-		assert.Equal(t, s1Storage.logs[i].Index, s2Storage.logs[i].Index)
+		assert.Equal(t, node1Logs[i].Data, node2Logs[i].Data)
+		assert.Equal(t, node1Logs[i].Term, node2Logs[i].Term)
+		assert.Equal(t, node1Logs[i].Index, node2Logs[i].Index)
 
-		assert.Equal(t, s3Storage.logs[i].Data, s2Storage.logs[i].Data)
-		assert.Equal(t, s3Storage.logs[i].Term, s2Storage.logs[i].Term)
-		assert.Equal(t, s3Storage.logs[i].Index, s2Storage.logs[i].Index)
+		assert.Equal(t, node3Logs[i].Data, node2Logs[i].Data)
+		assert.Equal(t, node3Logs[i].Term, node2Logs[i].Term)
+		assert.Equal(t, node3Logs[i].Index, node2Logs[i].Index)
 	}
 
 }
@@ -280,14 +285,17 @@ func TestLogConflict2(t *testing.T) {
 
 	time.Sleep(time.Millisecond * 400)
 
+	node1Logs := s1Storage.snapshotLogs()
+	node2Logs := s2Storage.snapshotLogs()
+	node3Logs := s3Storage.snapshotLogs()
 	for i := 0; i < 2; i++ {
-		assert.Equal(t, s1Storage.logs[i].Data, s2Storage.logs[i].Data)
-		assert.Equal(t, s1Storage.logs[i].Term, s2Storage.logs[i].Term)
-		assert.Equal(t, s1Storage.logs[i].Index, s2Storage.logs[i].Index)
+		assert.Equal(t, node1Logs[i].Data, node2Logs[i].Data)
+		assert.Equal(t, node1Logs[i].Term, node2Logs[i].Term)
+		assert.Equal(t, node1Logs[i].Index, node2Logs[i].Index)
 
-		assert.Equal(t, s3Storage.logs[i].Data, s2Storage.logs[i].Data)
-		assert.Equal(t, s3Storage.logs[i].Term, s2Storage.logs[i].Term)
-		assert.Equal(t, s3Storage.logs[i].Index, s2Storage.logs[i].Index)
+		assert.Equal(t, node3Logs[i].Data, node2Logs[i].Data)
+		assert.Equal(t, node3Logs[i].Term, node2Logs[i].Term)
+		assert.Equal(t, node3Logs[i].Index, node2Logs[i].Index)
 	}
 
 }
@@ -321,9 +329,9 @@ func TestProposeUntilApplied(t *testing.T) {
 	require.NoError(t, raft2.WaitUtilCommit(timeoutCtx, 1))
 	require.NoError(t, raft3.WaitUtilCommit(timeoutCtx, 1))
 
-	node1Logs := raft1.Options().Storage.(*testStorage).logs
-	node2Logs := raft2.Options().Storage.(*testStorage).logs
-	node3Logs := raft3.Options().Storage.(*testStorage).logs
+	node1Logs := raft1.Options().Storage.(*testStorage).snapshotLogs()
+	node2Logs := raft2.Options().Storage.(*testStorage).snapshotLogs()
+	node3Logs := raft3.Options().Storage.(*testStorage).snapshotLogs()
 
 	require.Len(t, node1Logs, 1)
 	require.Len(t, node2Logs, 1)
@@ -331,6 +339,64 @@ func TestProposeUntilApplied(t *testing.T) {
 
 	assert.Equal(t, node1Logs[0].Index, node2Logs[0].Index, node3Logs[0].Index)
 	assert.Equal(t, node1Logs[0].Data, node2Logs[0].Data, node3Logs[0].Data)
+}
+
+func TestPausedRaftControlOperations(t *testing.T) {
+	r := raft.New(newTestOptions(1, []uint64{1}))
+	// 先设置暂停，保证循环首次运行就处于暂停分支。
+	r.Pause()
+	if err := r.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		r.Resume()
+		r.Stop()
+	}()
+	done := make(chan struct{})
+	go func() {
+		r.BecomeFollower(2, 2)
+		r.KeepAlive()
+		r.BecomeLeader(3)
+		close(done)
+	}()
+	select {
+	case <-done:
+		if !r.IsLeader() {
+			t.Fatal("暂停中的角色切换没有完成")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("暂停阻塞了同步角色操作")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := r.ProposeBatchTimeout(ctx, types.ProposeReqSet{{Id: 1, Data: []byte("paused")}}); err != types.ErrPaused {
+		t.Fatalf("暂停中的提案错误 = %v, want %v", err, types.ErrPaused)
+	}
+	r.Resume()
+	if _, err := r.ProposeUntilAppliedTimeout(ctx, 2, []byte("resumed")); err != nil {
+		t.Fatalf("恢复后提案失败: %v", err)
+	}
+}
+
+func TestPausedRaftCanStop(t *testing.T) {
+	r := raft.New(newTestOptions(1, []uint64{1}))
+	r.Pause()
+	if err := r.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		r.Stop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		// 清理旧实现的条件变量等待，避免回归失败时遗留协程。
+		r.Resume()
+		<-done
+		t.Fatal("暂停阻塞了停止操作")
+	}
 }
 
 func newTestOptions(nodeId uint64, replicas []uint64, opt ...raft.Option) *raft.Options {
@@ -350,10 +416,18 @@ func (t *testTransport) Send(event types.Event) {
 	if !ok {
 		return
 	}
+	// 直连夹具也要隔离节点内存，不能把发送方的可变轨迹和数据交给接收方共用。
+	event.Logs = cloneTestLogs(event.Logs)
+	event.Config = event.Config.Clone()
+	if event.TermStartIndexInfo != nil {
+		info := *event.TermStartIndexInfo
+		event.TermStartIndexInfo = &info
+	}
 	r.Step(event)
 }
 
 type testStorage struct {
+	mu              sync.RWMutex
 	nodeId          uint64
 	logs            []types.Log
 	termStartIndexs []*types.TermStartIndexInfo
@@ -366,22 +440,48 @@ func newTestStorage(nodeId uint64) *testStorage {
 }
 
 func (s *testStorage) AppendLogs(logs []types.Log, termStartIndex *types.TermStartIndexInfo) error {
-	s.logs = append(s.logs, logs...)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// 存储拥有独立副本，调用方后续修改日志或任期信息不会污染夹具。
+	s.logs = append(s.logs, cloneTestLogs(logs)...)
 	if termStartIndex != nil {
-		s.termStartIndexs = append(s.termStartIndexs, termStartIndex)
+		info := *termStartIndex
+		s.termStartIndexs = append(s.termStartIndexs, &info)
 	}
 	return nil
 }
 
 func (s *testStorage) saveTermStartIndex(termStartIndex *types.TermStartIndexInfo) {
-	s.termStartIndexs = append(s.termStartIndexs, termStartIndex)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	info := *termStartIndex
+	s.termStartIndexs = append(s.termStartIndexs, &info)
 }
 
 func (s *testStorage) GetLogs(start, end uint64, limitSize uint64) ([]types.Log, error) {
-	return s.logs[start-1:], nil
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return cloneTestLogs(s.logs[start-1:]), nil
+}
+
+func (s *testStorage) snapshotLogs() []types.Log {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return cloneTestLogs(s.logs)
+}
+
+// 同时复制日志值（含轨迹）和数据切片，锁外读取不会再持有存储别名。
+func cloneTestLogs(logs []types.Log) []types.Log {
+	cloned := slices.Clone(logs)
+	for i := range cloned {
+		cloned[i].Data = slices.Clone(cloned[i].Data)
+	}
+	return cloned
 }
 
 func (s *testStorage) GetState() (types.RaftState, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if len(s.logs) == 0 {
 		return types.RaftState{}, nil
 	}
@@ -394,6 +494,8 @@ func (s *testStorage) GetState() (types.RaftState, error) {
 }
 
 func (s *testStorage) GetTermStartIndex(term uint32) (uint64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	for _, tsi := range s.termStartIndexs {
 		if tsi.Term == term {
 			return tsi.Index, nil
@@ -403,6 +505,8 @@ func (s *testStorage) GetTermStartIndex(term uint32) (uint64, error) {
 }
 
 func (s *testStorage) TruncateLogTo(index uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if int(index) > len(s.logs) {
 		return nil
 	}
@@ -411,6 +515,8 @@ func (s *testStorage) TruncateLogTo(index uint64) error {
 }
 
 func (s *testStorage) DeleteLeaderTermStartIndexGreaterThanTerm(term uint32) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	newTermStartIndexs := make([]*types.TermStartIndexInfo, 0)
 	for _, tsi := range s.termStartIndexs {
 		if tsi.Term <= term {
@@ -422,7 +528,8 @@ func (s *testStorage) DeleteLeaderTermStartIndexGreaterThanTerm(term uint32) err
 }
 
 func (s *testStorage) LeaderTermGreaterEqThan(term uint32) (uint32, error) {
-
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	for _, tsi := range s.termStartIndexs {
 		if tsi.Term >= term {
 			return tsi.Term, nil
@@ -432,6 +539,8 @@ func (s *testStorage) LeaderTermGreaterEqThan(term uint32) (uint32, error) {
 }
 
 func (s *testStorage) LeaderLastTerm() (uint32, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if len(s.termStartIndexs) == 0 {
 		return 0, nil
 	}
