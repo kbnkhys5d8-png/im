@@ -15,6 +15,7 @@ import (
 
 func TestSearchQueryGateFailsClosedExceptSafeMissingMarker(t *testing.T) {
 	safeDir := gateFileInfo{name: "tsdd-search-control", mode: os.ModeDir | 0o700, uid: 0}
+	traverseDir := gateFileInfo{name: "tsdd-search-control", mode: os.ModeDir | 0o710, uid: 0}
 	safeMarker := gateFileInfo{name: "usersearch-disabled-v1", mode: 0o644, uid: 0}
 	for _, test := range []struct {
 		name       string
@@ -26,12 +27,20 @@ func TestSearchQueryGateFailsClosedExceptSafeMissingMarker(t *testing.T) {
 		wantOpen   bool
 	}{
 		{name: "safe missing marker", configured: true, value: searchQueryGatePath, parent: safeDir, markerErr: os.ErrNotExist, wantOpen: true},
+		{name: "root-owned group-traverse missing marker", configured: true, value: searchQueryGatePath, parent: traverseDir, markerErr: os.ErrNotExist, wantOpen: true},
 		{name: "missing env"},
 		{name: "wrong path", configured: true, value: "/tmp/unsafe", parent: safeDir, markerErr: os.ErrNotExist},
 		{name: "missing parent", configured: true, value: searchQueryGatePath, markerErr: os.ErrNotExist},
 		{name: "writable parent", configured: true, value: searchQueryGatePath, parent: gateFileInfo{name: "parent", mode: os.ModeDir | 0o777, uid: 0}, markerErr: os.ErrNotExist},
 		{name: "world-readable parent", configured: true, value: searchQueryGatePath, parent: gateFileInfo{name: "parent", mode: os.ModeDir | 0o755, uid: 0}, markerErr: os.ErrNotExist},
+		{name: "group-readable parent", configured: true, value: searchQueryGatePath, parent: gateFileInfo{name: "parent", mode: os.ModeDir | 0o750, uid: 0}, markerErr: os.ErrNotExist},
+		{name: "world-traversable parent", configured: true, value: searchQueryGatePath, parent: gateFileInfo{name: "parent", mode: os.ModeDir | 0o711, uid: 0}, markerErr: os.ErrNotExist},
+		{name: "group-writable parent", configured: true, value: searchQueryGatePath, parent: gateFileInfo{name: "parent", mode: os.ModeDir | 0o730, uid: 0}, markerErr: os.ErrNotExist},
+		{name: "non-root traverse parent", configured: true, value: searchQueryGatePath, parent: gateFileInfo{name: "parent", mode: os.ModeDir | 0o710, uid: 999}, markerErr: os.ErrNotExist},
+		{name: "symlink parent", configured: true, value: searchQueryGatePath, parent: gateFileInfo{name: "parent", mode: os.ModeSymlink | 0o710, uid: 0}, markerErr: os.ErrNotExist},
 		{name: "safe marker disables", configured: true, value: searchQueryGatePath, parent: safeDir, marker: safeMarker},
+		{name: "traverse parent marker disables", configured: true, value: searchQueryGatePath, parent: traverseDir, marker: safeMarker},
+		{name: "traverse parent permission error disables", configured: true, value: searchQueryGatePath, parent: traverseDir, markerErr: os.ErrPermission},
 		{name: "symlink marker disables", configured: true, value: searchQueryGatePath, parent: safeDir, marker: gateFileInfo{name: "marker", mode: os.ModeSymlink | 0o777, uid: 0}},
 		{name: "fifo marker disables", configured: true, value: searchQueryGatePath, parent: safeDir, marker: gateFileInfo{name: "marker", mode: os.ModeNamedPipe | 0o600, uid: 0}},
 		{name: "writable marker disables", configured: true, value: searchQueryGatePath, parent: safeDir, marker: gateFileInfo{name: "marker", mode: 0o666, uid: 0}},

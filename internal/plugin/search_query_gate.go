@@ -32,7 +32,11 @@ func inspectSearchQueryGate(value string, configured bool, lstat func(string) (o
 	}
 	parent := filepath.Dir(searchQueryGatePath)
 	parentInfo, err := lstat(parent)
-	if err != nil || parentInfo.Mode()&os.ModeSymlink != 0 || !parentInfo.IsDir() || !rootOwnedSafeMode(parentInfo) || parentInfo.Mode().Perm() != 0o700 {
+	if err != nil || parentInfo.Mode()&os.ModeSymlink != 0 || !parentInfo.IsDir() || !rootOwnedSafeMode(parentInfo) {
+		return errSearchQueryUnavailable
+	}
+	// 非 root 的 IM 仅允许穿过 root 控制的 0710 目录，不能列目录或修改开关。
+	if mode := parentInfo.Mode().Perm(); mode != 0o700 && mode != 0o710 {
 		return errSearchQueryUnavailable
 	}
 	markerInfo, err := lstat(searchQueryGatePath)
