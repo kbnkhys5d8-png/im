@@ -110,13 +110,14 @@ func TestSingleSendMessage(t *testing.T) {
 	// cli2 recv
 	recvDone := make(chan struct{}, 1)
 	cli2.SetOnRecv(func(recv *wkproto.RecvPacket) error {
-		assert.Equal(t, "hello", string(recv.Payload))
+		assert.Equal(t, `{"type":1,"content":"hello"}`, string(recv.Payload))
 		recvDone <- struct{}{}
 		return nil
 	})
 
 	// send message
-	err = cli1.SendMessage(client.NewChannel("test2", 1), []byte("hello"))
+	// 正常消息使用合法文本正文，继续验证真实收发，不绕过类型拦截。
+	err = cli1.SendMessage(client.NewChannel("test2", 1), []byte(`{"type":1,"content":"hello"}`))
 	assert.Nil(t, err)
 
 	select {
@@ -339,7 +340,7 @@ func TestSingleJSONRPC_ConnectSendRecv(t *testing.T) {
 		Params: jsonrpc.SendParams{
 			ChannelID:   "test2",
 			ChannelType: int(wkproto.ChannelTypePerson), // Cast to int
-			Payload:     json.RawMessage(`{"data":"hello jsonrpc"}`),
+			Payload:     json.RawMessage(`{"type":1,"content":"hello jsonrpc","data":"hello jsonrpc"}`),
 		},
 	}
 	sendJSON(t, conn1, sendReq)
@@ -364,8 +365,8 @@ func TestClusterSendMessage(t *testing.T) {
 	sender := nodes[0].connect("test1")
 	receiver := nodes[1].connect("test2")
 	messages := receiveProcessMessage(t, receiver)
-	require.NoError(t, sender.SendMessage(client.NewChannel("test2", 1), []byte("hello")))
-	requireProcessMessage(t, messages, "hello")
+	require.NoError(t, sender.SendMessage(client.NewChannel("test2", 1), []byte(`{"type":1,"content":"hello"}`)))
+	requireProcessMessage(t, messages, `{"type":1,"content":"hello"}`)
 }
 
 func TestClusterSlotMigrate(t *testing.T) {
@@ -504,8 +505,8 @@ func TestClusterChannelElection(t *testing.T) {
 	sender := nodes[0].connect("test1")
 	receiver := nodes[1].connect("test2")
 	messages := receiveProcessMessage(t, receiver)
-	require.NoError(t, sender.SendMessage(client.NewChannel("test2", 1), []byte("hello")))
-	requireProcessMessage(t, messages, "hello")
+	require.NoError(t, sender.SendMessage(client.NewChannel("test2", 1), []byte(`{"type":1,"content":"hello"}`)))
+	requireProcessMessage(t, messages, `{"type":1,"content":"hello"}`)
 
 	channelID := options.GetFakeChannelIDWith("test1", "test2")
 	leaderID := nodes[0].call(clusterProcessRequest{
@@ -533,8 +534,8 @@ func TestClusterChannelElection(t *testing.T) {
 	sender = survivor.connect("test1")
 	receiver = survivor.connect("test2")
 	messages = receiveProcessMessage(t, receiver)
-	require.NoError(t, sender.SendMessage(client.NewChannel("test2", 1), []byte("after-election")))
-	requireProcessMessage(t, messages, "after-election")
+	require.NoError(t, sender.SendMessage(client.NewChannel("test2", 1), []byte(`{"type":1,"content":"after-election"}`)))
+	requireProcessMessage(t, messages, `{"type":1,"content":"after-election"}`)
 }
 
 // 群故障转移必须先建立订阅者，再验证故障前后真实收发。
@@ -575,9 +576,9 @@ func TestClusterFailover(t *testing.T) {
 		}
 	})
 	channel := client.NewChannel("g1", wkproto.ChannelTypeGroup)
-	require.NoError(t, sender.SendMessage(channel, []byte("hello")))
-	requireProcessMessage(t, messages2, "hello")
-	requireProcessMessage(t, messages3, "hello")
+	require.NoError(t, sender.SendMessage(channel, []byte(`{"type":1,"content":"hello"}`)))
+	requireProcessMessage(t, messages2, `{"type":1,"content":"hello"}`)
+	requireProcessMessage(t, messages3, `{"type":1,"content":"hello"}`)
 
 	nodes[2].stop()
 	nodes[0].waitFailover(nodes[2].config.ID)
@@ -585,9 +586,9 @@ func TestClusterFailover(t *testing.T) {
 	receiver3.Close()
 	receiver3 = nodes[1].connect("u3")
 	messages3 = receiveProcessMessage(t, receiver3)
-	require.NoError(t, sender.SendMessage(channel, []byte("hello2")))
-	requireProcessMessage(t, messages2, "hello2")
-	requireProcessMessage(t, messages3, "hello2")
+	require.NoError(t, sender.SendMessage(channel, []byte(`{"type":1,"content":"hello2"}`)))
+	requireProcessMessage(t, messages2, `{"type":1,"content":"hello2"}`)
+	requireProcessMessage(t, messages3, `{"type":1,"content":"hello2"}`)
 }
 
 func TestClusterSaveClusterConfig(t *testing.T) {

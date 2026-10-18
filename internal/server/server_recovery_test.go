@@ -57,9 +57,10 @@ func TestClusterUserConnectionRecovery(t *testing.T) {
 					requireProcessMessage(t, localMessages, payload)
 				}
 			}
-			send("before")
+			// 只调整正常消息夹具；原连接、换主时机和逐次送达断言保持不变。
+			send(`{"type":1,"content":"before"}`)
 			migrateProcessUser(t, nodes, "u2", nodes[0].config.ID)
-			send("after")
+			send(`{"type":1,"content":"after"}`)
 			want := 1
 			if tc.localDevice {
 				want = 2
@@ -67,7 +68,7 @@ func TestClusterUserConnectionRecovery(t *testing.T) {
 			require.Equal(t, want, nodes[0].call(clusterProcessRequest{Op: "user-state", UID: "u2"}).ConnCount)
 			// 再次迁移，验证恢复完成标记不会跨领导任期误用。
 			migrateProcessUser(t, nodes, "u2", nodes[2].config.ID)
-			send("back")
+			send(`{"type":1,"content":"back"}`)
 		})
 	}
 }
@@ -133,7 +134,7 @@ func TestClusterConnackAfterLeaderRecovery(t *testing.T) {
 				t.Fatal("释放真实 Connack 后客户端仍未完成登录")
 			}
 			// 不等心跳、不重连、不主动再次 Ensure，登录后的第一条消息立即发送。
-			const payload = "after-delayed-connack"
+			const payload = `{"type":1,"content":"after-delayed-connack"}`
 			require.NoError(t, sender.SendMessage(client.NewChannel("u2", 1), []byte(payload)))
 			requireProcessMessage(t, messages, payload)
 			if existingMessages != nil {

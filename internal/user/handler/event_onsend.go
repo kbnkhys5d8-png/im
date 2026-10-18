@@ -122,21 +122,7 @@ func (h *Handler) handleOnSend(event *eventbus.Event) {
 	if !validateSendText(event, sendPacket) {
 		return
 	}
-	if contentType, reserved := reservedWalletContentType(sendPacket.Payload); reserved {
-		h.Warn("client attempted to send reserved wallet content",
-			zap.String("uid", conn.Uid),
-			zap.String("channelId", channelId),
-			zap.Uint8("channelType", channelType),
-			zap.Int("contentType", contentType),
-		)
-		sendack := &wkproto.SendackPacket{
-			Framer:      sendPacket.Framer,
-			MessageID:   event.MessageId,
-			ClientSeq:   sendPacket.ClientSeq,
-			ClientMsgNo: sendPacket.ClientMsgNo,
-			ReasonCode:  wkproto.ReasonNotAllowSend,
-		}
-		eventbus.User.ConnWrite(event.ReqId, conn, sendack)
+	if !h.validateClientWalletContent(event, sendPacket) {
 		return
 	}
 
@@ -158,6 +144,10 @@ func (h *Handler) handleOnSend(event *eventbus.Event) {
 	if !validateSendText(event, sendPacket) {
 		return
 	}
+	// 插件改写也不能把客户端消息变成金融卡片；服务端钱包走独立的管理接口，不经过此入口。
+	if !h.validateClientWalletContent(event, sendPacket) {
+		return
+	}
 
 	trace.GlobalTrace.Metrics.App().SendPacketCountAdd(1)
 	trace.GlobalTrace.Metrics.App().SendPacketBytesAdd(sendPacket.GetFrameSize())
@@ -173,6 +163,22 @@ func (h *Handler) handleOnSend(event *eventbus.Event) {
 	// 推进
 	eventbus.Channel.Advance(fakeChannelId, channelType)
 
+}
+
+func (h *Handler) validateClientWalletContent(event *eventbus.Event, packet *wkproto.SendPacket) bool {
+	contentType, valid := clientMessageContentType(packet.Payload)
+	if valid && contentType != 9 && contentType != 10 {
+		return true
+	}
+	h.Warn("client attempted to send reserved or invalid wallet content",
+		zap.String("uid", event.Conn.Uid), zap.String("channelId", packet.ChannelID),
+		zap.Uint8("channelType", packet.ChannelType), zap.Int64("contentType", contentType),
+	)
+	eventbus.User.ConnWrite(event.ReqId, event.Conn, &wkproto.SendackPacket{
+		Framer: packet.Framer, MessageID: event.MessageId, ClientSeq: packet.ClientSeq,
+		ClientMsgNo: packet.ClientMsgNo, ReasonCode: wkproto.ReasonNotAllowSend,
+	})
+	return false
 }
 
 func validateSendText(event *eventbus.Event, packet *wkproto.SendPacket) bool {

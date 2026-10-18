@@ -5,17 +5,20 @@ import (
 	"encoding/json"
 	"io"
 	"math/big"
+	"strconv"
 	"strings"
 )
 
-func reservedWalletContentType(payload []byte) (int, bool) {
+// clientMessageContentType 只接受唯一、可精确表示的非负整数类型，禁止客户端和服务端产生解析分歧。
+func clientMessageContentType(payload []byte) (int64, bool) {
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.UseNumber()
 	start, err := decoder.Token()
 	if err != nil || start != json.Delim('{') {
 		return 0, false
 	}
-	reservedType := 0
+	var contentType int64
+	found := false
 	for decoder.More() {
 		keyToken, err := decoder.Token()
 		if err != nil {
@@ -32,9 +35,15 @@ func reservedWalletContentType(payload []byte) (int, bool) {
 		if key != "type" {
 			continue
 		}
-		if contentType, ok := normalizeReservedWalletContentType(raw); ok && reservedType == 0 {
-			reservedType = contentType
+		if found {
+			return 0, false
 		}
+		var valid bool
+		contentType, valid = normalizeClientMessageContentType(raw)
+		if !valid {
+			return 0, false
+		}
+		found = true
 	}
 	end, err := decoder.Token()
 	if err != nil || end != json.Delim('}') {
@@ -43,10 +52,10 @@ func reservedWalletContentType(payload []byte) (int, bool) {
 	if _, err = decoder.Token(); err != io.EOF {
 		return 0, false
 	}
-	return reservedType, reservedType != 0
+	return contentType, found
 }
 
-func normalizeReservedWalletContentType(raw json.RawMessage) (int, bool) {
+func normalizeClientMessageContentType(raw json.RawMessage) (int64, bool) {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()
 	var value interface{}
@@ -60,22 +69,34 @@ func normalizeReservedWalletContentType(raw json.RawMessage) (int, bool) {
 		encoded = typed.String()
 	case string:
 		encoded = strings.TrimSpace(typed)
+		// 字符串只接受规范十进制整数，禁止科学计数法被客户端按整数前缀解释。
+		contentType, err := strconv.ParseInt(encoded, 10, 32)
+		return contentType, err == nil && contentType >= 0 && strconv.FormatInt(contentType, 10) == encoded
 	default:
 		return 0, false
 	}
+	// 类型不是业务金额；限制表示长度和指数，避免任意精度解析被超大指数耗尽资源。
+	if len(encoded) > 256 {
+		return 0, false
+	}
+	if index := strings.IndexAny(encoded, "eE"); index >= 0 {
+		exponent, err := strconv.ParseInt(encoded[index+1:], 10, 16)
+		if err != nil || exponent < -256 || exponent > 256 {
+			return 0, false
+		}
+	}
 	var number json.Number
-	if err := json.Unmarshal([]byte(encoded), &number); err != nil {
+	if err := json.Unmarshal([]byte(encoded), &number); err != nil || number.String() != encoded {
 		return 0, false
 	}
 	rational, ok := new(big.Rat).SetString(number.String())
-	if !ok {
+	if !ok || !rational.IsInt() || !rational.Num().IsInt64() || rational.Sign() < 0 {
 		return 0, false
 	}
-	if rational.Cmp(big.NewRat(9, 1)) == 0 {
-		return 9, true
+	// 限定为非负32位整数，避免大类型值被客户端窄化转换成红包或转账类型。
+	contentType := rational.Num().Int64()
+	if contentType > 1<<31-1 {
+		return 0, false
 	}
-	if rational.Cmp(big.NewRat(10, 1)) == 0 {
-		return 10, true
-	}
-	return 0, false
+	return contentType, true
 }

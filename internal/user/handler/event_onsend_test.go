@@ -127,6 +127,112 @@ func TestHandleOnSendValidatesDecryptedAndPluginFinalTextBeforeEnqueue(t *testin
 	}
 }
 
+type walletRewriteOncePlugin struct {
+	types.Plugin
+	payload []byte
+	calls   int
+}
+
+func (*walletRewriteOncePlugin) GetNo() string { return "wallet-rewrite-test" }
+
+func (p *walletRewriteOncePlugin) Send(_ context.Context, packet *pluginproto.SendPacket) (*pluginproto.SendPacket, error) {
+	if p.calls == 0 {
+		packet.Payload = p.payload
+	}
+	p.calls++
+	return packet, nil
+}
+
+func TestHandleOnSendRejectsForgedWalletCardsAndContinuesBatch(t *testing.T) {
+	previousOptions, previousStore, previousPlugins := options.G, service.Store, service.PluginManager
+	previousUser, previousChannel, previousTrace := eventbus.User, eventbus.Channel, trace.GlobalTrace
+	options.G = options.New()
+	service.Store = store.New(store.NewOptions(store.WithDB(textSendPermissionDB{})))
+	trace.GlobalTrace = trace.New(context.Background(), trace.NewOptions())
+	t.Cleanup(func() {
+		options.G, service.Store, service.PluginManager = previousOptions, previousStore, previousPlugins
+		eventbus.User, eventbus.Channel, trace.GlobalTrace = previousUser, previousChannel, previousTrace
+	})
+
+	tests := []struct {
+		name        string
+		payload     string
+		replacement string
+		noPersist   bool
+	}{
+		{name: "整数转账", payload: `{"type":10,"amt":480000,"tx_no":12345}`},
+		{name: "小数转账", payload: `{"type":10.1,"amt":480000,"tx_no":12345}`},
+		{name: "小数红包", payload: `{"type":9.1}`},
+		{name: "字符串小数", payload: `{"type":"10.1"}`},
+		{name: "精度绕过", payload: `{"type":1.00000000000000000001}`},
+		{name: "科学计数转账", payload: `{"type":1e1}`},
+		{name: "小数整数转账", payload: `{"type":10.0}`},
+		{name: "字符串整数前缀", payload: `{"type":"10e-1"}`},
+		{name: "超大整数转账别名", payload: `{"type":4294967306}`},
+		{name: "非持久消息也禁止伪造", payload: `{"type":10.1,"amt":480000}`, noPersist: true},
+		{name: "转义字符串转账", payload: `{"type":"\u0031\u0030"}`},
+		{name: "歧义类型", payload: `{"type":1,"type":2}`},
+		{name: "缺少类型", payload: `{"content":"missing type"}`},
+		{name: "插件改写整数转账", payload: `{"type":1,"content":"hello"}`, replacement: `{"type":10,"amt":480000,"tx_no":12345}`},
+		{name: "插件改写小数转账", payload: `{"type":1,"content":"hello"}`, replacement: `{"type":10.1,"amt":480000,"tx_no":12345}`},
+	}
+	for _, tt := range tests {
+		for _, jsonRPC := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/JSONRPC=%v", tt.name, jsonRPC), func(t *testing.T) {
+				user, channel := &textSendUser{}, &textSendChannel{}
+				eventbus.RegisterUser(user)
+				eventbus.RegisterChannel(channel)
+				service.PluginManager = textSendPluginManager{}
+				if tt.replacement != "" {
+					service.PluginManager = textSendPluginManager{plugins: []types.Plugin{&walletRewriteOncePlugin{payload: []byte(tt.replacement)}}}
+				}
+				// 客户端即使伪装系统设备和钱包消息编号，也不能取得服务端发卡权限。
+				conn := &eventbus.Conn{Uid: "sender", DeviceId: options.G.SystemDeviceId, IsJsonRpc: jsonRPC, AesKey: []byte("0123456789abcdef"), AesIV: []byte("0123456789abcdef")}
+				packet := &wkproto.SendPacket{
+					Framer:    wkproto.Framer{NoPersist: tt.noPersist},
+					ChannelID: "peer", ChannelType: wkproto.ChannelTypePerson,
+					ClientMsgNo: "wallet-transfer-12345", ClientSeq: 7, Payload: []byte(tt.payload),
+				}
+				if !jsonRPC {
+					packet.Payload = encryptWalletTestPacket(t, packet, conn)
+				}
+				next := &wkproto.SendPacket{ChannelID: "peer", ChannelType: wkproto.ChannelTypePerson, ClientMsgNo: "ordinary", ClientSeq: 8, Payload: []byte(`{"type":1,"content":"hello"}`)}
+				if !jsonRPC {
+					next.Payload = encryptWalletTestPacket(t, next, conn)
+				}
+				h := &Handler{Log: wklog.NewWKLog("wallet-card-test")}
+				// 两条消息放在同一次事件消费中，证明拒绝第一条不会中止整批。
+				h.onSend(&eventbus.UserContext{Events: []*eventbus.Event{
+					{Conn: conn, Frame: packet, MessageId: 123, ReqId: "reject"},
+					{Conn: conn, Frame: next, MessageId: 124, ReqId: "accept"},
+				}})
+				if len(channel.events) != 1 || len(user.events) != 1 || channel.events[0].Frame != next {
+					t.Fatalf("应该只投递后续正常消息，实际入队 %d 次，失败 ACK %d 次", len(channel.events), len(user.events))
+				}
+				ack, ok := user.events[0].Frame.(*wkproto.SendackPacket)
+				if !ok || ack.ReasonCode != wkproto.ReasonNotAllowSend || ack.ClientSeq != 7 || ack.ClientMsgNo != "wallet-transfer-12345" {
+					t.Fatalf("失败 ACK 未保留原消息身份: %v", user.events[0].Frame)
+				}
+			})
+		}
+	}
+}
+
+func encryptWalletTestPacket(t *testing.T, packet *wkproto.SendPacket, conn *eventbus.Conn) []byte {
+	t.Helper()
+	encrypted, err := wkutil.AesEncryptPkcs7Base64(packet.Payload, conn.AesKey, conn.AesIV)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet.Payload = encrypted
+	sign, err := wkutil.AesEncryptPkcs7Base64([]byte(packet.VerityString()), conn.AesKey, conn.AesIV)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet.MsgKey = wkutil.MD5Bytes(sign)
+	return encrypted
+}
+
 func TestResolveSendChannelIDRejectsRaftKeyDelimiter(t *testing.T) {
 	tests := []struct {
 		name        string
