@@ -1,6 +1,7 @@
 package wkdb
 
 import (
+	"fmt"
 	"math"
 	"sort"
 	"time"
@@ -17,6 +18,7 @@ func (wk *wukongDB) getDeviceId(uid string, deviceFlag uint64) (uint64, error) {
 	})
 	defer iter.Close()
 
+	var selected Device
 	for iter.First(); iter.Valid(); iter.Next() {
 		_, id, err := key.ParseDeviceSecondIndexKey(iter.Key())
 		if err != nil {
@@ -27,9 +29,13 @@ func (wk *wukongDB) getDeviceId(uid string, deviceFlag uint64) (uint64, error) {
 			return 0, err
 		}
 
-		if device.DeviceFlag == deviceFlag {
-			return id, nil
+		if device.DeviceFlag == deviceFlag && (IsEmptyDevice(selected) || device.TokenVersion > selected.TokenVersion) {
+			// 历史库可能有同设备多条记录，优先最高版本，防止重启后选回旧 Token。
+			selected = device
 		}
+	}
+	if !IsEmptyDevice(selected) {
+		return selected.Id, nil
 	}
 	return 0, ErrNotFound
 }
@@ -60,11 +66,12 @@ func (wk *wukongDB) GetDevice(uid string, deviceFlag uint64) (Device, error) {
 
 	wk.metrics.GetDeviceAdd(1)
 
-	// 先从缓存获取
-	if device, found := wk.deviceCache.GetDevice(uid, deviceFlag); found {
-		return device, nil
-	}
+	return wk.deviceCache.getOrLoadDevice(uid, deviceFlag, func() (Device, error) {
+		return wk.getDeviceFromDB(uid, deviceFlag)
+	})
+}
 
+func (wk *wukongDB) getDeviceFromDB(uid string, deviceFlag uint64) (Device, error) {
 	// 缓存未命中，从数据库查询
 	// 获取设备id
 	id, err := wk.getDeviceId(uid, deviceFlag)
@@ -101,9 +108,6 @@ func (wk *wukongDB) GetDevice(uid string, deviceFlag uint64) (Device, error) {
 	if device == EmptyDevice {
 		return EmptyDevice, ErrNotFound
 	}
-
-	// 将结果写入缓存
-	wk.deviceCache.SetDevice(device)
 
 	return device, nil
 }
@@ -161,10 +165,22 @@ func (wk *wukongDB) AddDevice(d Device) error {
 	if d.Id == 0 {
 		return ErrInvalidDeviceId
 	}
+	old, err := wk.GetDevice(d.Uid, d.DeviceFlag)
+	if err != nil && err != ErrNotFound {
+		return err
+	}
+	if !IsEmptyDevice(old) && (old.TokenVersion > 0 || d.TokenVersion > 0) {
+		if !deviceTokenWriteAllowed(old, d) {
+			return nil
+		}
+		// 旧 Add 日志重放不得创建同一设备的第二条记录。
+		d.Id = old.Id
+		return wk.UpdateDevice(d)
+	}
 	db := wk.shardDB(d.Uid)
 	batch := db.NewBatch()
 	defer batch.Close()
-	err := wk.writeDevice(d, batch)
+	err = wk.writeDevice(d, batch)
 	if err != nil {
 		return err
 	}
@@ -194,6 +210,24 @@ func (wk *wukongDB) UpdateDevice(d Device) error {
 	if err != nil && err != ErrNotFound {
 		return err
 	}
+	// 直接按 UID/设备查最高版本，不能让另一条历史重复主键绕过版本保护。
+	currentID, lookupErr := wk.getDeviceId(d.Uid, d.DeviceFlag)
+	if lookupErr != nil && lookupErr != ErrNotFound {
+		return lookupErr
+	}
+	if currentID != 0 && currentID != d.Id {
+		current, readErr := wk.getDeviceById(currentID, db)
+		if readErr != nil {
+			return readErr
+		}
+		if current.TokenVersion > old.TokenVersion || (IsEmptyDevice(old) && d.TokenVersion > 0) {
+			d.Id, old = current.Id, current
+		}
+	}
+	// 在状态机落库处再次拒绝旧版本；忽略旧日志而不是让 Raft 重试错误。
+	if !deviceTokenWriteAllowed(old, d) {
+		return nil
+	}
 
 	if !IsEmptyDevice(old) {
 		old.CreatedAt = nil // 不删除创建时间
@@ -214,9 +248,11 @@ func (wk *wukongDB) UpdateDevice(d Device) error {
 		return err
 	}
 
-	// 更新缓存：先失效旧设备，再设置新设备
+	// 同一设备直接原子替换，不能先删掉新版本的缓存保护。
 	if !IsEmptyDevice(old) {
-		wk.deviceCache.InvalidateDevice(old.Uid, old.DeviceFlag)
+		if old.Uid != d.Uid || old.DeviceFlag != d.DeviceFlag {
+			wk.deviceCache.InvalidateDevice(old.Uid, old.DeviceFlag)
+		}
 	}
 	wk.deviceCache.SetDevice(d)
 
@@ -379,6 +415,11 @@ func (wk *wukongDB) writeDevice(d Device, w pebble.Writer) error {
 	if err = w.Set(key.NewDeviceColumnKey(d.Id, key.TableDevice.Column.Token), []byte(d.Token), wk.noSync); err != nil {
 		return err
 	}
+	version := make([]byte, 8)
+	wk.endian.PutUint64(version, d.TokenVersion)
+	if err = w.Set(key.NewDeviceColumnKey(d.Id, key.TableDevice.Column.TokenVersion), version, wk.noSync); err != nil {
+		return err
+	}
 
 	// deviceFlag
 	var deviceFlagBytes = make([]byte, 8)
@@ -494,6 +535,11 @@ func (wk *wukongDB) iterDevice(iter *pebble.Iterator, iterFnc func(d Device) boo
 			preDevice.Uid = string(iter.Value())
 		case key.TableDevice.Column.Token:
 			preDevice.Token = string(iter.Value())
+		case key.TableDevice.Column.TokenVersion:
+			if len(iter.Value()) != 8 {
+				return fmt.Errorf("invalid device token version length: %d", len(iter.Value()))
+			}
+			preDevice.TokenVersion = wk.endian.Uint64(iter.Value())
 		case key.TableDevice.Column.DeviceFlag:
 			preDevice.DeviceFlag = wk.endian.Uint64(iter.Value())
 		case key.TableDevice.Column.DeviceLevel:
@@ -521,4 +567,14 @@ func (wk *wukongDB) iterDevice(iter *pebble.Iterator, iterFnc func(d Device) boo
 		_ = iterFnc(preDevice)
 	}
 	return nil
+}
+
+func deviceTokenWriteAllowed(old, next Device) bool {
+	if old.TokenVersion == 0 && next.TokenVersion == 0 {
+		return true
+	}
+	if next.TokenVersion != old.TokenVersion {
+		return next.TokenVersion > old.TokenVersion
+	}
+	return next.Token == old.Token && next.DeviceLevel == old.DeviceLevel
 }

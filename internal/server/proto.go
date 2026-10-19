@@ -269,15 +269,16 @@ func (s *Server) handleUnauthenticatedConn(conn wknet.Conn, buff []byte, isJson 
 	}
 
 	connCtx := &eventbus.Conn{
-		NodeId:       s.opts.Cluster.NodeId,
-		ConnId:       conn.ID(),
-		SessionId:    uuid.NewString(),
-		Uid:          connectPacket.UID,
-		DeviceId:     connectPacket.DeviceID,
-		DeviceFlag:   wkproto.DeviceFlag(connectPacket.DeviceFlag),
-		ProtoVersion: connectPacket.Version,
-		Uptime:       fasttime.UnixTimestamp(),
-		IsJsonRpc:    isJson,
+		NodeId:        s.opts.Cluster.NodeId,
+		ConnId:        conn.ID(),
+		SessionId:     uuid.NewString(),
+		AuthTokenHash: eventbus.TokenFingerprint(connectPacket.Token),
+		Uid:           connectPacket.UID,
+		DeviceId:      connectPacket.DeviceID,
+		DeviceFlag:    wkproto.DeviceFlag(connectPacket.DeviceFlag),
+		ProtoVersion:  connectPacket.Version,
+		Uptime:        fasttime.UnixTimestamp(),
+		IsJsonRpc:     isJson,
 	}
 	if s.clusterServer != nil {
 		connCtx.AdmissionVersion = s.clusterServer.NodeVersion()

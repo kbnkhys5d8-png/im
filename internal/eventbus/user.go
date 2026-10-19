@@ -30,6 +30,8 @@ type IUser interface {
 	AddEvent(uid string, event *Event)
 	// Advance 推进事件（让事件池不需要等待直接执行下一轮事件）
 	Advance(uid string)
+	// UserTaskStopped 关闭时唤醒等待队列任务的调用方。
+	UserTaskStopped() <-chan struct{}
 	// 查询连接信息
 	ConnsByUid(uid string) []*Conn
 	// AuthedConnsByUid 查询已认证的连接

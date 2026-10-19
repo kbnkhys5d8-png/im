@@ -1,6 +1,9 @@
 package eventbus
 
-import "testing"
+import (
+	"bytes"
+	"testing"
+)
 
 func TestConnAdmissionVersionRemainsOwnerLocal(t *testing.T) {
 	conn := &Conn{Uid: "user", NodeId: 1, ConnId: 2, SessionId: "session", AdmissionVersion: 42}
@@ -109,5 +112,38 @@ func TestConnSessionEncodingCompatibility(t *testing.T) {
 	}
 	if err := decoded.Decode(data[:len(data)-1]); err == nil {
 		t.Fatal("截断的会话标识不能被当成有效旧编码")
+	}
+}
+
+func TestConnTokenFingerprintExtendsExistingEncoding(t *testing.T) {
+	conn := sessionTestConn()
+	conn.Internal, conn.AdmissionVersion = true, 42
+	previous, err := conn.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.AuthTokenHash = TokenFingerprint("test-token")
+	encoded, err := conn.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasPrefix(encoded, previous) {
+		t.Fatal("Token 指纹必须追加在 main 原有 Internal 和 SessionId 编码之后")
+	}
+	var decoded Conn
+	if err := decoded.Decode(encoded); err != nil {
+		t.Fatal(err)
+	}
+	if !decoded.Internal || !decoded.SameSession(conn) || decoded.AuthTokenHash != conn.AuthTokenHash || decoded.AdmissionVersion != 0 {
+		t.Fatal("扩展编码丢失原安全标记、严格会话身份或泄漏 owner 接入版本")
+	}
+	if err := decoded.Decode(previous); err != nil {
+		t.Fatal(err)
+	}
+	if !decoded.Internal || decoded.AuthTokenHash != "" || !decoded.SameSession(conn) {
+		t.Fatal("旧 main 编码必须保留安全字段并清除此前的 Token 指纹")
+	}
+	if err := decoded.Decode(encoded[:len(encoded)-1]); err == nil {
+		t.Fatal("截断的指纹不能作为有效连接解码")
 	}
 }

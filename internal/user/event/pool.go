@@ -3,6 +3,8 @@ package event
 import (
 	"fmt"
 	"hash/fnv"
+	"sync"
+	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/common"
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
@@ -17,13 +19,16 @@ import (
 type EventPool struct {
 	pollers []*poller
 	wklog.Log
-	handler eventbus.UserEventHandler
+	handler     eventbus.UserEventHandler
+	taskStopped chan struct{}
+	stopOnce    sync.Once
 }
 
 func NewEventPool(handler eventbus.UserEventHandler) *EventPool {
 	u := &EventPool{
-		handler: handler,
-		Log:     wklog.NewWKLog("EventPool"),
+		handler:     handler,
+		taskStopped: make(chan struct{}),
+		Log:         wklog.NewWKLog("EventPool"),
 	}
 	for i := 0; i < options.G.Poller.UserCount; i++ {
 		p := newPoller(i, u)
@@ -46,10 +51,21 @@ func (e *EventPool) Start() error {
 
 // Stop 停止
 func (e *EventPool) Stop() {
-	for _, p := range e.pollers {
-		p.stop()
-	}
+	e.stopOnce.Do(func() {
+		close(e.taskStopped)
+		for _, p := range e.pollers {
+			p.stop()
+		}
+		// 等待已开始的任务退出，避免停机后仍访问服务上下文。
+		for _, p := range e.pollers {
+			if err := p.handlePool.ReleaseTimeout(10 * time.Second); err != nil {
+				e.Warn("等待用户任务退出超时", zap.Error(err))
+			}
+		}
+	})
 }
+
+func (e *EventPool) UserTaskStopped() <-chan struct{} { return e.taskStopped }
 
 // AddEvent 添加事件
 func (e *EventPool) AddEvent(uid string, event *eventbus.Event) {

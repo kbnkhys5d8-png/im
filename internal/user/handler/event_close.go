@@ -21,17 +21,24 @@ func (h *Handler) closeConn(ctx *eventbus.UserContext) {
 			h.Error("closeConn: conn node id is 0")
 			return
 		}
-		// 移除逻辑连接
-		eventbus.User.DirectRemoveConn(conn)
-
 		// 如果不是本地节点，则转发关闭请求
 		if !options.G.IsLocalNode(conn.NodeId) {
+			eventbus.User.DirectRemoveConn(conn)
 			h.forwardToNode(conn.NodeId, conn.Uid, e)
-			return
+			continue
 		}
 
 		// 关闭真实连接
 		realConn, err := common.CheckConnValidAndGetRealConn(conn)
+		if err == nil && realConn != nil && e.Frame != nil && (e.Frame.GetFrameType() == wkproto.DISCONNECT || e.Frame.GetFrameType() == wkproto.SENDACK) {
+			// 关闭前尽力写出踢号提示或失败回执，只刷新一次，不为通知保留旧会话宽限期。
+			h.writeLocalFrame(e)
+			if flushErr := realConn.Flush(); flushErr != nil {
+				h.Warn("关闭前回执刷新失败", zap.Error(flushErr))
+			}
+		}
+		// 先保留精确匹配的真实连接，移除索引后仍可关闭原对象。
+		eventbus.User.DirectRemoveConn(conn)
 		if err != nil {
 			h.Warn("closeConn: conn invalid", zap.Error(err), zap.String("uid", conn.Uid), zap.Int64("connId", conn.ConnId))
 			continue

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
+	"github.com/WuKongIM/WuKongIM/internal/ingress"
 	"github.com/WuKongIM/WuKongIM/internal/options"
 	"github.com/WuKongIM/WuKongIM/internal/service"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
@@ -42,6 +43,7 @@ func newUser(s *Server) *user {
 func (u *user) route(r *wkhttp.WKHttp) {
 
 	r.POST("/user/token", u.updateToken)                  // 更新用户token
+	r.POST("/user/token/fenced", u.updateToken)           // 按版本更新 Token，供新版 API 内网调用
 	r.POST("/user/device_quit", u.deviceQuit)             // 强制设备退出
 	r.POST("/user/onlinestatus", u.getOnlineStatus)       // 获取用户在线状态
 	r.POST("/user/systemuids_add", u.systemUidsAdd)       // 添加系统uid
@@ -80,12 +82,19 @@ func (u *user) deviceQuit(c *wkhttp.Context) {
 		return
 	}
 
+	flags := []wkproto.DeviceFlag{wkproto.DeviceFlag(req.DeviceFlag)}
 	if req.DeviceFlag == -1 {
-		_ = u.quitUserDevice(req.UID, wkproto.APP)
-		_ = u.quitUserDevice(req.UID, wkproto.WEB)
-		_ = u.quitUserDevice(req.UID, wkproto.PC)
-	} else {
-		_ = u.quitUserDevice(req.UID, wkproto.DeviceFlag(req.DeviceFlag))
+		flags = []wkproto.DeviceFlag{wkproto.APP, wkproto.WEB, wkproto.PC}
+	}
+	var quitErr error
+	for _, flag := range flags {
+		if err := u.quitUserDevice(req.UID, flag); err != nil {
+			quitErr = err
+		}
+	}
+	if quitErr != nil {
+		c.ResponseError(quitErr)
+		return
 	}
 
 	c.ResponseOK()
@@ -94,6 +103,15 @@ func (u *user) deviceQuit(c *wkhttp.Context) {
 
 // 这里清空token 让设备去重新登录 空token是不让登录的
 func (u *user) quitUserDevice(uid string, deviceFlag wkproto.DeviceFlag) error {
+	return eventbus.User.RunOnUserLeader(context.Background(), uid, func() error {
+		return u.quitUserDeviceOnLeader(uid, deviceFlag)
+	})
+}
+
+func (u *user) quitUserDeviceOnLeader(uid string, deviceFlag wkproto.DeviceFlag) error {
+	lockKey := tokenUpdateLockKey(uid, deviceFlag)
+	u.tokenUpdateLock.Lock(lockKey)
+	defer u.tokenUpdateLock.Unlock(lockKey)
 
 	device, err := service.Store.GetDevice(uid, deviceFlag)
 	if err != nil && err != wkdb.ErrNotFound {
@@ -102,36 +120,46 @@ func (u *user) quitUserDevice(uid string, deviceFlag wkproto.DeviceFlag) error {
 	}
 	if wkdb.IsEmptyDevice(device) {
 		u.Error("设备信息不存在！", zap.String("uid", uid), zap.Uint8("deviceFlag", deviceFlag.ToUint8()))
-		return errors.New("设备信息不存在！")
+		// 不存在即已退出，保留旧接口对不存在设备的幂等成功行为。
+		return nil
 	}
 
 	updatedAt := time.Now()
+	version := device.TokenVersion
+	if version > 0 {
+		if version >= 9007199254740990 {
+			return errors.New("Token更新版本超出范围")
+		}
+		version++
+	}
 	err = service.Store.UpdateDevice(wkdb.Device{
-		Id:          device.Id,
-		Uid:         uid,
-		DeviceFlag:  uint64(deviceFlag),
-		DeviceLevel: uint8(wkproto.DeviceLevelMaster),
-		Token:       "",
-		CreatedAt:   device.CreatedAt,
-		UpdatedAt:   &updatedAt,
+		Id:           device.Id,
+		Uid:          uid,
+		DeviceFlag:   uint64(deviceFlag),
+		DeviceLevel:  uint8(wkproto.DeviceLevelMaster),
+		Token:        "",
+		TokenVersion: version,
+		CreatedAt:    device.CreatedAt,
+		UpdatedAt:    &updatedAt,
 	}) // 这里的deviceLevel可以随便给 不影响逻辑 这里随便给的master
 	if err != nil {
 		u.Error("清空用户token失败！", zap.Error(err), zap.String("uid", uid), zap.Uint8("deviceFlag", deviceFlag.ToUint8()))
 		return err
 	}
-	oldConns := eventbus.User.ConnsByDeviceFlag(uid, deviceFlag)
-	if len(oldConns) > 0 {
-		for _, oldConn := range oldConns {
-			eventbus.User.ConnWrite("", oldConn, &wkproto.DisconnectPacket{
-				ReasonCode: wkproto.ReasonConnectKick,
-			})
-			u.s.timingWheel.AfterFunc(time.Second*2, func() {
-				eventbus.User.CloseConn(oldConn)
-			})
-		}
+	if err := checkTokenLeader(uid); err != nil {
+		return err
 	}
-
-	return nil
+	current, err := service.Store.GetDevice(uid, deviceFlag)
+	if err != nil {
+		return err
+	}
+	if current.TokenVersion != version || current.Token != "" {
+		return errTokenVersionConflict
+	}
+	if err := u.revokeTokenConnections(uid, deviceFlag, true, ""); err != nil {
+		return err
+	}
+	return checkTokenLeader(uid)
 }
 
 func (u *user) getOnlineStatus(c *wkhttp.Context) {
@@ -265,6 +293,10 @@ func (u *user) updateToken(c *wkhttp.Context) {
 		c.ResponseError(err)
 		return
 	}
+	if c.Request.URL.Path == "/user/token/fenced" && req.TokenVersion == 0 {
+		c.ResponseError(errors.New("token_version必须大于0"))
+		return
+	}
 
 	if req.UID == options.G.SystemUID {
 		c.ResponseError(errors.New("系统账号不允许更新token！"))
@@ -284,18 +316,38 @@ func (u *user) updateToken(c *wkhttp.Context) {
 		return
 	}
 
+	// Token 写入与 CONNECT 验密至登记在认证 leader 上串行，避免在途连接逃过撤销。
+	err = eventbus.User.RunOnUserLeader(c.Request.Context(), req.UID, func() error { return u.updateTokenOnLeader(req) })
+	var denied *tokenPermissionDenied
+	switch {
+	case err == nil:
+		respondTokenUpdated(c, req)
+	case errors.Is(err, errTokenVersionConflict):
+		c.JSON(http.StatusConflict, map[string]interface{}{"msg": err.Error(), "status": http.StatusConflict})
+	case errors.As(err, &denied):
+		c.ResponseStatus(int(denied.reason))
+	default:
+		c.ResponseError(err)
+	}
+}
+
+var errTokenVersionConflict = errors.New("Token更新版本已失效")
+
+type tokenPermissionDenied struct{ reason wkproto.ReasonCode }
+
+func (e *tokenPermissionDenied) Error() string { return e.reason.String() }
+
+func (u *user) updateTokenOnLeader(req UpdateTokenReq) error {
 	u.Debug("update token request", updateTokenLogFields(req)...)
 
 	// 使用共享权限服务检查频道权限
 	reasonCode, err := service.Permission.HasPermissionForChannel(req.UID, wkproto.ChannelTypePerson)
 	if err != nil {
 		u.Error("检查频道权限失败！", zap.Error(err), zap.String("uid", req.UID))
-		c.ResponseError(err)
-		return
+		return err
 	}
 	if reasonCode != wkproto.ReasonSuccess {
-		c.ResponseStatus(int(reasonCode))
-		return
+		return &tokenPermissionDenied{reason: reasonCode}
 	}
 
 	lockKey := tokenUpdateLockKey(req.UID, req.DeviceFlag)
@@ -305,8 +357,7 @@ func (u *user) updateToken(c *wkhttp.Context) {
 	user, err := service.Store.GetUser(req.UID) // 确保用户存在
 	if err != nil && err != wkdb.ErrNotFound {
 		u.Error("获取用户信息失败！", zap.Error(err), zap.String("uid", req.UID))
-		c.ResponseError(err)
-		return
+		return err
 	}
 
 	// 如果用户不存在，则添加用户
@@ -320,83 +371,156 @@ func (u *user) updateToken(c *wkhttp.Context) {
 		})
 		if err != nil {
 			u.Error("添加用户失败！", zap.Error(err), zap.String("uid", req.UID))
-			c.ResponseError(err)
-			return
+			return err
 		}
 	}
 
 	device, err := service.Store.GetDevice(req.UID, req.DeviceFlag)
 	if err != nil && err != wkdb.ErrNotFound {
 		u.Error("获取设备信息失败！", zap.Error(err), zap.String("uid", req.UID), zap.Uint8("deviceFlag", req.DeviceFlag.ToUint8()))
-		c.ResponseError(err)
-		return
+		return err
+	}
+	if !tokenVersionMatches(device, req) {
+		return errTokenVersionConflict
 	}
 	if !deviceTokenUpdateRequired(device, req) {
 		u.Debug("token和设备等级未变化，跳过重复更新", zap.String("uid", req.UID), zap.Uint8("deviceFlag", req.DeviceFlag.ToUint8()))
-		c.ResponseOK()
-		return
+		// 重试同一版本时仍需完成上次失败的远端关闭，但不踢正常同 Token 连接。
+		if err := checkTokenLeader(req.UID); err != nil {
+			return err
+		}
+		if err := u.revokeTokenConnections(req.UID, req.DeviceFlag, false, eventbus.TokenFingerprint(req.Token)); err != nil {
+			return err
+		}
+		return checkTokenLeader(req.UID)
+	}
+	tokenChanged := wkdb.IsEmptyDevice(device) || device.Token != req.Token || device.DeviceLevel != uint8(req.DeviceLevel)
+	if err := checkTokenLeader(req.UID); err != nil {
+		return err
 	}
 
 	// 不存在设备则添加设备，存在则更新设备
 	if wkdb.IsEmptyDevice(device) {
 		createdAt := time.Now()
 		err = service.Store.AddDevice(wkdb.Device{
-			Id:          service.Store.NextPrimaryKey(),
-			Uid:         req.UID,
-			DeviceFlag:  uint64(req.DeviceFlag),
-			DeviceLevel: uint8(req.DeviceLevel),
-			Token:       req.Token,
-			CreatedAt:   &createdAt,
-			UpdatedAt:   &createdAt,
+			Id:           service.Store.NextPrimaryKey(),
+			Uid:          req.UID,
+			DeviceFlag:   uint64(req.DeviceFlag),
+			DeviceLevel:  uint8(req.DeviceLevel),
+			Token:        req.Token,
+			TokenVersion: req.TokenVersion,
+			CreatedAt:    &createdAt,
+			UpdatedAt:    &createdAt,
 		})
 		if err != nil {
 			u.Error("添加设备失败！", zap.Error(err), zap.String("uid", req.UID), zap.Uint8("deviceFlag", req.DeviceFlag.ToUint8()))
-			c.ResponseError(err)
-			return
+			return err
 		}
 	} else {
 		updatedAt := time.Now()
 		err = service.Store.UpdateDevice(wkdb.Device{
-			Id:          device.Id,
-			Uid:         req.UID,
-			DeviceFlag:  uint64(req.DeviceFlag),
-			DeviceLevel: uint8(req.DeviceLevel),
-			Token:       req.Token,
-			UpdatedAt:   &updatedAt,
+			Id:           device.Id,
+			Uid:          req.UID,
+			DeviceFlag:   uint64(req.DeviceFlag),
+			DeviceLevel:  uint8(req.DeviceLevel),
+			Token:        req.Token,
+			TokenVersion: req.TokenVersion,
+			UpdatedAt:    &updatedAt,
 		})
 		if err != nil {
 			u.Error("更新设备失败！", zap.Error(err), zap.String("uid", req.UID), zap.Uint8("deviceFlag", req.DeviceFlag.ToUint8()))
-			c.ResponseError(err)
-			return
+			return err
 		}
 	}
 
-	if req.DeviceLevel == wkproto.DeviceLevelMaster {
-		// 如果存在旧连接，则发起踢出请求
-		oldConns := eventbus.User.ConnsByDeviceFlag(req.UID, req.DeviceFlag)
-		if len(oldConns) > 0 {
-			for _, oldConn := range oldConns {
-				u.Debug("更新Token时，存在旧连接！", zap.String("uid", req.UID), zap.Int64("id", oldConn.ConnId), zap.String("deviceFlag", req.DeviceFlag.String()))
-				// 踢旧连接
-				eventbus.User.ConnWrite("", oldConn, &wkproto.DisconnectPacket{
-					ReasonCode: wkproto.ReasonConnectKick,
-					Reason:     "账号在其他设备上登录",
-				})
-				u.s.timingWheel.AfterFunc(time.Second*10, func() {
-					eventbus.User.CloseConn(oldConn)
-				})
+	// 集群落库也可能忽略过时日志；确认当前版本后才允许踢旧连接。
+	current, err := service.Store.GetDevice(req.UID, req.DeviceFlag)
+	if err != nil {
+		return err
+	}
+	if current.TokenVersion != req.TokenVersion || current.Token != req.Token || current.DeviceLevel != uint8(req.DeviceLevel) {
+		return errTokenVersionConflict
+	}
+	if err := checkTokenLeader(req.UID); err != nil {
+		return err
+	}
+	if err := u.revokeTokenConnections(req.UID, req.DeviceFlag, tokenChanged && req.DeviceLevel == wkproto.DeviceLevelMaster, eventbus.TokenFingerprint(req.Token)); err != nil {
+		return err
+	}
+	return checkTokenLeader(req.UID)
+}
+
+func checkTokenLeader(uid string) error {
+	leader := service.Cluster.SlotLeaderId(service.Cluster.GetSlotId(uid))
+	if leader == 0 || !options.G.IsLocalNode(leader) {
+		return errors.New("认证节点已变化，请重试")
+	}
+	return nil
+}
+
+// 必须在 leader 的 UID 队列内调用；成功响应前精确关闭源节点旧会话。
+func (u *user) revokeTokenConnections(uid string, flag wkproto.DeviceFlag, changed bool, currentHash string) error {
+	conns := eventbus.User.ConnsByDeviceFlag(uid, flag)
+	markRevoked := func(conn *eventbus.Conn) {
+		if conn.AuthTokenHash != currentHash || (changed && (currentHash == "" || (conn.Auth && conn.DeviceLevel != wkproto.DeviceLevelMaster))) {
+			conn.Revoked.Store(true)
+		}
+	}
+	// 源节点查询可能失败，必须先拦住已知旧会话，不能等全部查询成功后才撤销。
+	for _, conn := range conns {
+		markRevoked(conn)
+	}
+	// leader 接管后逻辑索引可能为空；必须向所有源节点确认物理会话，失败则不确认撤销成功。
+	for _, node := range service.Cluster.Nodes() {
+		var sources []*eventbus.Conn
+		if options.G.IsLocalNode(node.Id) {
+			sources = ingress.LocalUserConns(uid)
+		} else {
+			var err error
+			sources, err = ingress.NewClient().UserConns(node.Id, uid)
+			if err != nil {
+				return err
+			}
+		}
+		for _, source := range sources {
+			if source.DeviceFlag != flag {
+				continue
+			}
+			// 已发现的旧会话也立即标记，避免后续另一个源节点失败时遗漏。
+			markRevoked(source)
+			found := false
+			for _, existing := range conns {
+				if existing.SameSession(source) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				conns = append(conns, source)
 			}
 		}
 	}
-
-	// // 创建或更新个人频道
-	// err = u.s.channelManager.CreateOrUpdatePersonChannel(req.UID)
-	// if err != nil {
-	// 	u.Error("创建个人频道失败！", zap.Error(err))
-	// 	c.ResponseError(errors.New("创建个人频道失败！"))
-	// 	return
-	// }
-	c.ResponseOK()
+	if err := checkTokenLeader(uid); err != nil {
+		return err
+	}
+	for _, conn := range conns {
+		if !conn.Revoked.Load() {
+			continue
+		}
+		if options.G.IsLocalNode(conn.NodeId) {
+			eventbus.ExecuteUserEvent(&eventbus.UserContext{Uid: uid, EventType: eventbus.EventConnClose,
+				Events: []*eventbus.Event{{Type: eventbus.EventConnClose, Conn: conn, Frame: &wkproto.DisconnectPacket{
+					ReasonCode: wkproto.ReasonConnectKick, Reason: "账号在其他设备上登录",
+				}}},
+			})
+		} else {
+			if err := ingress.NewClient().RevokeConn(conn); err != nil {
+				return err
+			}
+			eventbus.User.DirectRemoveConn(conn)
+		}
+	}
+	return nil
 }
 
 // 添加系统uid
@@ -654,14 +778,34 @@ func (u *user) updatePluginNo(c *wkhttp.Context) {
 
 // UpdateTokenReq 更新token请求
 type UpdateTokenReq struct {
-	UID         string              `json:"uid"`          // 用户唯一uid
-	Token       string              `json:"token"`        // 用户的token
-	DeviceFlag  wkproto.DeviceFlag  `json:"device_flag"`  // 设备标识  0.app 1.web
-	DeviceLevel wkproto.DeviceLevel `json:"device_level"` // 设备等级 0.为从设备 1.为主设备
+	UID          string              `json:"uid"`           // 用户唯一uid
+	Token        string              `json:"token"`         // 用户的token
+	TokenVersion uint64              `json:"token_version"` // 内部写入版本，旧请求为零
+	DeviceFlag   wkproto.DeviceFlag  `json:"device_flag"`   // 设备标识  0.app 1.web
+	DeviceLevel  wkproto.DeviceLevel `json:"device_level"`  // 设备等级 0.为从设备 1.为主设备
 }
 
 func deviceTokenUpdateRequired(device wkdb.Device, req UpdateTokenReq) bool {
-	return wkdb.IsEmptyDevice(device) || device.Token != req.Token || device.DeviceLevel != uint8(req.DeviceLevel)
+	return wkdb.IsEmptyDevice(device) || device.Token != req.Token || device.DeviceLevel != uint8(req.DeviceLevel) || device.TokenVersion != req.TokenVersion
+}
+
+func tokenVersionMatches(device wkdb.Device, req UpdateTokenReq) bool {
+	if device.TokenVersion == 0 && req.TokenVersion == 0 {
+		return true
+	}
+	if req.TokenVersion != device.TokenVersion {
+		return req.TokenVersion > device.TokenVersion
+	}
+	return device.Token == req.Token && device.DeviceLevel == uint8(req.DeviceLevel)
+}
+
+func respondTokenUpdated(c *wkhttp.Context, req UpdateTokenReq) {
+	if req.TokenVersion == 0 {
+		c.ResponseOK()
+		return
+	}
+	// 版本放在响应体，跨节点转发时也能保留确认依据。
+	c.JSON(http.StatusOK, map[string]interface{}{"status": http.StatusOK, "token_version": req.TokenVersion})
 }
 
 func updateTokenLogFields(req UpdateTokenReq) []zap.Field {
@@ -686,6 +830,9 @@ func (u UpdateTokenReq) Check() error {
 	// }
 	if u.Token == "" {
 		return errors.New("token不能为空！")
+	}
+	if u.TokenVersion >= 9007199254740991 {
+		return errors.New("Token更新版本超出范围")
 	}
 
 	if options.IsSpecialChar(u.UID) {

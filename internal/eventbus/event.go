@@ -45,6 +45,8 @@ const (
 	EventPushOffline
 	// EventChannelDistributeInitial 普通频道的首次全局分发，追加编号以保持既有编码。
 	EventChannelDistributeInitial
+	// EventUserLeaderTask 仅在本地认证 leader 的 UID 队列内执行，不参与网络编码。
+	EventUserLeaderTask
 )
 
 func (e EventType) String() string {
@@ -102,6 +104,8 @@ type Event struct {
 	ChannelId         string          // 频道ID
 	ChannelType       uint8           // 频道类型
 	ReqId             string          // 请求ID(非必填)(jsonrpc)
+
+	UserLeaderTask *UserTask
 }
 
 func (e *Event) Clone() *Event {
@@ -124,6 +128,7 @@ func (e *Event) Clone() *Event {
 		ChannelId:         e.ChannelId,
 		ChannelType:       e.ChannelType,
 		ReqId:             e.ReqId,
+		UserLeaderTask:    e.UserLeaderTask,
 	}
 }
 
@@ -165,6 +170,9 @@ func (e *Event) Size() uint64 {
 }
 
 func (e Event) encodeWithEcoder(enc *wkproto.Encoder) error {
+	if e.Type == EventUserLeaderTask {
+		return fmt.Errorf("local user leader task cannot be forwarded")
+	}
 	var flag uint8 = e.hasConn()<<7 | e.hasFrame()<<6 | e.hasTrack()<<5 | e.hasChannel()<<4 | e.hasReqId()<<3
 	enc.WriteUint8(flag)
 
@@ -223,6 +231,9 @@ func (e *Event) decodeWithDecoder(dec *wkproto.Decoder) error {
 		return err
 	}
 	e.Type = EventType(typeUint8)
+	if e.Type == EventUserLeaderTask {
+		return fmt.Errorf("local user leader task cannot be decoded")
+	}
 
 	if hasConn == 1 {
 		data, err := dec.Binary()

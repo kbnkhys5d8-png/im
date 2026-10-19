@@ -2,6 +2,8 @@ package eventbus
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"sync/atomic"
 
@@ -33,7 +35,8 @@ type Conn struct {
 	// 连接id
 	ConnId int64
 	// 接入节点为真实连接生成的会话标识，不属于客户端协议。
-	SessionId string
+	SessionId     string
+	AuthTokenHash string // 验密时 Token 的指纹，用于迁移后的幂等撤销
 	// 对应设备的id
 	DeviceId string
 	// 对应设备的标记
@@ -54,7 +57,8 @@ type Conn struct {
 	Uptime uint64
 
 	// 不参与编码
-	LastActive uint64 // 最后一次活动时间单位秒
+	LastActive uint64      // 最后一次活动时间单位秒
+	Revoked    atomic.Bool // leader 撤销后立即拒绝该会话的在途请求
 	// 仅 owner 内存保存接入时配置版本，回传认证结果不得覆盖它。
 	AdmissionVersion uint64
 
@@ -76,13 +80,18 @@ func (c *Conn) Encode() ([]byte, error) {
 	enc.WriteUint64(c.Uptime)
 	enc.WriteUint8(wkutil.BoolToUint8(c.IsJsonRpc))
 	enc.WriteUint8(wkutil.BoolToUint8(c.Internal))
-	if c.SessionId != "" {
+	if c.SessionId != "" || c.AuthTokenHash != "" {
 		enc.WriteString(c.SessionId)
+	}
+	// 指纹追加在既有 Internal 和 SessionId 之后，不改变原编码字段顺序。
+	if c.AuthTokenHash != "" {
+		enc.WriteString(c.AuthTokenHash)
 	}
 	return enc.Bytes(), nil
 }
 
 func (c *Conn) Decode(data []byte) error {
+	c.AuthTokenHash = ""
 	dec := wkproto.NewDecoder(data)
 	var err error
 	if c.Uid, err = dec.String(); err != nil {
@@ -151,14 +160,22 @@ func (c *Conn) Decode(data []byte) error {
 			return err
 		}
 	}
+	if dec.Len() > 0 {
+		if c.AuthTokenHash, err = dec.String(); err != nil {
+			return err
+		}
+	}
 
 	return nil
 }
 
 func (c *Conn) Size() uint64 {
 	size := uint64(8 + len(c.Uid) + len(c.DeviceId) + 1 + 1 + 8 + 1 + len(c.AesIV) + len(c.AesKey) + 1 + 1)
-	if c.SessionId != "" {
+	if c.SessionId != "" || c.AuthTokenHash != "" {
 		size += uint64(2 + len(c.SessionId))
+	}
+	if c.AuthTokenHash != "" {
+		size += uint64(2 + len(c.AuthTokenHash))
 	}
 	return size
 }
@@ -176,6 +193,11 @@ func (c *Conn) SameSession(other *Conn) bool {
 func (c *Conn) Equal(cn *Conn) bool {
 
 	return c.Uid == cn.Uid && c.ConnId == cn.ConnId && c.NodeId == cn.NodeId
+}
+
+func TokenFingerprint(token string) string {
+	hash := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(hash[:])
 }
 
 func (c *Conn) String() string {

@@ -29,7 +29,11 @@ func (textSendPermissionDB) GetChannel(string, uint8) (wkdb.ChannelInfo, error) 
 type textSendUser struct {
 	eventbus.IUser
 	events []*eventbus.Event
+	conn   *eventbus.Conn
 }
+
+// 会话门禁前登记夹具连接，原正文和钱包断言继续验证完整发送路径。
+func (u *textSendUser) ConnById(string, uint64, int64) *eventbus.Conn { return u.conn }
 
 func (u *textSendUser) AddEvent(_ string, event *eventbus.Event) {
 	u.events = append(u.events, event)
@@ -188,6 +192,7 @@ func TestHandleOnSendRejectsForgedWalletCardsAndContinuesBatch(t *testing.T) {
 				}
 				// 客户端即使伪装系统设备和钱包消息编号，也不能取得服务端发卡权限。
 				conn := &eventbus.Conn{Uid: "sender", DeviceId: options.G.SystemDeviceId, IsJsonRpc: jsonRPC, AesKey: []byte("0123456789abcdef"), AesIV: []byte("0123456789abcdef")}
+				user.conn = conn
 				packet := &wkproto.SendPacket{
 					Framer:    wkproto.Framer{NoPersist: tt.noPersist},
 					ChannelID: "peer", ChannelType: wkproto.ChannelTypePerson,

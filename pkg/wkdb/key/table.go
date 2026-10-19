@@ -186,12 +186,13 @@ var TableDevice = struct {
 	IndexSize       int
 	SecondIndexSize int
 	Column          struct {
-		Uid         [2]byte // 用户uid
-		Token       [2]byte // 设备Token
-		DeviceFlag  [2]byte // 设备标识
-		DeviceLevel [2]byte // 设备等级
-		CreatedAt   [2]byte // 创建时间
-		UpdatedAt   [2]byte // 更新时间
+		Uid          [2]byte // 用户uid
+		Token        [2]byte // 设备Token
+		TokenVersion [2]byte // Token 写入版本
+		DeviceFlag   [2]byte // 设备标识
+		DeviceLevel  [2]byte // 设备等级
+		CreatedAt    [2]byte // 创建时间
+		UpdatedAt    [2]byte // 更新时间
 	}
 	SecondIndex struct {
 		Uid         [2]byte
@@ -206,19 +207,21 @@ var TableDevice = struct {
 	IndexSize:       2 + 2 + 2 + 8,     // tableId + dataType + indexName + columnValue
 	SecondIndexSize: 2 + 2 + 2 + 8 + 8, // tableId + dataType + secondIndexName + columnValue + primaryKey
 	Column: struct {
-		Uid         [2]byte
-		Token       [2]byte
-		DeviceFlag  [2]byte
-		DeviceLevel [2]byte
-		CreatedAt   [2]byte
-		UpdatedAt   [2]byte
+		Uid          [2]byte
+		Token        [2]byte
+		TokenVersion [2]byte
+		DeviceFlag   [2]byte
+		DeviceLevel  [2]byte
+		CreatedAt    [2]byte
+		UpdatedAt    [2]byte
 	}{
-		Uid:         [2]byte{0x03, 0x01},
-		Token:       [2]byte{0x03, 0x02},
-		DeviceFlag:  [2]byte{0x03, 0x03},
-		DeviceLevel: [2]byte{0x03, 0x04},
-		CreatedAt:   [2]byte{0x03, 0x05},
-		UpdatedAt:   [2]byte{0x03, 0x06},
+		Uid:          [2]byte{0x03, 0x01},
+		Token:        [2]byte{0x03, 0x02},
+		TokenVersion: [2]byte{0x03, 0x07},
+		DeviceFlag:   [2]byte{0x03, 0x03},
+		DeviceLevel:  [2]byte{0x03, 0x04},
+		CreatedAt:    [2]byte{0x03, 0x05},
+		UpdatedAt:    [2]byte{0x03, 0x06},
 	},
 	SecondIndex: struct {
 		Uid         [2]byte

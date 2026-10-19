@@ -51,6 +51,15 @@ func (h *Handler) OnMessage(m *proto.Message) {
 // 收到事件
 func (h *Handler) OnEvent(ctx *eventbus.UserContext) {
 	slotLeaderId := h.userLeaderNodeId(ctx.Uid)
+	if ctx.EventType == eventbus.EventUserLeaderTask {
+		// 本地任务不能转发，换主后拒绝旧 leader 上排队的 Token 写入。
+		for _, event := range ctx.Events {
+			if event.UserLeaderTask != nil {
+				event.UserLeaderTask.Execute(slotLeaderId != 0 && options.G.IsLocalNode(slotLeaderId))
+			}
+		}
+		return
+	}
 	if slotLeaderId == 0 {
 		h.Error("OnEvent: get slotLeaderId is 0")
 		return
@@ -215,7 +224,9 @@ func (h *Handler) onForwardUserEvent(m *proto.Message) {
 				// 新握手必须保留接入节点的会话代次，不能继承复用连接号的旧目录和认证状态。
 				newConnectSession := e.Type == eventbus.EventConnect && e.Conn.SessionId != "" &&
 					e.Conn.SessionId != conn.SessionId
-				if !newConnectSession {
+				// 带指纹的新认证结果保留验密字段；旧编码仍沿用原连接替换流程。
+				newTokenConnack := e.Type == eventbus.EventConnack && e.Conn.AuthTokenHash != ""
+				if !newConnectSession && !newTokenConnack {
 					e.Conn = conn
 				}
 			}

@@ -34,7 +34,7 @@ func TestUnauthenticatedConnGeneratesUniqueInternalSession(t *testing.T) {
 	u := &sessionProtoUser{}
 	eventbus.RegisterUser(u)
 	s := &Server{opts: options.G}
-	packet := &wkproto.ConnectPacket{UID: "user", DeviceID: "device", Version: wkproto.LatestVersion}
+	packet := &wkproto.ConnectPacket{UID: "user", Token: "test-token", DeviceID: "device", Version: wkproto.LatestVersion}
 	data, err := s.opts.Proto.EncodeFrame(packet, wkproto.LatestVersion)
 	if err != nil {
 		t.Fatal(err)
@@ -51,6 +51,9 @@ func TestUnauthenticatedConnGeneratesUniqueInternalSession(t *testing.T) {
 		}
 		if ctx.Auth || conn.ctx != ctx || consumed != len(data) || u.events[i].Conn != ctx {
 			t.Fatal("会话标识不能改变原客户端握手或绕过认证")
+		}
+		if ctx.Internal || ctx.AuthTokenHash != eventbus.TokenFingerprint(packet.Token) {
+			t.Fatal("客户端不得取得内部标记，接入上下文只保存 Token 指纹")
 		}
 		previousSession = ctx.SessionId
 	}

@@ -2,8 +2,10 @@ package wkdb
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
+	"github.com/WuKongIM/WuKongIM/pkg/wkdb/key"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	lru "github.com/hashicorp/golang-lru/v2"
 	"go.uber.org/zap"
@@ -13,6 +15,10 @@ import (
 type DeviceCache struct {
 	// 设备缓存 key: uid:deviceFlag
 	cache *lru.Cache[string, *DeviceCacheItem]
+	mu    sync.Mutex
+	// 固定分段记录回填代次，避免缓存淘汰后丢失在途查询的失效依据。
+	loadVersions [1024]uint64
+	clearVersion uint64
 
 	// 配置
 	maxCacheSize int           // 缓存最大数量
@@ -51,39 +57,87 @@ func NewDeviceCache(maxCacheSize int) *DeviceCache {
 
 // GetDevice 从缓存获取设备
 func (c *DeviceCache) GetDevice(uid string, deviceFlag uint64) (Device, bool) {
-	key := c.getDeviceKey(uid, deviceFlag)
-	if item, ok := c.cache.Get(key); ok {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.getDeviceLocked(c.getDeviceKey(uid, deviceFlag))
+}
+
+func (c *DeviceCache) getDeviceLocked(cacheKey string) (Device, bool) {
+	if item, ok := c.cache.Get(cacheKey); ok {
 		if !item.IsExpired() {
 			return item.Device, true
 		}
-		// 缓存过期，异步删除
-		go func() {
-			c.cache.Remove(key)
-		}()
+		// 在同一临界区删除，不能让延迟清理误删随后写入的新 Token。
+		c.cache.Remove(cacheKey)
 	}
 	return EmptyDevice, false
 }
 
+func (c *DeviceCache) getOrLoadDevice(uid string, deviceFlag uint64, load func() (Device, error)) (Device, error) {
+	cacheKey := c.getDeviceKey(uid, deviceFlag)
+	index := key.HashWithString(cacheKey) % uint64(len(c.loadVersions))
+	for {
+		c.mu.Lock()
+		if device, found := c.getDeviceLocked(cacheKey); found {
+			c.mu.Unlock()
+			return device, nil
+		}
+		version, clearVersion := c.loadVersions[index], c.clearVersion
+		c.mu.Unlock()
+
+		// 磁盘读取不持缓存锁；更新或失效后必须丢弃旧结果，包括旧查询错误。
+		device, err := load()
+		c.mu.Lock()
+		if version != c.loadVersions[index] || clearVersion != c.clearVersion {
+			c.mu.Unlock()
+			continue
+		}
+		if err == nil {
+			device = c.setDeviceLocked(device)
+		}
+		c.mu.Unlock()
+		return device, err
+	}
+}
+
 // SetDevice 设置设备到缓存
 func (c *DeviceCache) SetDevice(device Device) {
-	key := c.getDeviceKey(device.Uid, device.DeviceFlag)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cacheKey := c.getDeviceKey(device.Uid, device.DeviceFlag)
+	c.loadVersions[key.HashWithString(cacheKey)%uint64(len(c.loadVersions))]++
+	c.setDeviceLocked(device)
+}
 
+func (c *DeviceCache) setDeviceLocked(device Device) Device {
+	cacheKey := c.getDeviceKey(device.Uid, device.DeviceFlag)
+	if current, found := c.cache.Peek(cacheKey); found && !deviceTokenWriteAllowed(current.Device, device) {
+		return current.Device
+	}
 	item := &DeviceCacheItem{
 		Device:   device,
 		CachedAt: time.Now(),
 		TTL:      c.cacheTTL,
 	}
-	c.cache.Add(key, item)
+	c.cache.Add(cacheKey, item)
+	return device
 }
 
 // InvalidateDevice 使指定设备缓存失效
 func (c *DeviceCache) InvalidateDevice(uid string, deviceFlag uint64) {
-	key := c.getDeviceKey(uid, deviceFlag)
-	c.cache.Remove(key)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cacheKey := c.getDeviceKey(uid, deviceFlag)
+	c.loadVersions[key.HashWithString(cacheKey)%uint64(len(c.loadVersions))]++
+	c.cache.Remove(cacheKey)
 }
 
 // InvalidateUserDevices 使指定用户的所有设备缓存失效
 func (c *DeviceCache) InvalidateUserDevices(uid string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// 在途查询可能尚未出现在缓存中，批量失效也要阻止它们回填。
+	c.clearVersion++
 	keys := c.cache.Keys()
 	userPrefix := uid + ":"
 
@@ -113,6 +167,8 @@ func (c *DeviceCache) BatchInvalidateDevices(devices []struct {
 
 // InvalidateByDeviceId 使指定设备ID的缓存失效
 func (c *DeviceCache) InvalidateByDeviceId(deviceId uint64) {
+	c.mu.Lock()
+	c.clearVersion++
 	keys := c.cache.Keys()
 	removedCount := 0
 
@@ -124,6 +180,7 @@ func (c *DeviceCache) InvalidateByDeviceId(deviceId uint64) {
 			}
 		}
 	}
+	c.mu.Unlock()
 
 	if removedCount > 0 {
 		c.Debug("Invalidated devices by device ID",
@@ -134,6 +191,8 @@ func (c *DeviceCache) InvalidateByDeviceId(deviceId uint64) {
 
 // GetCacheStats 获取缓存统计信息
 func (c *DeviceCache) GetCacheStats() map[string]interface{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return map[string]interface{}{
 		"device_cache_len":  c.cache.Len(),
 		"device_cache_max":  c.maxCacheSize,
@@ -143,7 +202,10 @@ func (c *DeviceCache) GetCacheStats() map[string]interface{} {
 
 // ClearCache 清空所有缓存
 func (c *DeviceCache) ClearCache() {
+	c.mu.Lock()
+	c.clearVersion++
 	c.cache.Purge()
+	c.mu.Unlock()
 	c.Info("Device cache cleared")
 }
 
@@ -164,16 +226,21 @@ func (c *DeviceCache) GetMaxCacheSize() int {
 
 // SetCacheTTL 设置缓存过期时间
 func (c *DeviceCache) SetCacheTTL(ttl time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.cacheTTL = ttl
 }
 
 // GetCacheTTL 获取缓存过期时间
 func (c *DeviceCache) GetCacheTTL() time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return c.cacheTTL
 }
 
 // RemoveExpiredItems 清理过期的缓存项
 func (c *DeviceCache) RemoveExpiredItems() int {
+	c.mu.Lock()
 	keys := c.cache.Keys()
 	removedCount := 0
 
@@ -183,6 +250,7 @@ func (c *DeviceCache) RemoveExpiredItems() int {
 			removedCount++
 		}
 	}
+	c.mu.Unlock()
 
 	if removedCount > 0 {
 		c.Debug("Removed expired device cache items", zap.Int("count", removedCount))
@@ -261,21 +329,30 @@ func (c *DeviceCache) GetDevicesByUser(uid string) []Device {
 
 // UpdateDeviceToken 更新设备Token（用于设备更新时）
 func (c *DeviceCache) UpdateDeviceToken(uid string, deviceFlag uint64, newToken string) {
-	key := c.getDeviceKey(uid, deviceFlag)
-	if item, ok := c.cache.Get(key); ok && !item.IsExpired() {
-		item.Device.Token = newToken
-		// 更新缓存时间
-		item.CachedAt = time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cacheKey := c.getDeviceKey(uid, deviceFlag)
+	if item, ok := c.cache.Get(cacheKey); ok && !item.IsExpired() {
+		// 替换缓存项，避免其他读者持有的快照被原地改写。
+		updated := *item
+		updated.Device.Token = newToken
+		updated.CachedAt = time.Now()
+		c.loadVersions[key.HashWithString(cacheKey)%uint64(len(c.loadVersions))]++
+		c.cache.Add(cacheKey, &updated)
 	}
 }
 
 // UpdateDeviceLevel 更新设备级别
 func (c *DeviceCache) UpdateDeviceLevel(uid string, deviceFlag uint64, newLevel uint8) {
-	key := c.getDeviceKey(uid, deviceFlag)
-	if item, ok := c.cache.Get(key); ok && !item.IsExpired() {
-		item.Device.DeviceLevel = newLevel
-		// 更新缓存时间
-		item.CachedAt = time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cacheKey := c.getDeviceKey(uid, deviceFlag)
+	if item, ok := c.cache.Get(cacheKey); ok && !item.IsExpired() {
+		updated := *item
+		updated.Device.DeviceLevel = newLevel
+		updated.CachedAt = time.Now()
+		c.loadVersions[key.HashWithString(cacheKey)%uint64(len(c.loadVersions))]++
+		c.cache.Add(cacheKey, &updated)
 	}
 }
 

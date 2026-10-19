@@ -709,6 +709,10 @@ func EncodeCMDDevice(d wkdb.Device) []byte {
 	} else {
 		enc.WriteUint64(0)
 	}
+	// 新字段追加在末尾，旧格式日志仍按版本零读取。
+	if d.TokenVersion > 0 {
+		enc.WriteUint64(d.TokenVersion)
+	}
 
 	return enc.Bytes()
 }
@@ -750,6 +754,12 @@ func (c *CMD) DecodeCMDDevice() (d wkdb.Device, err error) {
 	if updatedAtUnixNano > 0 {
 		ct := time.Unix(int64(updatedAtUnixNano/1e9), int64(updatedAtUnixNano%1e9))
 		d.UpdatedAt = &ct
+	}
+	if decoder.Len() > 0 {
+		if decoder.Len() != 8 {
+			return d, fmt.Errorf("invalid device token version length: %d", decoder.Len())
+		}
+		d.TokenVersion, err = decoder.Uint64()
 	}
 
 	return

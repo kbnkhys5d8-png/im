@@ -26,6 +26,11 @@ func (h *Handler) connect(ctx *eventbus.UserContext) {
 			return
 		}
 		if reasonCode == wkproto.ReasonSuccess {
+			// 稳定 leader 内由 UID 队列保证原子性；迁移中不再允许旧 leader 登记。
+			if !options.G.IsLocalNode(h.userLeaderNodeId(uid)) {
+				conn.Auth = false
+				return
+			}
 			if conn.LastActive <= 0 {
 				conn.LastActive = fasttime.UnixTimestamp()
 			}
@@ -89,6 +94,7 @@ func (h *Handler) handleConnect(event *eventbus.Event) (wkproto.ReasonCode, *wkp
 			return wkproto.ReasonAuthFail, nil, errors.New("token verify fail")
 		}
 		devceLevel = wkproto.DeviceLevel(device.DeviceLevel)
+		conn.AuthTokenHash = eventbus.TokenFingerprint(device.Token)
 	} else {
 		devceLevel = wkproto.DeviceLevelSlave // 默认都是slave设备
 	}

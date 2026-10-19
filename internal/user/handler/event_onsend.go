@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
+	"github.com/WuKongIM/WuKongIM/internal/ingress"
 	"github.com/WuKongIM/WuKongIM/internal/options"
 	"github.com/WuKongIM/WuKongIM/internal/service"
 	"github.com/WuKongIM/WuKongIM/internal/track"
@@ -22,6 +23,20 @@ import (
 // onSend 收到发送消息
 func (h *Handler) onSend(ctx *eventbus.UserContext) {
 	for _, event := range ctx.Events {
+		// 撤销与消息入场共用 UID 队列；关闭 RPC 尚在途时也不能再接受旧会话。
+		current := eventbus.User.ConnById(event.Conn.Uid, event.Conn.NodeId, event.Conn.ConnId)
+		if !current.SameSession(event.Conn) {
+			var err error
+			current, err = h.restoreSourceConn(ctx, event.Conn)
+			if err != nil {
+				h.closeUnrestoredConn(event, err)
+				continue
+			}
+		}
+		if !current.SameSession(event.Conn) || current.Revoked.Load() {
+			continue
+		}
+		event.Conn = current
 		frameType := event.Frame.GetFrameType()
 		switch frameType {
 		case wkproto.SEND:
@@ -32,6 +47,67 @@ func (h *Handler) onSend(ctx *eventbus.UserContext) {
 			h.ping(event)
 		}
 	}
+}
+
+// 新 leader 的索引可能缺失或停留在旧代际；仅恢复源节点仍持有且凭据有效的精确会话。
+func (h *Handler) restoreSourceConn(ctx *eventbus.UserContext, conn *eventbus.Conn) (*eventbus.Conn, error) {
+	if ctx.AddConn == nil || conn == nil || !conn.Auth || conn.SessionId == "" || conn.Revoked.Load() {
+		return nil, nil
+	}
+	if conn.Uid == options.G.ManagerUID {
+		if options.G.ManagerTokenOn && conn.AuthTokenHash != eventbus.TokenFingerprint(options.G.ManagerToken) {
+			return nil, nil
+		}
+	} else if options.G.TokenAuthOn && !options.G.IsVisitors(conn.Uid) {
+		device, err := service.Store.GetDevice(conn.Uid, conn.DeviceFlag)
+		if err != nil {
+			return nil, err
+		}
+		if device.Token == "" || conn.AuthTokenHash != eventbus.TokenFingerprint(device.Token) {
+			return nil, nil
+		}
+		conn.DeviceLevel = wkproto.DeviceLevel(device.DeviceLevel)
+	}
+	channel, err := service.Store.GetChannel(conn.Uid, wkproto.ChannelTypePerson)
+	if err != nil {
+		return nil, err
+	}
+	if channel.Ban {
+		return nil, nil
+	}
+	var sources []*eventbus.Conn
+	if options.G.IsLocalNode(conn.NodeId) {
+		sources = ingress.LocalUserConns(conn.Uid)
+	} else {
+		sources, err = ingress.NewClient().UserConns(conn.NodeId, conn.Uid)
+		if err != nil {
+			return nil, err
+		}
+	}
+	for _, source := range sources {
+		if source.Auth && source.SameSession(conn) && source.AuthTokenHash == conn.AuthTokenHash {
+			if !options.G.IsLocalNode(h.userLeaderNodeId(conn.Uid)) {
+				return nil, errors.New("恢复会话时认证节点已变化")
+			}
+			ctx.AddConn(conn)
+			return conn, nil
+		}
+	}
+	return nil, nil
+}
+
+// 临时恢复失败不确认发送成功；沿原关闭链路处理精确会话，旧客户端无需增加协议字段。
+func (h *Handler) closeUnrestoredConn(event *eventbus.Event, err error) {
+	h.Warn("恢复会话失败，关闭原连接等待重连", zap.Error(err), zap.String("uid", event.Conn.Uid))
+	var frame wkproto.Frame
+	if send, ok := event.Frame.(*wkproto.SendPacket); ok {
+		frame = &wkproto.SendackPacket{Framer: send.Framer, MessageID: event.MessageId,
+			ClientSeq: send.ClientSeq, ClientMsgNo: send.ClientMsgNo, ReasonCode: wkproto.ReasonSystemError}
+	}
+	// 回执随关闭事件传递，避免按类型分组时先关闭、后写回执；不发送会清登录态的踢号通知。
+	eventbus.User.AddEvent(event.Conn.Uid, &eventbus.Event{Type: eventbus.EventConnClose, Conn: event.Conn,
+		Frame: frame, ReqId: event.ReqId, SourceNodeId: options.G.Cluster.NodeId})
+	eventbus.User.Advance(event.Conn.Uid)
 }
 
 func (h *Handler) handleOnSend(event *eventbus.Event) {

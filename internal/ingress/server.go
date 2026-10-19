@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 
+	"github.com/WuKongIM/WuKongIM/internal/eventbus"
 	"github.com/WuKongIM/WuKongIM/internal/options"
 	"github.com/WuKongIM/WuKongIM/internal/service"
 	"github.com/WuKongIM/WuKongIM/internal/types"
@@ -27,6 +28,8 @@ func New() *Ingress {
 }
 
 func (i *Ingress) SetRoutes() {
+	service.Cluster.Route("/wk/ingress/revokeConn", i.handleRevokeConn)
+	service.Cluster.Route("/wk/ingress/userConns", i.handleUserConns)
 	// 获取tag
 	service.Cluster.Route("/wk/ingress/getTag", i.handleGetTag)
 	// 判断接受者是否允许发送消息
@@ -39,6 +42,73 @@ func (i *Ingress) SetRoutes() {
 	service.Cluster.Route("/wk/ingress/getSubscribers", i.handleGetSubscribers)
 	// 处理转发的PersistAfter插件调用请求
 	service.Cluster.Route("/wk/ingress/persistAfter", i.handlePersistAfter)
+}
+
+func (i *Ingress) handleUserConns(c *wkserver.Context) {
+	data, err := i.UserConns(string(c.Body()))
+	if err != nil {
+		c.WriteErr(err)
+		return
+	}
+	c.Write(data)
+}
+
+// LocalUserConns 从物理连接索引取源会话，包含尚未收到 Connack 的在途连接。
+// 调用方须位于本节点该 UID 队列内，不能把 leader 的逻辑索引当作在线事实。
+func LocalUserConns(uid string) []*eventbus.Conn {
+	var conns []*eventbus.Conn
+	for _, real := range service.ConnManager.GetAllConn() {
+		conn, ok := real.Context().(*eventbus.Conn)
+		if ok && conn != nil && conn.Uid == uid && options.G.IsLocalNode(conn.NodeId) {
+			conns = append(conns, conn)
+		}
+	}
+	return conns
+}
+
+func (i *Ingress) UserConns(uid string) ([]byte, error) {
+	var data []byte
+	err := eventbus.User.RunOnUserLocal(context.Background(), uid, func() error {
+		var batch eventbus.EventBatch
+		for _, conn := range LocalUserConns(uid) {
+			batch = append(batch, &eventbus.Event{Conn: conn})
+		}
+		var err error
+		data, err = batch.Encode()
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+func (i *Ingress) handleRevokeConn(c *wkserver.Context) {
+	conn := &eventbus.Conn{}
+	if err := conn.Decode(c.Body()); err != nil {
+		c.WriteErr(err)
+		return
+	}
+	if err := i.RevokeConn(conn); err != nil {
+		c.WriteErr(err)
+		return
+	}
+	c.WriteOk()
+}
+
+// RevokeConn 只关闭本节点精确会话；通过 UID 队列与合法 Connack、写入串行。
+func (i *Ingress) RevokeConn(conn *eventbus.Conn) error {
+	if !options.G.IsLocalNode(conn.NodeId) {
+		return errors.New("撤销目标不是本节点")
+	}
+	return eventbus.User.RunOnUserLocal(context.Background(), conn.Uid, func() error {
+		eventbus.ExecuteUserEvent(&eventbus.UserContext{Uid: conn.Uid, EventType: eventbus.EventConnClose,
+			Events: []*eventbus.Event{{Type: eventbus.EventConnClose, Conn: conn, Frame: &wkproto.DisconnectPacket{
+				ReasonCode: wkproto.ReasonConnectKick, Reason: "账号在其他设备上登录",
+			}}},
+		})
+		return nil
+	})
 }
 
 // handlePersistAfter 处理转发的PersistAfter插件调用请求

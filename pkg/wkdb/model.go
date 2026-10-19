@@ -147,6 +147,7 @@ type Device struct {
 	Id           uint64     `json:"id,omitempty"`
 	Uid          string     `json:"uid,omitempty"`            // 用户唯一uid
 	Token        string     `json:"token,omitempty"`          // 设备token
+	TokenVersion uint64     `json:"token_version,omitempty"`  // Token 写入版本，防止超时旧请求覆盖新登录
 	DeviceFlag   uint64     `json:"device_flag,omitempty"`    // 设备标记 (TODO: 这里deviceFlag弄成uint64是为了以后扩展)
 	DeviceLevel  uint8      `json:"device_level,omitempty"`   // 设备等级
 	ConnCount    uint32     `json:"conn_count,omitempty"`     // 连接数量

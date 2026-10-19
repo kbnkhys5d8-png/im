@@ -124,7 +124,7 @@ func (u *userHandler) advanceEvents(events []*eventbus.Event) {
 	slotLeaderId := u.leaderId()
 	if slotLeaderId == 0 {
 		u.Error("advanceEvents: slotLeaderId is 0", zap.String("uid", u.Uid))
-		return
+		// 仍须交给 handler 拒绝本地任务，不能丢掉等待中的 Token 更新。
 	}
 
 	// 统计在线用户数
@@ -156,7 +156,7 @@ func (u *userHandler) advanceEvents(events []*eventbus.Event) {
 func affectsConnDirectory(eventType eventbus.EventType) bool {
 	switch eventType {
 	case eventbus.EventConnect, eventbus.EventConnack, eventbus.EventConnClose,
-		eventbus.EventConnRemove, eventbus.EventConnLeaderRemove:
+		eventbus.EventConnRemove, eventbus.EventConnLeaderRemove, eventbus.EventUserLeaderTask:
 		return true
 	default:
 		return false

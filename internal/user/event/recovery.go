@@ -132,7 +132,8 @@ func cloneRecoveryConn(conn *eventbus.Conn) *eventbus.Conn {
 	return &eventbus.Conn{
 		Uid: conn.Uid, NodeId: conn.NodeId, ConnId: conn.ConnId,
 		SessionId: conn.SessionId, DeviceId: conn.DeviceId,
-		DeviceFlag: conn.DeviceFlag, DeviceLevel: conn.DeviceLevel,
+		AuthTokenHash: conn.AuthTokenHash,
+		DeviceFlag:    conn.DeviceFlag, DeviceLevel: conn.DeviceLevel,
 		Auth: conn.Auth, Internal: conn.Internal,
 		AesIV:        append([]byte(nil), conn.AesIV...),
 		AesKey:       append([]byte(nil), conn.AesKey...),

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/WuKongIM/WuKongIM/internal/eventbus"
+	"github.com/WuKongIM/WuKongIM/internal/options"
 	"github.com/WuKongIM/WuKongIM/internal/service"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
@@ -20,6 +22,50 @@ func NewClient() *Client {
 	return &Client{
 		Log: wklog.NewWKLog("ingress.Client"),
 	}
+}
+
+// RevokeConn 等源节点实际处理精确关闭后才确认，旧代际请求不能关闭新连接。
+func (c *Client) RevokeConn(conn *eventbus.Conn) error {
+	data, err := conn.Encode()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), options.G.Cluster.ReqTimeout)
+	defer cancel()
+	resp, err := service.Cluster.RequestWithContext(ctx, conn.NodeId, "/wk/ingress/revokeConn", data)
+	if err != nil {
+		return err
+	}
+	if resp.Status != proto.StatusOK {
+		return errors.New("关闭旧会话未获源节点确认")
+	}
+	return nil
+}
+
+// UserConns 查询指定源节点的物理会话，用于 leader 接管自愈及撤销定位。
+func (c *Client) UserConns(node uint64, uid string) ([]*eventbus.Conn, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), options.G.Cluster.ReqTimeout)
+	defer cancel()
+	resp, err := service.Cluster.RequestWithContext(ctx, node, "/wk/ingress/userConns", []byte(uid))
+	if err != nil {
+		return nil, err
+	}
+	if resp.Status != proto.StatusOK {
+		return nil, errors.New("源节点会话查询失败")
+	}
+	var batch eventbus.EventBatch
+	if err := batch.Decode(resp.Body); err != nil {
+		return nil, err
+	}
+	var conns []*eventbus.Conn
+	for _, event := range batch {
+		conn := event.Conn
+		if conn == nil || conn.Uid != uid || conn.NodeId != node {
+			return nil, errors.New("源节点会话身份不匹配")
+		}
+		conns = append(conns, conn)
+	}
+	return conns, nil
 }
 
 // 请求获取指定节点的用户
