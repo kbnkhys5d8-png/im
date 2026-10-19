@@ -124,7 +124,8 @@ func (c *conns) authedConns() []*eventbus.Conn {
 	defer c.RUnlock()
 	conns := make([]*eventbus.Conn, 0, len(c.conns))
 	for _, conn := range c.conns {
-		if conn.Auth {
+		// 撤销依据仍保留在目录，但不能再作为在线接收者。
+		if conn.Auth && !conn.Revoked.Load() {
 			conns = append(conns, conn)
 		}
 	}

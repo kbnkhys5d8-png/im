@@ -8,6 +8,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/options"
 	"github.com/WuKongIM/WuKongIM/internal/track"
 	"github.com/WuKongIM/WuKongIM/pkg/wknet"
+	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"go.uber.org/zap"
 )
 
@@ -21,6 +22,9 @@ func (h *Handler) writeFrame(ctx *eventbus.UserContext) {
 		}
 		if conn.NodeId == 0 {
 			h.Error("writeFrame: conn node id is 0")
+			continue
+		}
+		if revokedDelivery(conn, frame) {
 			continue
 		}
 		// 如果不是本地节点，则转发写请求
@@ -89,6 +93,12 @@ func (h *Handler) writeLocalFrame(event *eventbus.Event) {
 		return
 	}
 
+	// 入队或编码后仍可能被撤销；最终写出前同时检查目录和真实 socket 的同代依据。
+	socketConn, _ := realConn.Context().(*eventbus.Conn)
+	if revokedDelivery(conn, frame) || (socketConn.SameSession(conn) && revokedDelivery(socketConn, frame)) {
+		return
+	}
+
 	// 开始写入数据
 	wsConn, wsok := realConn.(wknet.IWSConn) // websocket连接
 	if wsok {
@@ -107,4 +117,16 @@ func (h *Handler) writeLocalFrame(event *eventbus.Event) {
 		}
 	}
 	_ = realConn.WakeWrite()
+}
+
+// 只拦用户可见推送，不影响关闭提示、失败发送回执和认证必需回执。
+func revokedDelivery(conn *eventbus.Conn, frame wkproto.Frame) bool {
+	if frame.GetFrameType() != wkproto.RECV && frame.GetFrameType() != wkproto.EVENT {
+		return false
+	}
+	if conn.Revoked.Load() {
+		return true
+	}
+	current := eventbus.User.ConnById(conn.Uid, conn.NodeId, conn.ConnId)
+	return current.SameSession(conn) && current.Revoked.Load()
 }

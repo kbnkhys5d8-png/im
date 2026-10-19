@@ -63,10 +63,11 @@ func (h *Handler) restoreSourceConn(ctx *eventbus.UserContext, conn *eventbus.Co
 		if err != nil {
 			return nil, err
 		}
-		if device.Token == "" || conn.AuthTokenHash != eventbus.TokenFingerprint(device.Token) {
+		// 补恢复必须验证原会话等级，不能把旧会话直接改成当前权限后重新登记。
+		if device.Token == "" || conn.AuthTokenHash != eventbus.TokenFingerprint(device.Token) ||
+			conn.DeviceLevel != wkproto.DeviceLevel(device.DeviceLevel) {
 			return nil, nil
 		}
-		conn.DeviceLevel = wkproto.DeviceLevel(device.DeviceLevel)
 	}
 	channel, err := service.Store.GetChannel(conn.Uid, wkproto.ChannelTypePerson)
 	if err != nil {
@@ -85,7 +86,7 @@ func (h *Handler) restoreSourceConn(ctx *eventbus.UserContext, conn *eventbus.Co
 		}
 	}
 	for _, source := range sources {
-		if source.Auth && source.SameSession(conn) && source.AuthTokenHash == conn.AuthTokenHash {
+		if source.Auth && source.SameSession(conn) && source.AuthTokenHash == conn.AuthTokenHash && source.DeviceLevel == conn.DeviceLevel {
 			if !options.G.IsLocalNode(h.userLeaderNodeId(conn.Uid)) {
 				return nil, errors.New("恢复会话时认证节点已变化")
 			}

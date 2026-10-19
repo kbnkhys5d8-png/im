@@ -3,7 +3,9 @@ package event
 import (
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
 	"github.com/WuKongIM/WuKongIM/internal/options"
+	"github.com/WuKongIM/WuKongIM/internal/service"
 	"github.com/WuKongIM/WuKongIM/pkg/fasttime"
+	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 )
 
 type recoveryConnKey struct {
@@ -79,6 +81,34 @@ func (e *EventPool) BeginConnRecovery(uid string, version uint64) (func([]*event
 			prepared[key] = cloneRecoveryConn(conn)
 		}
 
+		// 新 leader 不能信任源节点残留的认证结果；只在恢复时按设备核验当前凭据。
+		// 沿用连接认证的适用范围，不改变管理连接、访客或未启用 Token 验证的行为。
+		if options.G.TokenAuthOn && uid != options.G.ManagerUID && !options.G.IsVisitors(uid) {
+			type credential struct {
+				hash  string
+				level wkproto.DeviceLevel
+			}
+			credentials := make(map[wkproto.DeviceFlag]credential)
+			for _, conn := range prepared {
+				current, loaded := credentials[conn.DeviceFlag]
+				if !loaded {
+					device, err := service.Store.GetDevice(uid, conn.DeviceFlag)
+					if err != nil {
+						return false
+					}
+					if device.Token != "" {
+						current.hash = eventbus.TokenFingerprint(device.Token)
+					}
+					current.level = wkproto.DeviceLevel(device.DeviceLevel)
+					credentials[conn.DeviceFlag] = current
+				}
+				// 等级也是认证结果；同 Token 改等级后不能恢复旧权限的会话。
+				if current.hash == "" || conn.AuthTokenHash != current.hash || conn.DeviceLevel != current.level {
+					conn.Revoked.Store(true)
+				}
+			}
+		}
+
 		p.Lock()
 		defer p.Unlock()
 		if p.handler(uid) != h {
@@ -86,6 +116,8 @@ func (e *EventPool) BeginConnRecovery(uid string, version uint64) (func([]*event
 		}
 		h.pending.RLock()
 		defer h.pending.RUnlock()
+		// 凭据查询期间排队或已经完成的 Token 任务，都使本次核验结果失效。
+		// 持读锁到应用完成，保证后续任务能看到已恢复的连接再执行撤销。
 		if h.pending.connRevision != pendingRevision || h.pending.connEvents != 0 {
 			return false
 		}
@@ -106,19 +138,33 @@ func (e *EventPool) BeginConnRecovery(uid string, version uint64) (func([]*event
 					if !current.Auth || current.Internal || !current.SameSession(incoming) {
 						return false
 					}
+					if incoming.Revoked.Load() {
+						current.Revoked.Store(true)
+					}
 					delete(prepared, key)
 				}
 				next = append(next, current)
 				continue
 			}
 			if found {
-				// 远端记录以本次真实 socket 快照为准，同时刷新活跃时间。
-				next = append(next, incoming)
+				if current.SameSession(incoming) {
+					// 同代保留原撤销引用，不能让已持有旧指针的撤销写入失效。
+					if incoming.Revoked.Load() {
+						current.Revoked.Store(true)
+					}
+					current.LastActive = incoming.LastActive
+					next = append(next, current)
+				} else if !incoming.Revoked.Load() {
+					// 新代际独立验证，不继承旧连接号的撤销状态。
+					next = append(next, incoming)
+				}
 				delete(prepared, key)
 			}
 		}
 		for _, incoming := range prepared {
-			next = append(next, incoming)
+			if !incoming.Revoked.Load() {
+				next = append(next, incoming)
+			}
 		}
 		h.conns.conns = next
 		h.conns.revision++
@@ -129,7 +175,7 @@ func (e *EventPool) BeginConnRecovery(uid string, version uint64) (func([]*event
 }
 
 func cloneRecoveryConn(conn *eventbus.Conn) *eventbus.Conn {
-	return &eventbus.Conn{
+	cloned := &eventbus.Conn{
 		Uid: conn.Uid, NodeId: conn.NodeId, ConnId: conn.ConnId,
 		SessionId: conn.SessionId, DeviceId: conn.DeviceId,
 		AuthTokenHash: conn.AuthTokenHash,
@@ -140,4 +186,6 @@ func cloneRecoveryConn(conn *eventbus.Conn) *eventbus.Conn {
 		ProtoVersion: conn.ProtoVersion, Uptime: conn.Uptime,
 		LastActive: fasttime.UnixTimestamp(), IsJsonRpc: conn.IsJsonRpc,
 	}
+	cloned.Revoked.Store(conn.Revoked.Load())
+	return cloned
 }
