@@ -95,6 +95,8 @@ func (h *Handler) handleConnect(event *eventbus.Event) (wkproto.ReasonCode, *wkp
 		}
 		devceLevel = wkproto.DeviceLevel(device.DeviceLevel)
 		conn.AuthTokenHash = eventbus.TokenFingerprint(device.Token)
+		conn.AuthTokenVersion = device.TokenVersion
+		conn.AuthTokenVersionKnown = true
 	} else {
 		devceLevel = wkproto.DeviceLevelSlave // 默认都是slave设备
 	}

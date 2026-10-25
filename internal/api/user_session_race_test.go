@@ -462,12 +462,21 @@ func (c *sessionRaceCluster) ProposeUntilApplied(_ uint32, data []byte) (*raftty
 	if err := cmd.Unmarshal(data); err != nil {
 		return nil, err
 	}
-	device, err := cmd.DecodeCMDDevice()
+	var device wkdb.Device
+	var err error
+	var expectedVersion uint64
+	var expectedHash string
+	if cmd.CmdType == store.CMDUpdateDeviceIfTokenMatches {
+		device, expectedVersion, expectedHash, err = cmd.DecodeConditionalDevice()
+	} else {
+		device, err = cmd.DecodeCMDDevice()
+	}
 	if err != nil {
 		return nil, err
 	}
 	c.db.mu.Lock()
-	if device.TokenVersion >= c.db.device.TokenVersion {
+	matches := cmd.CmdType != store.CMDUpdateDeviceIfTokenMatches || (expectedVersion == c.db.device.TokenVersion && expectedHash == eventbus.TokenFingerprint(c.db.device.Token)) || (device.TokenVersion == c.db.device.TokenVersion && device.Token == c.db.device.Token)
+	if matches && device.TokenVersion >= c.db.device.TokenVersion {
 		c.db.device = device
 	}
 	c.db.mu.Unlock()

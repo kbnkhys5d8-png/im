@@ -42,13 +42,15 @@ func newUser(s *Server) *user {
 // Route 用户相关路由配置
 func (u *user) route(r *wkhttp.WKHttp) {
 
-	r.POST("/user/token", u.updateToken)                  // 更新用户token
-	r.POST("/user/token/fenced", u.updateToken)           // 按版本更新 Token，供新版 API 内网调用
-	r.POST("/user/device_quit", u.deviceQuit)             // 强制设备退出
-	r.POST("/user/onlinestatus", u.getOnlineStatus)       // 获取用户在线状态
-	r.POST("/user/systemuids_add", u.systemUidsAdd)       // 添加系统uid
-	r.POST("/user/systemuids_remove", u.systemUidsRemove) // 移除系统uid
-	r.GET("/user/systemuids", u.getSystemUids)            // 获取系统uid
+	r.POST("/user/token", u.updateToken)                   // 更新用户token
+	r.POST("/user/token/fenced", u.updateToken)            // 按版本更新 Token，供新版 API 内网调用
+	r.POST("/user/token/session", u.deviceSessionSnapshot) // 只读会话指纹，供 API 精准退出使用
+	r.POST("/user/token/revoke", u.revokeDeviceSession)    // 比较原目标后撤销，禁止追踢新会话
+	r.POST("/user/device_quit", u.deviceQuit)              // 强制设备退出
+	r.POST("/user/onlinestatus", u.getOnlineStatus)        // 获取用户在线状态
+	r.POST("/user/systemuids_add", u.systemUidsAdd)        // 添加系统uid
+	r.POST("/user/systemuids_remove", u.systemUidsRemove)  // 移除系统uid
+	r.GET("/user/systemuids", u.getSystemUids)             // 获取系统uid
 
 	r.POST("/user/systemuids_add_to_cache", u.systemUidsAddToCache)           // 仅仅添加系统账号至缓存
 	r.POST("/user/systemuids_remove_from_cache", u.systemUidsRemoveFromCache) // 仅仅从缓存中移除系统账号
@@ -338,6 +340,13 @@ type tokenPermissionDenied struct{ reason wkproto.ReasonCode }
 func (e *tokenPermissionDenied) Error() string { return e.reason.String() }
 
 func (u *user) updateTokenOnLeader(req UpdateTokenReq) error {
+	return u.updateTokenOnLeaderExpected(req, nil)
+}
+
+func (u *user) updateTokenOnLeaderExpected(req UpdateTokenReq, expected *deviceSessionTarget) error {
+	if expected != nil && expected.ctx != nil && expected.ctx.Err() != nil {
+		return expected.ctx.Err()
+	}
 	u.Debug("update token request", updateTokenLogFields(req)...)
 
 	// 使用共享权限服务检查频道权限
@@ -362,6 +371,9 @@ func (u *user) updateTokenOnLeader(req UpdateTokenReq) error {
 
 	// 如果用户不存在，则添加用户
 	if wkdb.IsEmptyUser(user) {
+		if expected != nil {
+			return errDeviceSessionSuperseded
+		}
 		createdAt := time.Now()
 		updatedAt := time.Now()
 		err = service.Store.AddUser(wkdb.User{
@@ -380,6 +392,10 @@ func (u *user) updateTokenOnLeader(req UpdateTokenReq) error {
 		u.Error("获取设备信息失败！", zap.Error(err), zap.String("uid", req.UID), zap.Uint8("deviceFlag", req.DeviceFlag.ToUint8()))
 		return err
 	}
+	if expected != nil && !expected.matches(device) && !(device.TokenVersion == req.TokenVersion && device.Token == req.Token && device.DeviceLevel == uint8(req.DeviceLevel)) {
+		// 与写入共用 UID 队列及端锁；原目标已变化时，即便任务版本更高也绝不写入或踢线。
+		return errDeviceSessionSuperseded
+	}
 	if !tokenVersionMatches(device, req) {
 		return errTokenVersionConflict
 	}
@@ -389,7 +405,7 @@ func (u *user) updateTokenOnLeader(req UpdateTokenReq) error {
 		if err := checkTokenLeader(req.UID); err != nil {
 			return err
 		}
-		if err := u.revokeTokenConnections(req.UID, req.DeviceFlag, false, eventbus.TokenFingerprint(req.Token)); err != nil {
+		if err := u.revokeTokenConnections(req.UID, req.DeviceFlag, false, eventbus.TokenFingerprint(req.Token), expected); err != nil {
 			return err
 		}
 		return checkTokenLeader(req.UID)
@@ -418,7 +434,7 @@ func (u *user) updateTokenOnLeader(req UpdateTokenReq) error {
 		}
 	} else {
 		updatedAt := time.Now()
-		err = service.Store.UpdateDevice(wkdb.Device{
+		updated := wkdb.Device{
 			Id:           device.Id,
 			Uid:          req.UID,
 			DeviceFlag:   uint64(req.DeviceFlag),
@@ -426,7 +442,15 @@ func (u *user) updateTokenOnLeader(req UpdateTokenReq) error {
 			Token:        req.Token,
 			TokenVersion: req.TokenVersion,
 			UpdatedAt:    &updatedAt,
-		})
+		}
+		if expected != nil {
+			if expected.ctx != nil && expected.ctx.Err() != nil {
+				return expected.ctx.Err()
+			}
+			err = service.Store.UpdateDeviceIfTokenMatches(updated, expected.Version, expected.Hash)
+		} else {
+			err = service.Store.UpdateDevice(updated)
+		}
 		if err != nil {
 			u.Error("更新设备失败！", zap.Error(err), zap.String("uid", req.UID), zap.Uint8("deviceFlag", req.DeviceFlag.ToUint8()))
 			return err
@@ -444,7 +468,7 @@ func (u *user) updateTokenOnLeader(req UpdateTokenReq) error {
 	if err := checkTokenLeader(req.UID); err != nil {
 		return err
 	}
-	if err := u.revokeTokenConnections(req.UID, req.DeviceFlag, tokenChanged && req.DeviceLevel == wkproto.DeviceLevelMaster, eventbus.TokenFingerprint(req.Token)); err != nil {
+	if err := u.revokeTokenConnections(req.UID, req.DeviceFlag, tokenChanged && req.DeviceLevel == wkproto.DeviceLevelMaster, eventbus.TokenFingerprint(req.Token), expected); err != nil {
 		return err
 	}
 	return checkTokenLeader(req.UID)
@@ -459,9 +483,30 @@ func checkTokenLeader(uid string) error {
 }
 
 // 必须在 leader 的 UID 队列内调用；成功响应前精确关闭源节点旧会话。
-func (u *user) revokeTokenConnections(uid string, flag wkproto.DeviceFlag, changed bool, currentHash string) error {
+func (u *user) revokeTokenConnections(uid string, flag wkproto.DeviceFlag, changed bool, currentHash string, targets ...*deviceSessionTarget) error {
 	conns := eventbus.User.ConnsByDeviceFlag(uid, flag)
+	var expected *deviceSessionTarget
+	if len(targets) > 0 {
+		expected = targets[0]
+	}
+	ctx := context.Background()
+	if expected != nil && expected.ctx != nil {
+		ctx = expected.ctx
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	belongsToTarget := func(conn *eventbus.Conn) bool {
+		// 同 Token 的更高代际也必须保留；只关闭使用原凭据或更早代际认证的连接。
+		return expected == nil || (conn.AuthTokenHash == expected.Hash && conn.AuthTokenVersionKnown && conn.AuthTokenVersion <= expected.Version)
+	}
 	markRevoked := func(conn *eventbus.Conn) {
+		if expected != nil {
+			if belongsToTarget(conn) {
+				conn.Revoked.Store(true)
+			}
+			return
+		}
 		if conn.AuthTokenHash != currentHash || (changed && (currentHash == "" || (conn.Auth && conn.DeviceLevel != wkproto.DeviceLevelMaster))) {
 			conn.Revoked.Store(true)
 		}
@@ -472,12 +517,15 @@ func (u *user) revokeTokenConnections(uid string, flag wkproto.DeviceFlag, chang
 	}
 	// leader 接管后逻辑索引可能为空；必须向所有源节点确认物理会话，失败则不确认撤销成功。
 	for _, node := range service.Cluster.Nodes() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		var sources []*eventbus.Conn
 		if options.G.IsLocalNode(node.Id) {
 			sources = ingress.LocalUserConns(uid)
 		} else {
 			var err error
-			sources, err = ingress.NewClient().UserConns(node.Id, uid)
+			sources, err = ingress.NewClient().UserConnsContext(ctx, node.Id, uid)
 			if err != nil {
 				return err
 			}
@@ -489,8 +537,15 @@ func (u *user) revokeTokenConnections(uid string, flag wkproto.DeviceFlag, chang
 			// 已发现的旧会话也立即标记，避免后续另一个源节点失败时遗漏。
 			markRevoked(source)
 			found := false
-			for _, existing := range conns {
+			for index, existing := range conns {
 				if existing.SameSession(source) {
+					if expected != nil && !existing.AuthTokenVersionKnown && source.AuthTokenVersionKnown {
+						// 旧目录缺字段时仅使用同一物理会话的源证明，不原地改写共享认证字段。
+						conns[index] = source
+						if belongsToTarget(source) {
+							existing.Revoked.Store(true)
+						}
+					}
 					found = true
 					break
 				}
@@ -503,8 +558,15 @@ func (u *user) revokeTokenConnections(uid string, flag wkproto.DeviceFlag, chang
 	if err := checkTokenLeader(uid); err != nil {
 		return err
 	}
+	unknownTarget := false
 	for _, conn := range conns {
-		if !conn.Revoked.Load() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if expected != nil && conn.Auth && conn.AuthTokenHash == expected.Hash && !conn.AuthTokenVersionKnown {
+			unknownTarget = true
+		}
+		if !conn.Revoked.Load() || !belongsToTarget(conn) {
 			continue
 		}
 		if options.G.IsLocalNode(conn.NodeId) {
@@ -514,11 +576,14 @@ func (u *user) revokeTokenConnections(uid string, flag wkproto.DeviceFlag, chang
 				}}},
 			})
 		} else {
-			if err := ingress.NewClient().RevokeConn(conn); err != nil {
+			if err := ingress.NewClient().RevokeConnContext(ctx, conn); err != nil {
 				return err
 			}
 			eventbus.User.DirectRemoveConn(conn)
 		}
+	}
+	if unknownTarget {
+		return errors.New("旧连接缺少认证代际，无法确认精准退出完成")
 	}
 	return nil
 }

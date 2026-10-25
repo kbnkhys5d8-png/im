@@ -163,6 +163,8 @@ type DeviceDB interface {
 
 	// UpdateDevice 更新设备
 	UpdateDevice(device Device) error
+	// UpdateDeviceIfTokenMatches 在同一槽状态机中核对原目标后写入，过时命令无副作用。
+	UpdateDeviceIfTokenMatches(device Device, version uint64, hash string) error
 }
 
 type UserDB interface {

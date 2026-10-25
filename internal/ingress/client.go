@@ -26,14 +26,28 @@ func NewClient() *Client {
 
 // RevokeConn 等源节点实际处理精确关闭后才确认，旧代际请求不能关闭新连接。
 func (c *Client) RevokeConn(conn *eventbus.Conn) error {
+	return c.RevokeConnContext(context.Background(), conn)
+}
+
+// RevokeConnContext 供条件退出传播取消，不改变已有调用的超时行为。
+func (c *Client) RevokeConnContext(parent context.Context, conn *eventbus.Conn) error {
+	if err := parent.Err(); err != nil {
+		return err
+	}
 	data, err := conn.Encode()
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), options.G.Cluster.ReqTimeout)
+	ctx, cancel := context.WithTimeout(parent, options.G.Cluster.ReqTimeout)
 	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	resp, err := service.Cluster.RequestWithContext(ctx, conn.NodeId, "/wk/ingress/revokeConn", data)
 	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if resp.Status != proto.StatusOK {
@@ -44,10 +58,24 @@ func (c *Client) RevokeConn(conn *eventbus.Conn) error {
 
 // UserConns 查询指定源节点的物理会话，用于 leader 接管自愈及撤销定位。
 func (c *Client) UserConns(node uint64, uid string) ([]*eventbus.Conn, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), options.G.Cluster.ReqTimeout)
+	return c.UserConnsContext(context.Background(), node, uid)
+}
+
+// UserConnsContext 让新会话查询在请求取消后停止，避免占住认证队列。
+func (c *Client) UserConnsContext(parent context.Context, node uint64, uid string) ([]*eventbus.Conn, error) {
+	if err := parent.Err(); err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(parent, options.G.Cluster.ReqTimeout)
 	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	resp, err := service.Cluster.RequestWithContext(ctx, node, "/wk/ingress/userConns", []byte(uid))
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if resp.Status != proto.StatusOK {

@@ -68,8 +68,8 @@ const (
 	CMDSystemUIDsAdd
 	// 移除系统UID
 	CMDSystemUIDsRemove
-	_cmdSaveStreamMetaRemoved  // 已移除，保留占位
-	_cmdStreamEndRemoved       // 已移除，保留占位
+	_cmdSaveStreamMetaRemoved   // 已移除，保留占位
+	_cmdStreamEndRemoved        // 已移除，保留占位
 	_cmdAppendStreamItemRemoved // 已移除，保留占位
 	// 频道分布式配置保存
 	CMDChannelClusterConfigSave
@@ -78,8 +78,8 @@ const (
 
 	// 批量更新最近会话
 	CMDBatchUpdateConversation
-	_cmdAddStreamMetaRemoved  // 已移除，保留占位
-	_cmdAddStreamsRemoved     // 已移除，保留占位
+	_cmdAddStreamMetaRemoved // 已移除，保留占位
+	_cmdAddStreamsRemoved    // 已移除，保留占位
 	// 批量添加最近会话
 	CMDAddOrUpdateConversations
 	// 添加或更新测试机
@@ -103,6 +103,8 @@ const (
 	CMDAppendMessageEvent
 	// 更新最近会话的已读位置（如果seq更大）
 	CMDUpdateConversationIfSeqGreater
+	// 条件撤销单独使用新命令号，绝不改变既有日志编号或让旧命令忽略比较条件。
+	CMDUpdateDeviceIfTokenMatches
 )
 
 func (c CMDType) Uint16() uint16 {
@@ -115,6 +117,8 @@ func (c CMDType) String() string {
 		return "CMDAddDevice"
 	case CMDUpdateDevice:
 		return "CMDUpdateDevice"
+	case CMDUpdateDeviceIfTokenMatches:
+		return "CMDUpdateDeviceIfTokenMatches"
 	case CMDAddUser:
 		return "CMDAddUser"
 	case CMDUpdateUser:
@@ -252,6 +256,13 @@ func (c *CMD) Unmarshal(data []byte) error {
 
 func (c *CMD) CMDContent() (string, error) {
 	switch c.CmdType {
+	case CMDUpdateDeviceIfTokenMatches:
+		device, _, _, err := c.DecodeConditionalDevice()
+		if err != nil {
+			return "", err
+		}
+		// 新命令的诊断信息不输出撤销 Token 或原会话指纹。
+		return wkutil.ToJSON(map[string]interface{}{"uid": device.Uid, "device_flag": device.DeviceFlag, "token_version": device.TokenVersion}), nil
 	case CMDAddDevice:
 		device, err := c.DecodeCMDDevice()
 		if err != nil {

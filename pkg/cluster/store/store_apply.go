@@ -20,7 +20,7 @@ func (s *Store) ApplySlotLogs(slotId uint32, logs []types.Log) error {
 			cmd := &CMD{}
 			err := cmd.Unmarshal(log.Data)
 			if err != nil {
-				s.Panic("unmarshal cmd err", zap.Error(err), zap.Uint64("index", log.Index), zap.ByteString("data", log.Data))
+				s.Panic("unmarshal cmd err", zap.Error(err), zap.Uint64("index", log.Index), zap.ByteString("data", slotLogDiagnosticData(log.Data)))
 				return err
 			}
 			cmds = append(cmds, cmd)
@@ -37,7 +37,7 @@ func (s *Store) ApplySlotLogs(slotId uint32, logs []types.Log) error {
 			if err != nil {
 				cmd := &CMD{}
 				cmd.Unmarshal(log.Data)
-				s.Panic("apply log err", zap.Error(err), zap.String("cmd", cmd.CmdType.String()), zap.Uint64("index", log.Index), zap.ByteString("data", log.Data))
+				s.Panic("apply log err", zap.Error(err), zap.String("cmd", cmd.CmdType.String()), zap.Uint64("index", log.Index), zap.ByteString("data", slotLogDiagnosticData(log.Data)))
 				return err
 			}
 		}
@@ -108,6 +108,8 @@ func (s *Store) applyCMD(cmd *CMD, logIndex uint64) error {
 		return s.handleAddDevice(cmd)
 	case CMDUpdateDevice: // 更新设备信息
 		return s.handleUpdateDevice(cmd)
+	case CMDUpdateDeviceIfTokenMatches: // 原目标证明在 Raft 状态机内再次比较
+		return s.handleConditionalDeviceUpdate(cmd)
 	case CMDAddChannelInfo: // 添加频道信息
 		return s.handleAddChannelInfo(cmd)
 	case CMDUpdateChannelInfo: // 更新频道信息

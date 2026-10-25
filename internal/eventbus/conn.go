@@ -35,8 +35,10 @@ type Conn struct {
 	// 连接id
 	ConnId int64
 	// 接入节点为真实连接生成的会话标识，不属于客户端协议。
-	SessionId     string
-	AuthTokenHash string // 验密时 Token 的指纹，用于迁移后的幂等撤销
+	SessionId             string
+	AuthTokenHash         string // 验密时 Token 的指纹，用于迁移后的幂等撤销
+	AuthTokenVersion      uint64 // 服务端验密时的版本，不属于客户端协议。
+	AuthTokenVersionKnown bool   // 旧内部事件缺失版本时，不得把零值猜成原目标。
 	// 对应设备的id
 	DeviceId string
 	// 对应设备的标记
@@ -80,18 +82,23 @@ func (c *Conn) Encode() ([]byte, error) {
 	enc.WriteUint64(c.Uptime)
 	enc.WriteUint8(wkutil.BoolToUint8(c.IsJsonRpc))
 	enc.WriteUint8(wkutil.BoolToUint8(c.Internal))
-	if c.SessionId != "" || c.AuthTokenHash != "" {
+	if c.SessionId != "" || c.AuthTokenHash != "" || c.AuthTokenVersion > 0 || c.AuthTokenVersionKnown {
 		enc.WriteString(c.SessionId)
 	}
 	// 指纹追加在既有 Internal 和 SessionId 之后，不改变原编码字段顺序。
-	if c.AuthTokenHash != "" {
+	if c.AuthTokenHash != "" || c.AuthTokenVersion > 0 || c.AuthTokenVersionKnown {
 		enc.WriteString(c.AuthTokenHash)
+	}
+	if c.AuthTokenVersion > 0 || c.AuthTokenVersionKnown {
+		enc.WriteUint64(c.AuthTokenVersion)
 	}
 	return enc.Bytes(), nil
 }
 
 func (c *Conn) Decode(data []byte) error {
 	c.AuthTokenHash = ""
+	c.AuthTokenVersion = 0
+	c.AuthTokenVersionKnown = false
 	dec := wkproto.NewDecoder(data)
 	var err error
 	if c.Uid, err = dec.String(); err != nil {
@@ -165,17 +172,26 @@ func (c *Conn) Decode(data []byte) error {
 			return err
 		}
 	}
+	if dec.Len() > 0 {
+		if c.AuthTokenVersion, err = dec.Uint64(); err != nil {
+			return err
+		}
+		c.AuthTokenVersionKnown = true
+	}
 
 	return nil
 }
 
 func (c *Conn) Size() uint64 {
 	size := uint64(8 + len(c.Uid) + len(c.DeviceId) + 1 + 1 + 8 + 1 + len(c.AesIV) + len(c.AesKey) + 1 + 1)
-	if c.SessionId != "" || c.AuthTokenHash != "" {
+	if c.SessionId != "" || c.AuthTokenHash != "" || c.AuthTokenVersion > 0 || c.AuthTokenVersionKnown {
 		size += uint64(2 + len(c.SessionId))
 	}
-	if c.AuthTokenHash != "" {
+	if c.AuthTokenHash != "" || c.AuthTokenVersion > 0 || c.AuthTokenVersionKnown {
 		size += uint64(2 + len(c.AuthTokenHash))
+	}
+	if c.AuthTokenVersion > 0 || c.AuthTokenVersionKnown {
+		size += 8
 	}
 	return size
 }

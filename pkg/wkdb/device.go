@@ -1,6 +1,8 @@
 package wkdb
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"math"
 	"sort"
@@ -196,6 +198,19 @@ func (wk *wukongDB) AddDevice(d Device) error {
 }
 
 func (wk *wukongDB) UpdateDevice(d Device) error {
+	return wk.updateDeviceWithTokenCondition(d, nil)
+}
+
+type deviceTokenCondition struct {
+	version uint64
+	hash    string
+}
+
+func (wk *wukongDB) UpdateDeviceIfTokenMatches(d Device, version uint64, hash string) error {
+	return wk.updateDeviceWithTokenCondition(d, &deviceTokenCondition{version: version, hash: hash})
+}
+
+func (wk *wukongDB) updateDeviceWithTokenCondition(d Device, expected *deviceTokenCondition) error {
 
 	wk.metrics.UpdateDeviceAdd(1)
 
@@ -225,6 +240,14 @@ func (wk *wukongDB) UpdateDevice(d Device) error {
 		}
 	}
 	// 在状态机落库处再次拒绝旧版本；忽略旧日志而不是让 Raft 重试错误。
+	if expected != nil {
+		hash := sha256.Sum256([]byte(old.Token))
+		matches := !IsEmptyDevice(old) && old.TokenVersion == expected.version && hex.EncodeToString(hash[:]) == expected.hash
+		alreadyApplied := old.TokenVersion == d.TokenVersion && old.Token == d.Token && old.DeviceLevel == d.DeviceLevel
+		if !matches && !alreadyApplied {
+			return nil
+		}
+	}
 	if !deviceTokenWriteAllowed(old, d) {
 		return nil
 	}
