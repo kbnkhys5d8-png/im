@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/icluster"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 )
@@ -14,7 +15,27 @@ type Options struct {
 
 	Channel icluster.Channel
 
-	IsCmdChannel func(channel string) bool
+	IsCmdChannel         func(channel string) bool
+	HistoryTopology      func(channel string, channelType uint8) error
+	HistoryCapabilities  func() error
+	HistoryDrain         func(context.Context, string, uint8) error
+	HistorySourceChannel func(channel string) string
+}
+
+func WithHistoryDrain(drain func(context.Context, string, uint8) error) Option {
+	return func(o *Options) { o.HistoryDrain = drain }
+}
+
+func WithHistoryTopology(check func(string, uint8) error) Option {
+	return func(o *Options) { o.HistoryTopology = check }
+}
+
+func WithHistorySourceChannel(normalize func(string) string) Option {
+	return func(o *Options) { o.HistorySourceChannel = normalize }
+}
+
+func WithHistoryCapabilities(check func() error) Option {
+	return func(o *Options) { o.HistoryCapabilities = check }
 }
 
 func NewOptions(opt ...Option) *Options {

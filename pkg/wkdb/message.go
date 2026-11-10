@@ -16,6 +16,49 @@ import (
 )
 
 func (wk *wukongDB) AppendMessages(channelId string, channelType uint8, msgs []Message) error {
+	return wk.appendMessages(channelId, channelType, msgs, false)
+}
+
+// Raft 只可恢复冻结水位内的日志，不能借重放写入水位后的新消息或改写已有正文。
+func (wk *wukongDB) AppendMessagesForRaft(channelId string, channelType uint8, msgs []Message) error {
+	return wk.appendMessages(channelId, channelType, msgs, true)
+}
+
+func (wk *wukongDB) appendMessages(channelId string, channelType uint8, msgs []Message, replay bool) error {
+	wk.historyFenceMu.RLock()
+	defer wk.historyFenceMu.RUnlock()
+	var frozen bool
+	if channelType == 1 {
+		fence, err := wk.historyFence(channelId, 1)
+		if err != nil {
+			return err
+		}
+		if fence != nil {
+			if !replay {
+				return ErrHistoryFenced
+			}
+			frozen = true
+			for _, msg := range msgs {
+				if msg.MessageSeq == 0 || uint64(msg.MessageSeq) > fence.HighWatermark {
+					return ErrHistoryFenced
+				}
+				old, err := wk.LoadMsg(channelId, channelType, uint64(msg.MessageSeq))
+				if err != nil && !errors.Is(err, ErrNotFound) {
+					return err
+				}
+				if err == nil {
+					if err := wk.restoreHistoryHeader(&old); err != nil {
+						return err
+					}
+					before, e1 := old.Marshal()
+					after, e2 := msg.Marshal()
+					if e1 != nil || e2 != nil || !bytes.Equal(before, after) {
+						return ErrHistoryConflict
+					}
+				}
+			}
+		}
+	}
 	// 锁必须覆盖实际提交，不能只保护 writeSearchOutbox 中的批次构造。
 	for _, message := range msgs {
 		if message.SearchOutbox {
@@ -70,7 +113,15 @@ func (wk *wukongDB) AppendMessages(channelId string, channelType uint8, msgs []M
 		}
 	}
 	lastMsg := msgs[len(msgs)-1]
-	err := wk.setChannelLastMessageSeq(channelId, channelType, uint64(lastMsg.MessageSeq), batch)
+	lastSeq := uint64(lastMsg.MessageSeq)
+	if frozen {
+		current, _, err := wk.GetChannelLastMessageSeq(channelId, channelType)
+		if err != nil {
+			return err
+		}
+		lastSeq = max(lastSeq, current)
+	}
+	err := wk.setChannelLastMessageSeq(channelId, channelType, lastSeq, batch)
 	if err != nil {
 		return err
 	}
@@ -80,7 +131,7 @@ func (wk *wukongDB) AppendMessages(channelId string, channelType uint8, msgs []M
 		return err
 	}
 
-	wk.channelSeqCache.setChannelLastSeq(channelId, channelType, uint64(lastMsg.MessageSeq))
+	wk.channelSeqCache.setChannelLastSeq(channelId, channelType, lastSeq)
 
 	// 更新用户最后发送消息序号缓存
 	for _, msg := range msgs {
@@ -543,6 +594,17 @@ func (wk *wukongDB) LoadNextRangeMsgsForSize(channelId string, channelType uint8
 }
 
 func (wk *wukongDB) TruncateLogTo(channelId string, channelType uint8, messageSeq uint64) error {
+	wk.historyFenceMu.RLock()
+	defer wk.historyFenceMu.RUnlock()
+	if channelType == 1 {
+		fence, err := wk.historyFence(channelId, 1)
+		if err != nil {
+			return err
+		}
+		if fence != nil && messageSeq < fence.HighWatermark {
+			return ErrHistoryFenced
+		}
+	}
 	// 日志截断与显式恢复串行，避免恢复重新插入刚被截断的任务。
 	lock := &wk.searchOutboxMu[wk.GetChannelShardIndex(channelId, channelType)]
 	lock.Lock()

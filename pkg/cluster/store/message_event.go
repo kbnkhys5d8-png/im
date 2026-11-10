@@ -9,6 +9,11 @@ import (
 
 // AppendMessageEventWithState appends one event through raft proposal and returns persisted event + state.
 func (s *Store) AppendMessageEventWithState(channelId string, channelType uint8, event *wkdb.MessageEvent) (*wkdb.MessageEvent, *wkdb.MessageEventState, error) {
+	unlock := s.historyReadLock(channelId, channelType)
+	defer unlock()
+	if err := s.historyWritable(channelId, channelType); err != nil {
+		return nil, nil, err
+	}
 	if event == nil {
 		return nil, nil, wkdb.ErrNotFound
 	}
@@ -56,21 +61,46 @@ func (s *Store) AppendMessageEventWithState(channelId string, channelType uint8,
 }
 
 func (s *Store) GetMessageEventByEventID(channelId string, channelType uint8, clientMsgNo, eventID string) (*wkdb.MessageEvent, error) {
+	unlock := s.historyReadLock(channelId, channelType)
+	defer unlock()
+	if err := s.historyWritable(channelId, channelType); err != nil {
+		return nil, err
+	}
 	return s.wdb.GetMessageEventByEventID(channelId, channelType, clientMsgNo, eventID)
 }
 
 func (s *Store) ListMessageEvents(channelId string, channelType uint8, clientMsgNo string, fromMsgEventSeq uint64, eventKey string, limit int) ([]wkdb.MessageEvent, error) {
+	unlock := s.historyReadLock(channelId, channelType)
+	defer unlock()
+	if err := s.historyWritable(channelId, channelType); err != nil {
+		return nil, err
+	}
 	return s.wdb.ListMessageEvents(channelId, channelType, clientMsgNo, fromMsgEventSeq, eventKey, limit)
 }
 
 func (s *Store) GetMessageEventStates(channelId string, channelType uint8, clientMsgNo string) ([]wkdb.MessageEventState, error) {
+	unlock := s.historyReadLock(channelId, channelType)
+	defer unlock()
+	if err := s.historyWritable(channelId, channelType); err != nil {
+		return nil, err
+	}
 	return s.wdb.GetMessageEventStates(channelId, channelType, clientMsgNo)
 }
 
 func (s *Store) GetMessageEventStatesBatch(channelId string, channelType uint8, clientMsgNos []string) (map[string][]wkdb.MessageEventState, error) {
+	unlock := s.historyReadLock(channelId, channelType)
+	defer unlock()
+	if err := s.historyWritable(channelId, channelType); err != nil {
+		return nil, err
+	}
 	return s.wdb.GetMessageEventStatesBatch(channelId, channelType, clientMsgNos)
 }
 
 func (s *Store) GetMessageEventState(channelId string, channelType uint8, clientMsgNo, eventKey string) (*wkdb.MessageEventState, error) {
+	unlock := s.historyReadLock(channelId, channelType)
+	defer unlock()
+	if err := s.historyWritable(channelId, channelType); err != nil {
+		return nil, err
+	}
 	return s.wdb.GetMessageEventState(channelId, channelType, clientMsgNo, eventKey)
 }

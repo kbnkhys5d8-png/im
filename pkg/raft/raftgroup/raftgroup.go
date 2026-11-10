@@ -203,6 +203,19 @@ func (rg *RaftGroup) handleReceivedEvents() bool {
 	hasEvent := false
 	for _, e := range events {
 		raft := rg.raftList.get(e.RaftKey)
+		if e.historyBarrier != nil {
+			state := historyBarrierState{raft: raft}
+			if raft == nil {
+				state.err = ErrRaftNotExist
+			} else if !raft.IsLeader() {
+				state.err = types.ErrNotLeader
+			} else {
+				raft.KeepAlive()
+				state.index = raft.LastLogIndex()
+			}
+			e.historyBarrier <- state
+			continue
+		}
 		if raft == nil {
 			rg.Warn("raft not found", zap.String("raftKey", e.RaftKey), zap.String("event", e.Event.Type.String()))
 			if e.WaitC != nil {

@@ -92,6 +92,8 @@ func (s *Store) applyCMDs(cmds []*CMD, logIndexs []uint64) error {
 
 func (s *Store) applyCMD(cmd *CMD, logIndex uint64) error {
 	switch cmd.CmdType {
+	case CMDHistoryFenceSet, CMDHistoryFenceRelease:
+		return s.applyHistoryFence(cmd)
 	case CMDChannelClusterConfigSave: // 保存频道分布式配置
 		return s.handleChannelClusterConfigSave(cmd, logIndex)
 	case CMDAddOrUpdateConversations: // 添加或更新会话

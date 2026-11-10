@@ -135,6 +135,7 @@ func (s *apiServer) setRoutes() {
 	// message
 	msg := newMessage(s.s)
 	msg.route(s.r)
+	newHistoryAPI().route(s.r)
 	// conversation
 	conves := newConversation(s.s)
 	conves.route(s.r)

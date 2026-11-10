@@ -153,7 +153,11 @@ func New(opts *Options) *Server {
 		store.WithSlot(s.slotServer),
 		store.WithChannel(s.channelServer),
 		store.WithDB(s.db),
+		store.WithHistoryTopology(store.SingleNodeHistoryTopology(opts.ConfigOptions.NodeId, s, ErrChannelClusterConfigNotFound, wkdb.ErrNotFound)),
+		store.WithHistoryCapabilities(store.SingleNodeHistoryCapabilities(opts.ConfigOptions.NodeId, s)),
+		store.WithHistoryDrain(s.channelServer.WaitForHistory),
 		store.WithIsCmdChannel(opts.IsCmdChannel),
+		store.WithHistorySourceChannel(opts.HistorySourceChannel),
 	))
 
 	// 添加事件监听

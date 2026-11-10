@@ -37,6 +37,7 @@ type wukongDB struct {
 	dblock       *dblock
 	// 同分片任务校验与提交串行；慢分片不得阻塞其他分片的聊天存储。
 	searchOutboxMu []sync.Mutex
+	historyFenceMu sync.RWMutex
 	cancelCtx      context.Context
 	cancelFunc     context.CancelFunc
 

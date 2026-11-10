@@ -72,7 +72,14 @@ func (s *storage) AppendLogs(key string, logs []types.Log, termStartIndexInfo *t
 		msg.Term = uint64(log.Term)
 		messages = append(messages, msg)
 	}
-	err := s.db.AppendMessages(channelId, channelType, messages)
+	var err error
+	if db, ok := s.db.(interface {
+		AppendMessagesForRaft(string, uint8, []wkdb.Message) error
+	}); ok {
+		err = db.AppendMessagesForRaft(channelId, channelType, messages)
+	} else {
+		err = s.db.AppendMessages(channelId, channelType, messages)
+	}
 	if err != nil {
 		return err
 	}

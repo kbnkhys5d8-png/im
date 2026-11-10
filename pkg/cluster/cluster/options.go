@@ -57,7 +57,8 @@ type Options struct {
 
 	AppVersion string
 
-	IsCmdChannel func(channel string) bool
+	IsCmdChannel         func(channel string) bool
+	HistorySourceChannel func(channel string) string
 }
 
 func NewOptions(opt ...Option) *Options {
@@ -212,4 +213,8 @@ func WithIsCmdChannel(isCmdChannel func(channel string) bool) Option {
 	return func(o *Options) {
 		o.IsCmdChannel = isCmdChannel
 	}
+}
+
+func WithHistorySourceChannel(normalize func(string) string) Option {
+	return func(o *Options) { o.HistorySourceChannel = normalize }
 }

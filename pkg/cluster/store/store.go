@@ -10,7 +10,8 @@ type Store struct {
 	opts *Options
 	wklog.Log
 
-	wdb wkdb.DB
+	wdb          wkdb.DB
+	historyLocks historyLockTable
 
 	channelCfgCh chan *channelCfgReq
 	stopper      *syncutil.Stopper

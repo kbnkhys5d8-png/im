@@ -103,6 +103,9 @@ const (
 	CMDAppendMessageEvent
 	// 更新最近会话的已读位置（如果seq更大）
 	CMDUpdateConversationIfSeqGreater
+	// 历史迁移门禁必须随槽元数据复制，不能只存在于某个进程内。
+	CMDHistoryFenceSet
+	CMDHistoryFenceRelease
 )
 
 func (c CMDType) Uint16() uint16 {
@@ -111,6 +114,10 @@ func (c CMDType) Uint16() uint16 {
 
 func (c CMDType) String() string {
 	switch c {
+	case CMDHistoryFenceSet:
+		return "CMDHistoryFenceSet"
+	case CMDHistoryFenceRelease:
+		return "CMDHistoryFenceRelease"
 	case CMDAddDevice:
 		return "CMDAddDevice"
 	case CMDUpdateDevice:

@@ -214,6 +214,7 @@ func New(opts *options.Options) *Server {
 			cluster.WithDBWKDbMemTableSize(s.opts.Db.MemTableSize),
 			cluster.WithAuth(s.opts.Auth),
 			cluster.WithIsCmdChannel(s.opts.IsCmdChannel),
+			cluster.WithHistorySourceChannel(s.opts.CmdChannelConvertOrginalChannel),
 			cluster.WithAppVersion(version.Version),
 		),
 

@@ -111,7 +111,21 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 			// 已保存消息只交接首次分发，换主后不能再次执行持久化和回执。
 			cloneEvent.Type = eventbus.EventChannelDistributeInitial
 		}
-		eventbus.Channel.AddEvent(ctx.ChannelId, ctx.ChannelType, cloneEvent)
+		if e.Frame.(*wkproto.SendPacket).NoPersist && ctx.ChannelType == wkproto.ChannelTypePerson {
+			if service.Store == nil {
+				e.ReasonCode = wkproto.ReasonSystemError
+				continue
+			}
+			err := service.Store.WithHistorySend(ctx.ChannelId, ctx.ChannelType, func() error {
+				eventbus.Channel.AddEvent(ctx.ChannelId, ctx.ChannelType, cloneEvent)
+				return nil
+			})
+			if err != nil {
+				e.ReasonCode = wkproto.ReasonSystemError
+			}
+		} else {
+			eventbus.Channel.AddEvent(ctx.ChannelId, ctx.ChannelType, cloneEvent)
+		}
 	}
 
 	eventbus.Channel.Advance(ctx.ChannelId, ctx.ChannelType)
