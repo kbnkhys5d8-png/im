@@ -9,7 +9,7 @@
 - `POST /history/capabilities`：成功为 `200 {"single_node":true,"protocol":1}`；多节点、槽未就绪或能力缺失为 501。API 应在建立来源 reservation 前调用，freeze 时仍会再次检查。
 - `POST /history/fence`：请求为 `task_id`（64 位小写 hex）、`source_uid`、`peer_uid`。拒绝相同 UID、包含 `@`、CRC32 碰撞或非原生 canonical 身份。返回同身份和 `source_channel`、`high_watermark`。
 - `POST /history/export`：同身份加 `after_seq`、`limit`（1–200）。返回 `source_channel`、`messages`、`next_seq`、JSON bool `more`、`high_watermark`。范围固定为 `(after_seq, high_watermark]`。消息中的 `channel_id` 为原始 canonical，而非普通展示的 logical UID；保留 ID、seq、header、setting、expire、时间戳及正文。非空 StreamNo 或 stream setting 返回 422，由 API 拒绝整项并取消，不静默降级。
-- `POST /history/fence/release`：同身份，仅用于未发布取消。存在门禁时 task 和双方身份必须精确匹配；无门禁是安全的幂等 no-op。API 必须保留 cancelling，直到所有释放确认成功；发布后禁止调用 release。
+- `POST /history/fence/release`：同身份，仅用于未发布取消。存在门禁时 task 和双方身份必须精确匹配；无门禁也耐久保存该任务的取消标记，防止迟到的 freeze 或槽日志重新建立门禁。重复取消幂等，其他任务的门禁不能被释放。API 必须保留 cancelling，直到所有释放确认成功；发布后禁止调用 release。
 
 导出不修改原消息或任何目标频道，也不调用普通发送、分发、webhook 或消息索引写入。消息以原生 MessageResp 为基础，但显式保留存储频道。额外的业务类型过滤在 API 完整核验所有页之后执行：首版只允许文本、图片、语音、视频、文档；任何不支持类型必须整项拒绝，不删除来源。
 
@@ -21,8 +21,8 @@
 
 ## 耐久性与关闭路径
 
-- Store 按原生频道和类型使用引用计数 RW 锁，覆盖 AppendMessages 提案、单频道读取、NoPersist 分发准入、freeze 和 release。私聊命令频道映射到对应原生来源锁；无关私聊和群聊不共享长时锁，也不使用可能碰撞的哈希分桶。引用表的全局互斥只保护增减引用和建删键，等待者也计入引用，最后释放后立即删除键，不跨任何 Drain、提案或存储 IO。
-- freeze 只独占来源频道，等待该来源已进入 Store 的 append 退出，再通过同一 Raft Propose FIFO 的只读屏障等待既有日志实际应用；这包括请求已超时返回、但仍在队列或持久化中的提案。排空失败不创建门禁。最后在 wkdb 锁内取高水位并同步写入门禁；底层全局锁只保护本地元数据/批次，不覆盖 Store 的慢排空或槽提案。
+- Store 按原生频道和类型使用引用计数读写信号量，覆盖 AppendMessages 提案、单频道读取、NoPersist 分发准入、freeze 和 release。带 context 的 append、freeze、export、release 及 freeze 配置锁等待可因请求取消退出。私聊命令频道映射到对应原生来源锁；无关私聊和群聊不共享长时锁，也不使用可能碰撞的哈希分桶。引用表的全局互斥只保护增减引用和建删键，等待者也计入引用，最后释放后立即删除键，不跨任何 Drain、提案或存储 IO。
+- freeze 只独占来源频道，等待该来源已进入 Store 的 append 退出，再通过同一 Raft Propose FIFO 的只读屏障等待既有日志实际应用；这包括请求已超时返回、但仍在队列或持久化中的提案。排空失败不创建门禁。最后在 wkdb 按原生私聊频道加锁取高水位并同步写入门禁；慢批次提交仅持有所属频道锁，不阻塞其他频道的冻结或群消息追加。
 - 频道配置保存使用独立的按频道互斥锁与该来源的最终取样串行，避免首次 append 创建配置时重入读锁造成 freeze 死锁，也不阻塞无关频道配置；排空过程中不持有配置锁，允许既有频道唤醒完成。
 - 门禁使用 wkdb 独立命名空间 0x1c01，并提交独立槽元数据命令。槽提案失败也保留本地门禁，重复同任务取相同水位；其他任务不能覆盖。每个已释放 task 保留耐久取消标记，旧槽日志重放不能复活旧门禁或释放新任务。
 - 普通 Store 消息读取、ClientMsgNo、全局搜索、批量读取及消息事件入口对已冻结来源失败关闭；原生 DB 数据保留给导出及 Raft 内部读取。搜索/多频道批量读取不持长时锁跨原始 IO，读取完成后逐频道复核门禁；复核不等待正在独占冻结的来源，而是隐藏它，避免来源的慢 Drain 拖住无关频道结果。按 ID 搜索也检查实际返回频道。全局搜索会跳过冻结来源继续取正常频道结果，不将冻结记录造成的空页当结束。
@@ -49,7 +49,7 @@
 - 发送末端：`internal/channel/handler/event_persist.go`、`internal/channel/handler/history_fence_test.go`。
 - 服务注入：`internal/server/server.go`、`pkg/cluster/cluster/options.go`、`pkg/cluster/cluster/server.go`。
 - 频道存储和排空：`pkg/cluster/channel/storage.go`、`pkg/cluster/channel/history_barrier.go`、`pkg/cluster/channel/history_barrier_test.go`。
-- Store：`pkg/cluster/store/history_fence.go`、`pkg/cluster/store/history_fence_test.go`、`pkg/cluster/store/history_lock.go`、`pkg/cluster/store/history_lock_test.go`、`pkg/cluster/store/message.go`、`pkg/cluster/store/message_event.go`、`pkg/cluster/store/channel_clusterconfig.go`、`pkg/cluster/store/options.go`、`pkg/cluster/store/store.go`、`pkg/cluster/store/store_apply.go`、`pkg/cluster/store/model.go`。
+- Store：`pkg/cluster/store/history_fence.go`、`pkg/cluster/store/history_fence_test.go`、`pkg/cluster/store/history_lock.go`、`pkg/cluster/store/history_lock_test.go`、`pkg/cluster/store/history_recovery_test.go`、`pkg/cluster/store/message.go`、`pkg/cluster/store/message_event.go`、`pkg/cluster/store/channel_clusterconfig.go`、`pkg/cluster/store/options.go`、`pkg/cluster/store/store.go`、`pkg/cluster/store/store_apply.go`、`pkg/cluster/store/model.go`。
 - Raft 队列屏障：`pkg/raft/raftgroup/history_barrier.go`、`pkg/raft/raftgroup/history_barrier_test.go`、`pkg/raft/raftgroup/raftgroup.go`、`pkg/raft/raftgroup/types.go`。
-- Pebble：`pkg/wkdb/history_fence.go`、`pkg/wkdb/history_fence_test.go`、`pkg/wkdb/message.go`、`pkg/wkdb/wukongdb.go`。
+- Pebble：`pkg/wkdb/history_fence.go`、`pkg/wkdb/history_fence_test.go`、`pkg/wkdb/history_lock.go`、`pkg/wkdb/history_lock_test.go`、`pkg/wkdb/message.go`、`pkg/wkdb/wukongdb.go`。
 - 说明：`docs/history-fence.md`。

@@ -158,7 +158,10 @@ func (s *Store) applyHistoryFence(cmd *CMD) error {
 }
 
 func (s *Store) FreezeHistory(ctx context.Context, identity wkdb.HistoryFence) (wkdb.HistoryFence, error) {
-	unlock := s.historyWriteLock(identity.ChannelID, 1)
+	unlock, err := s.historyWriteLockContext(ctx, identity.ChannelID, 1)
+	if err != nil {
+		return wkdb.HistoryFence{}, err
+	}
 	defer unlock()
 	if err := ctx.Err(); err != nil {
 		return wkdb.HistoryFence{}, err
@@ -178,7 +181,10 @@ func (s *Store) FreezeHistory(ctx context.Context, identity wkdb.HistoryFence) (
 	if err := s.opts.HistoryDrain(ctx, identity.ChannelID, 1); err != nil {
 		return wkdb.HistoryFence{}, err
 	}
-	unlockConfig := s.historyConfigLock(identity.ChannelID, 1)
+	unlockConfig, err := s.historyConfigLockContext(ctx, identity.ChannelID, 1)
+	if err != nil {
+		return wkdb.HistoryFence{}, err
+	}
 	defer unlockConfig()
 	// 排空日志可能唤醒已有频道，须在配置锁内重新决定是否允许空来源分支。
 	topologyErr = s.historyTopology(identity.ChannelID)
@@ -188,7 +194,6 @@ func (s *Store) FreezeHistory(ctx context.Context, identity wkdb.HistoryFence) (
 	}
 	// 已接收 append 完成后才取样；槽日志失败也保留本地门禁，重试不得换水位。
 	var fence wkdb.HistoryFence
-	var err error
 	if empty {
 		fence, err = db.FreezeEmptyHistoryFence(identity)
 	} else {
@@ -211,7 +216,10 @@ func sameFenceIdentity(a, b wkdb.HistoryFence) bool {
 }
 
 func (s *Store) ReleaseHistory(ctx context.Context, identity wkdb.HistoryFence) error {
-	unlock := s.historyWriteLock(identity.ChannelID, 1)
+	unlock, err := s.historyWriteLockContext(ctx, identity.ChannelID, 1)
+	if err != nil {
+		return err
+	}
 	defer unlock()
 	if _, ok := s.wdb.(wkdb.HistoryFenceStore); !ok {
 		return wkdb.ErrHistoryUnsupported
@@ -223,11 +231,8 @@ func (s *Store) ReleaseHistory(ctx context.Context, identity wkdb.HistoryFence) 
 	if old != nil && !sameFenceIdentity(*old, identity) {
 		return wkdb.ErrHistoryConflict
 	}
-	if old == nil {
-		// 未创建门禁的失败任务也能取消；这里不删除任何门禁或任务记录。
-		return nil
-	}
-	if err := s.historyTopology(identity.ChannelID); err != nil && !(errors.Is(err, wkdb.ErrHistoryChannelMissing) && old.HighWatermark == 0) {
+	// 尚无门禁也必须耐久登记取消，拒绝尚未进入频道锁的迟到冻结请求。
+	if err := s.historyTopology(identity.ChannelID); err != nil && !(errors.Is(err, wkdb.ErrHistoryChannelMissing) && (old == nil || old.HighWatermark == 0)) {
 		return err
 	}
 	return s.historyCommand(ctx, CMDHistoryFenceRelease, identity)
@@ -240,7 +245,10 @@ type HistoryExportPage struct {
 }
 
 func (s *Store) ExportHistory(ctx context.Context, identity wkdb.HistoryFence, after uint64, limit int) (HistoryExportPage, error) {
-	unlock := s.historyReadLock(identity.ChannelID, 1)
+	unlock, err := s.historyReadLockContext(ctx, identity.ChannelID, 1)
+	if err != nil {
+		return HistoryExportPage{}, err
+	}
 	defer unlock()
 	page := HistoryExportPage{Messages: []wkdb.Message{}}
 	if limit < 1 || limit > 200 {

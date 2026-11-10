@@ -89,8 +89,8 @@ func validHistoryFence(f HistoryFence) bool {
 }
 
 func (wk *wukongDB) GetReleasedHistoryFence(channel, task string) (*HistoryFence, error) {
-	wk.historyFenceMu.RLock()
-	defer wk.historyFenceMu.RUnlock()
+	unlock := wk.historyFenceLocks.acquire(channel, false)
+	defer unlock()
 	return wk.readHistoryFence(channel, historyReleasedKey(channel, task))
 }
 
@@ -130,8 +130,8 @@ func (wk *wukongDB) GetHistoryFence(channel string, kind uint8) (*HistoryFence, 
 	if kind != 1 {
 		return nil, nil
 	}
-	wk.historyFenceMu.RLock()
-	defer wk.historyFenceMu.RUnlock()
+	unlock := wk.historyFenceLocks.acquire(channel, false)
+	defer unlock()
 	return wk.historyFence(channel, 1)
 }
 
@@ -159,8 +159,8 @@ func (wk *wukongDB) freezeHistoryFence(fence HistoryFence, requireEmpty bool) (H
 	if !validHistoryFence(fence) {
 		return HistoryFence{}, ErrHistoryConflict
 	}
-	wk.historyFenceMu.Lock()
-	defer wk.historyFenceMu.Unlock()
+	unlock := wk.historyFenceLocks.acquire(fence.ChannelID, true)
+	defer unlock()
 	old, err := wk.historyFence(fence.ChannelID, 1)
 	if err != nil {
 		return HistoryFence{}, err
@@ -217,15 +217,15 @@ func (wk *wukongDB) SetHistoryFence(fence HistoryFence) error {
 	if !validHistoryFence(fence) {
 		return ErrHistoryConflict
 	}
-	wk.historyFenceMu.Lock()
-	defer wk.historyFenceMu.Unlock()
+	unlock := wk.historyFenceLocks.acquire(fence.ChannelID, true)
+	defer unlock()
 	// 槽 applied 检查点可能落后于业务库；旧任务日志重放不得复活已释放门禁。
 	released, err := wk.readHistoryFence(fence.ChannelID, historyReleasedKey(fence.ChannelID, fence.TaskID))
 	if err != nil {
 		return err
 	}
 	if released != nil {
-		if !sameHistoryIdentity(*released, fence) || released.HighWatermark != fence.HighWatermark {
+		if !sameHistoryIdentity(*released, fence) {
 			return ErrHistoryConflict
 		}
 		return nil
@@ -244,8 +244,8 @@ func (wk *wukongDB) ReleaseHistoryFence(fence HistoryFence) error {
 	if !validHistoryFence(fence) {
 		return ErrHistoryConflict
 	}
-	wk.historyFenceMu.Lock()
-	defer wk.historyFenceMu.Unlock()
+	unlock := wk.historyFenceLocks.acquire(fence.ChannelID, true)
+	defer unlock()
 	released, err := wk.readHistoryFence(fence.ChannelID, historyReleasedKey(fence.ChannelID, fence.TaskID))
 	if err != nil {
 		return err
@@ -260,11 +260,13 @@ func (wk *wukongDB) ReleaseHistoryFence(fence HistoryFence) error {
 	if err != nil {
 		return err
 	}
-	if old == nil {
+	if old != nil && !sameHistoryIdentity(*old, fence) {
 		return ErrHistoryConflict
 	}
-	if !sameHistoryIdentity(*old, fence) {
-		return ErrHistoryConflict
+	if old == nil {
+		// 先取消后到达的冻结也不能生效；取消标记不依赖旧高水位。
+		fence.HighWatermark = 0
+		old = &fence
 	}
 	data, err := json.Marshal(old)
 	if err != nil {

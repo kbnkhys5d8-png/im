@@ -9,7 +9,10 @@ import (
 
 // AppendMessages 追加消息
 func (s *Store) AppendMessages(ctx context.Context, channelId string, channelType uint8, msgs []wkdb.Message) (types.ProposeRespSet, error) {
-	unlock := s.historyReadLock(channelId, channelType)
+	unlock, err := s.historyReadLockContext(ctx, channelId, channelType)
+	if err != nil {
+		return nil, err
+	}
 	defer unlock()
 	if err := s.historyWritable(channelId, channelType); err != nil {
 		return nil, err

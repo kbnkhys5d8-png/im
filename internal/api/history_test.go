@@ -312,9 +312,17 @@ func TestHistoryHTTPEmptyMissingChannelAndUnfrozenCancellation(t *testing.T) {
 			t.Fatal(r.Code, r.Body.String())
 		}
 	}
-	if topologyCalls != 0 {
-		t.Fatal("未冻结取消仍依赖缺失频道 leader")
+	if topologyCalls != 2 {
+		t.Fatal("未冻结取消没有核验单节点拓扑")
 	}
+	// 取消必须阻止旧请求迟到冻结；新任务仍可导出没有普通频道的空来源。
+	if r := historyLocalHTTP(router, "/history/fence", request); r.Code != http.StatusBadRequest {
+		t.Fatal("已取消任务重新建立门禁", r.Code, r.Body.String())
+	}
+	if fence, err := db.(wkdb.HistoryFenceStore).GetHistoryFence("a@c", 1); err != nil || fence != nil {
+		t.Fatal("已取消来源残留门禁", fence, err)
+	}
+	request.TaskID = strings.Repeat("b", 64)
 	for i := 0; i < 2; i++ {
 		r := historyLocalHTTP(router, "/history/fence", request)
 		var fence wkdb.HistoryFence

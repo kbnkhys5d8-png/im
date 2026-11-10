@@ -25,10 +25,10 @@ func (wk *wukongDB) AppendMessagesForRaft(channelId string, channelType uint8, m
 }
 
 func (wk *wukongDB) appendMessages(channelId string, channelType uint8, msgs []Message, replay bool) error {
-	wk.historyFenceMu.RLock()
-	defer wk.historyFenceMu.RUnlock()
 	var frozen bool
 	if channelType == 1 {
+		unlock := wk.historyFenceLocks.acquire(channelId, false)
+		defer unlock()
 		fence, err := wk.historyFence(channelId, 1)
 		if err != nil {
 			return err
@@ -594,9 +594,9 @@ func (wk *wukongDB) LoadNextRangeMsgsForSize(channelId string, channelType uint8
 }
 
 func (wk *wukongDB) TruncateLogTo(channelId string, channelType uint8, messageSeq uint64) error {
-	wk.historyFenceMu.RLock()
-	defer wk.historyFenceMu.RUnlock()
 	if channelType == 1 {
+		unlock := wk.historyFenceLocks.acquire(channelId, false)
+		defer unlock()
 		fence, err := wk.historyFence(channelId, 1)
 		if err != nil {
 			return err
