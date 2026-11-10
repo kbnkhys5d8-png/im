@@ -224,19 +224,20 @@ func (s *Server) handleUnauthenticatedConn(conn wknet.Conn, buff []byte, isJson 
 		}
 
 		if frameType != wkproto.CONNECT {
-			s.Warn("frameType is not CONNECT, closing connection", zap.String("frameType", frameType.String()), zap.ByteString("data", frameData))
+			// 首帧日志只保留固定类别和长度，避免原始帧及解码错误携带凭据。
+			s.Warn("frameType is not CONNECT, closing connection", zap.String("error_class", "unexpected_frame_type"), zap.String("frameType", frameType.String()), zap.Int("frame_bytes", len(frameData)))
 			conn.Close()
 			return
 		}
 
 		packet, firstFrameSize, decodeErr := s.opts.Proto.DecodeFrame(frameData, wkproto.LatestVersion)
 		if decodeErr != nil {
-			s.Warn("Failed to decode first frame, closing connection", zap.Error(decodeErr), zap.ByteString("data", frameData))
+			s.Warn("Failed to decode first frame, closing connection", zap.String("error_class", "decode_failed"), zap.String("frameType", frameType.String()), zap.Int("frame_bytes", len(frameData)))
 			conn.Close()
 			return nil, 0, decodeErr
 		}
 		if packet == nil {
-			s.Warn("Decoded first frame is nil, closing connection", zap.ByteString("data", frameData))
+			s.Warn("Decoded first frame is nil, closing connection", zap.String("error_class", "nil_frame"), zap.String("frameType", frameType.String()), zap.Int("frame_bytes", len(frameData)))
 			conn.Close()
 			return nil, 0, errors.New("decoded nil frame")
 		}
