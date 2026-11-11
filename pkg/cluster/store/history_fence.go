@@ -248,6 +248,15 @@ type HistoryExportPage struct {
 }
 
 func (s *Store) ExportHistory(ctx context.Context, identity wkdb.HistoryFence, after uint64, limit int) (HistoryExportPage, error) {
+	return s.readHistory(ctx, identity, after, limit, false, nil)
+}
+
+// PreviewHistory 只读取固定水位内的记录，不排空队列、不建立迁移门禁。
+func (s *Store) PreviewHistory(ctx context.Context, identity wkdb.HistoryFence, after uint64, limit int, high *uint64) (HistoryExportPage, error) {
+	return s.readHistory(ctx, identity, after, limit, true, high)
+}
+
+func (s *Store) readHistory(ctx context.Context, identity wkdb.HistoryFence, after uint64, limit int, preview bool, high *uint64) (HistoryExportPage, error) {
 	unlock, err := s.historyReadLockContext(ctx, identity.ChannelID, 1)
 	if err != nil {
 		return HistoryExportPage{}, err
@@ -265,24 +274,31 @@ func (s *Store) ExportHistory(ctx context.Context, identity wkdb.HistoryFence, a
 	if err != nil {
 		return page, err
 	}
-	if fence == nil || !sameFenceIdentity(*fence, identity) {
-		return page, wkdb.ErrHistoryConflict
-	}
-	page.HighWatermark = fence.HighWatermark
-	if topologyErr != nil && fence.HighWatermark != 0 {
-		return page, topologyErr
-	}
 	current, _, err := s.wdb.GetChannelLastMessageSeq(identity.ChannelID, 1)
 	if err != nil {
 		return page, err
 	}
-	if current != fence.HighWatermark {
-		return page, wkdb.ErrHistoryConflict
+	if preview {
+		if fence != nil || (high != nil && *high > current) || (high == nil && after != 0) {
+			return page, wkdb.ErrHistoryConflict
+		}
+		page.HighWatermark = current
+		if high != nil {
+			page.HighWatermark = *high
+		}
+	} else {
+		if fence == nil || !sameFenceIdentity(*fence, identity) || current != fence.HighWatermark {
+			return page, wkdb.ErrHistoryConflict
+		}
+		page.HighWatermark = fence.HighWatermark
 	}
-	if after > fence.HighWatermark || after > math.MaxUint32 {
+	if topologyErr != nil && current != 0 {
+		return page, topologyErr
+	}
+	if after > page.HighWatermark || after > math.MaxUint32 || page.HighWatermark > math.MaxUint32 {
 		return page, errors.New("invalid history cursor")
 	}
-	if after == fence.HighWatermark {
+	if after == page.HighWatermark {
 		return page, nil
 	}
 	db, ok := s.wdb.(wkdb.HistoryFenceStore)
@@ -295,7 +311,7 @@ func (s *Store) ExportHistory(ctx context.Context, identity wkdb.HistoryFence, a
 			return HistoryExportPage{}, err
 		}
 		// 逐条读取限制内存，不能先加载最多 201 条任意大小的正文。
-		rows, err := db.LoadHistoryMessages(identity.ChannelID, next, fence.HighWatermark+1, 1)
+		rows, err := db.LoadHistoryMessages(identity.ChannelID, next, page.HighWatermark+1, 1)
 		if err != nil {
 			return HistoryExportPage{}, err
 		}
@@ -304,7 +320,7 @@ func (s *Store) ExportHistory(ctx context.Context, identity wkdb.HistoryFence, a
 		}
 		msg := rows[0]
 		seq := uint64(msg.MessageSeq)
-		if seq < next || seq > fence.HighWatermark || msg.ChannelID != identity.ChannelID || msg.ChannelType != 1 {
+		if seq < next || seq > page.HighWatermark || msg.ChannelID != identity.ChannelID || msg.ChannelType != 1 {
 			return HistoryExportPage{}, wkdb.ErrHistoryConflict
 		}
 		if msg.StreamNo != "" || msg.Setting.IsSet(wkproto.SettingStream) {
@@ -324,7 +340,7 @@ func (s *Store) ExportHistory(ctx context.Context, identity wkdb.HistoryFence, a
 		page.Messages = append(page.Messages, msg)
 		size += len(data)
 		next = seq + 1
-		if seq == fence.HighWatermark {
+		if seq == page.HighWatermark {
 			break
 		}
 	}

@@ -217,6 +217,48 @@ func TestHistoryHTTPOversizeMessageFailsWithoutCursor(t *testing.T) {
 	}
 }
 
+func TestHistoryHTTPPreflightPagesWithoutFence(t *testing.T) {
+	router, db, req := historyAPIFixture(t, 20, 20)
+	req.Limit = 1
+	if r := historyHTTP(router, "/history/preflight", req, "192.0.2.1:1234", "synthetic-history-token"); r.Code != http.StatusForbidden {
+		t.Fatal("非本机请求不得预检")
+	}
+	read := func() historyResponse {
+		t.Helper()
+		r := historyLocalHTTP(router, "/history/preflight", req)
+		var page historyResponse
+		if r.Code != http.StatusOK || json.Unmarshal(r.Body.Bytes(), &page) != nil {
+			t.Fatalf("预检分页失败: %d", r.Code)
+		}
+		return page
+	}
+	first := read()
+	if first.HighWatermark != 2 || first.NextSeq != 1 || !first.More || len(first.Messages) != 1 {
+		t.Fatal("首批预检没有固定正确的水位")
+	}
+	identity, err := req.identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence, err := db.(wkdb.HistoryFenceStore).GetHistoryFence(identity.ChannelID, 1)
+	if err != nil || fence != nil {
+		t.Fatal("预检不得建立持久门禁")
+	}
+	msg := wkdb.Message{RecvPacket: wkproto.RecvPacket{MessageID: 102, MessageSeq: 3, FromUID: "a", ChannelID: identity.ChannelID, ChannelType: 1, Timestamp: 1700000000, Payload: []byte("synthetic")}}
+	if err := db.AppendMessages(identity.ChannelID, 1, []wkdb.Message{msg}); err != nil {
+		t.Fatal("预检后仍应可以追加新消息:", err)
+	}
+	req.AfterSeq, req.High = first.NextSeq, &first.HighWatermark
+	last := read()
+	if last.HighWatermark != 2 || last.NextSeq != 2 || last.More || len(last.Messages) != 1 {
+		t.Fatal("预检续页越过了首次读取的水位")
+	}
+	req.High = nil
+	if r := historyLocalHTTP(router, "/history/export", req); r.Code == http.StatusOK {
+		t.Fatal("预检不能替代正式导出的门禁")
+	}
+}
+
 func TestHistoryHTTPCapabilitiesRejectsNotReady(t *testing.T) {
 	previous := options.G
 	options.G = options.New()

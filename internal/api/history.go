@@ -24,11 +24,12 @@ import (
 var historyTaskID = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 type historyRequest struct {
-	TaskID    string `json:"task_id"`
-	SourceUID string `json:"source_uid"`
-	PeerUID   string `json:"peer_uid"`
-	AfterSeq  uint64 `json:"after_seq"`
-	Limit     int    `json:"limit"`
+	TaskID    string  `json:"task_id"`
+	SourceUID string  `json:"source_uid"`
+	PeerUID   string  `json:"peer_uid"`
+	AfterSeq  uint64  `json:"after_seq"`
+	Limit     int     `json:"limit"`
+	High      *uint64 `json:"high_watermark,omitempty"`
 }
 
 func (r historyRequest) identity() (wkdb.HistoryFence, error) {
@@ -46,6 +47,7 @@ func (h *historyAPI) route(r *wkhttp.WKHttp) {
 	r.POST("/history/capabilities", h.capabilities)
 	r.POST("/history/fence", h.freeze)
 	r.POST("/history/export", h.export)
+	r.POST("/history/preflight", h.preflight)
 	r.POST("/history/fence/release", h.release)
 }
 
@@ -70,7 +72,7 @@ func historyLocal(c *wkhttp.Context) bool {
 	return true
 }
 
-func historyInput(c *wkhttp.Context) (historyRequest, wkdb.HistoryFence, bool) {
+func historyInput(c *wkhttp.Context, preview bool) (historyRequest, wkdb.HistoryFence, bool) {
 	var req historyRequest
 	// 只信真实 TCP 对端，X-Forwarded-For 等代理头不能授予 loopback 权限。
 	if !historyLocal(c) {
@@ -79,7 +81,7 @@ func historyInput(c *wkhttp.Context) (historyRequest, wkdb.HistoryFence, bool) {
 	var err error
 	decoder := json.NewDecoder(io.LimitReader(c.Request.Body, 4097))
 	decoder.DisallowUnknownFields()
-	if err = decoder.Decode(&req); err != nil {
+	if err = decoder.Decode(&req); err != nil || (!preview && req.High != nil) {
 		c.ResponseError(errors.New("invalid history request"))
 		return req, wkdb.HistoryFence{}, false
 	}
@@ -97,7 +99,7 @@ func historyInput(c *wkhttp.Context) (historyRequest, wkdb.HistoryFence, bool) {
 }
 
 func (h *historyAPI) freeze(c *wkhttp.Context) {
-	_, identity, ok := historyInput(c)
+	_, identity, ok := historyInput(c, false)
 	if !ok {
 		return
 	}
@@ -110,7 +112,7 @@ func (h *historyAPI) freeze(c *wkhttp.Context) {
 }
 
 func (h *historyAPI) release(c *wkhttp.Context) {
-	_, identity, ok := historyInput(c)
+	_, identity, ok := historyInput(c, false)
 	if !ok {
 		return
 	}
@@ -130,11 +132,25 @@ type historyResponse struct {
 }
 
 func (h *historyAPI) export(c *wkhttp.Context) {
-	req, identity, ok := historyInput(c)
+	h.readHistory(c, false)
+}
+
+func (h *historyAPI) preflight(c *wkhttp.Context) {
+	h.readHistory(c, true)
+}
+
+func (h *historyAPI) readHistory(c *wkhttp.Context, preview bool) {
+	req, identity, ok := historyInput(c, preview)
 	if !ok {
 		return
 	}
-	page, err := h.store.ExportHistory(c.Request.Context(), identity, req.AfterSeq, req.Limit)
+	var page store.HistoryExportPage
+	var err error
+	if preview {
+		page, err = h.store.PreviewHistory(c.Request.Context(), identity, req.AfterSeq, req.Limit, req.High)
+	} else {
+		page, err = h.store.ExportHistory(c.Request.Context(), identity, req.AfterSeq, req.Limit)
+	}
 	if err != nil {
 		if errors.Is(err, store.ErrHistoryMessageTooLarge) {
 			historyMessageTooLarge(c)
