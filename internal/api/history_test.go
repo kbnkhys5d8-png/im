@@ -196,12 +196,24 @@ func TestHistoryHTTPExportBudgetNoLossAndTerminalCursor(t *testing.T) {
 }
 
 func TestHistoryHTTPOversizeMessageFailsWithoutCursor(t *testing.T) {
-	router, _, request := historyAPIFixture(t, store.HistoryPageBytes)
-	if r := historyLocalHTTP(router, "/history/fence", request); r.Code != 200 {
-		t.Fatal(r.Body.String())
-	}
-	if r := historyLocalHTTP(router, "/history/export", request); r.Code == 200 {
-		t.Fatal("单条超限被静默跳过")
+	for _, tc := range []struct {
+		name string
+		size int
+	}{
+		{"原始消息超限", store.HistoryPageBytes},
+		{"JSON编码后超限", store.HistoryPageBytes * 4 / 5},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			router, _, request := historyAPIFixture(t, tc.size)
+			if r := historyLocalHTTP(router, "/history/fence", request); r.Code != http.StatusOK {
+				t.Fatal(r.Body.String())
+			}
+			r := historyLocalHTTP(router, "/history/export", request)
+			var body map[string]string
+			if r.Code != http.StatusUnprocessableEntity || json.Unmarshal(r.Body.Bytes(), &body) != nil || len(body) != 1 || body["error_code"] != "history_message_too_large" {
+				t.Fatalf("单条超限未返回固定分类，状态=%d", r.Code)
+			}
+		})
 	}
 }
 

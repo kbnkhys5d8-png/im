@@ -136,6 +136,10 @@ func (h *historyAPI) export(c *wkhttp.Context) {
 	}
 	page, err := h.store.ExportHistory(c.Request.Context(), identity, req.AfterSeq, req.Limit)
 	if err != nil {
+		if errors.Is(err, store.ErrHistoryMessageTooLarge) {
+			historyMessageTooLarge(c)
+			return
+		}
 		if errors.Is(err, wkdb.ErrHistoryStreamUnsupported) {
 			c.JSON(http.StatusUnprocessableEntity, map[string]string{"error": err.Error()})
 			return
@@ -165,7 +169,7 @@ func (h *historyAPI) export(c *wkhttp.Context) {
 		if len(encoded) > store.HistoryPageBytes-32 {
 			response.Messages = response.Messages[:len(response.Messages)-1]
 			if len(response.Messages) == 0 {
-				c.ResponseError(errors.New("history message exceeds JSON page budget"))
+				historyMessageTooLarge(c)
 				return
 			}
 			response.NextSeq = response.Messages[len(response.Messages)-1].MessageSeq
@@ -182,6 +186,11 @@ func (h *historyAPI) export(c *wkhttp.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, response)
+}
+
+// 两种单条超限都不可重试，只返回固定类别，不返回原文或游标。
+func historyMessageTooLarge(c *wkhttp.Context) {
+	c.JSON(http.StatusUnprocessableEntity, map[string]string{"error_code": "history_message_too_large"})
 }
 
 func newHistoryAPI() *historyAPI { return &historyAPI{store: service.Store} }

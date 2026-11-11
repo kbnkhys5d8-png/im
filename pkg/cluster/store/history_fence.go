@@ -13,6 +13,9 @@ import (
 
 const HistoryPageBytes = 4 * 1024 * 1024
 
+// ErrHistoryMessageTooLarge 表示单条消息无法放进受限的迁移导出页。
+var ErrHistoryMessageTooLarge = errors.New("history message exceeds page budget")
+
 type HistoryTopologyCluster interface {
 	Nodes() []*nodetypes.Node
 	Slots() []*nodetypes.Slot
@@ -313,7 +316,7 @@ func (s *Store) ExportHistory(ctx context.Context, identity wkdb.HistoryFence, a
 		}
 		if len(page.Messages) == limit || size+len(data) > HistoryPageBytes {
 			if len(page.Messages) == 0 {
-				return HistoryExportPage{}, errors.New("history message exceeds page budget")
+				return HistoryExportPage{}, ErrHistoryMessageTooLarge
 			}
 			page.More = true
 			break
