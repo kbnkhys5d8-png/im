@@ -1,7 +1,6 @@
 package manager
 
 import (
-	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -42,43 +41,24 @@ func NewRetryQueue(index int, r *RetryManager) *RetryQueue {
 }
 
 func (r *RetryQueue) startInFlightTimeout(msg *types.RetryMessage) {
-	now := time.Now()
-	msg.Pri = now.Add(options.G.MessageRetry.Interval).UnixNano()
-	r.pushInFlightMessage(msg)
-	r.addToInFlightPQ(msg)
-
-}
-
-func (r *RetryQueue) addToInFlightPQ(msg *types.RetryMessage) {
-	r.inFlightMutex.Lock()
-	defer r.inFlightMutex.Unlock()
-	r.inFlightPQ.Push(msg)
-
-}
-func (r *RetryQueue) pushInFlightMessage(msg *types.RetryMessage) {
-	r.inFlightMutex.Lock()
-	defer r.inFlightMutex.Unlock()
 	key := r.getInFlightKey(msg.FromNode, msg.ConnId, msg.MessageId)
-	_, ok := r.inFlightMessages[key]
-	if ok {
-		r.Warn("ID already in flight", zap.String("key", key), zap.String("uid", msg.Uid), zap.Uint64("fromNode", msg.FromNode), zap.Int64("connId", msg.ConnId), zap.Int64("messageId", msg.MessageId))
+	r.inFlightMutex.Lock()
+	if r.inFlightMessages[key] != nil {
+		r.inFlightMutex.Unlock()
+		r.Warn("ID already in flight",
+			zap.String("key", key),
+			zap.String("uid", msg.Uid),
+			zap.Uint64("fromNode", msg.FromNode),
+			zap.Int64("connId", msg.ConnId),
+			zap.Int64("messageId", msg.MessageId),
+		)
 		return
 	}
+	// 表和堆一起登记，避免回执移除了表项后仍留下堆项。
 	r.inFlightMessages[key] = msg
-
-}
-
-func (r *RetryQueue) popInFlightMessage(fromNodeId uint64, connId int64, messageId int64) (*types.RetryMessage, error) {
-	r.inFlightMutex.Lock()
-	defer r.inFlightMutex.Unlock()
-	key := r.getInFlightKey(fromNodeId, connId, messageId)
-	msg, ok := r.inFlightMessages[key]
-	if !ok {
-		r.Warn("ID not in flight", zap.String("key", key), zap.Uint64("fromNode", fromNodeId), zap.Int64("connId", connId), zap.Int64("messageId", messageId))
-		return nil, errors.New("ID not in flight")
-	}
-	delete(r.inFlightMessages, key)
-	return msg, nil
+	msg.Pri = time.Now().Add(options.G.MessageRetry.Interval).UnixNano()
+	r.inFlightPQ.Push(msg)
+	r.inFlightMutex.Unlock()
 }
 
 func (r *RetryQueue) getInFlightMessage(fromNodeId uint64, connId int64, messageId int64) *types.RetryMessage {
@@ -98,41 +78,64 @@ func (r *RetryQueue) getInFlightKey(fromNodeId uint64, connId int64, messageId i
 	b.WriteString(strconv.FormatInt(messageId, 10))
 	return b.String()
 }
-func (r *RetryQueue) finishMessage(fromNode uint64, connId int64, messageId int64) error {
-	msg, err := r.popInFlightMessage(fromNode, connId, messageId)
-	if err != nil {
-		return err
-	}
-	r.removeFromInFlightPQ(msg)
-
-	return nil
-}
-func (r *RetryQueue) removeFromInFlightPQ(msg *types.RetryMessage) {
+func (r *RetryQueue) finishMessage(fromNode uint64, connId int64, messageId int64) {
+	key := r.getInFlightKey(fromNode, connId, messageId)
 	r.inFlightMutex.Lock()
-	if msg.Index == -1 {
-		// this item has already been popped off the pqueue
-		r.inFlightMutex.Unlock()
+	defer r.inFlightMutex.Unlock()
+	msg := r.inFlightMessages[key]
+	if msg == nil {
+		// 重复或迟到的回执无需再次移除，不视为失败。
 		return
 	}
-	r.inFlightPQ.Remove(msg.Index)
-	r.inFlightMutex.Unlock()
+	delete(r.inFlightMessages, key)
+	if msg.Index >= 0 {
+		r.inFlightPQ.Remove(msg.Index)
+	}
+}
+
+func (r *RetryQueue) takeDueRetry(t int64) (*types.RetryMessage, int) {
+	r.inFlightMutex.Lock()
+	defer r.inFlightMutex.Unlock()
+	for {
+		msg, _ := r.inFlightPQ.PeekAndShift(t)
+		if msg == nil {
+			return nil, 0
+		}
+		key := r.getInFlightKey(msg.FromNode, msg.ConnId, msg.MessageId)
+		if r.inFlightMessages[key] != msg {
+			// 旧堆项不能触碰新对象，也不能阻塞后续到期任务。
+			continue
+		}
+		// 出堆后仍留在表内，查询连接期间回执仍可移除它。
+		msg.Retry++
+		return msg, msg.Retry
+	}
+}
+
+func (r *RetryQueue) completeRetry(msg *types.RetryMessage, rearm bool) bool {
+	key := r.getInFlightKey(msg.FromNode, msg.ConnId, msg.MessageId)
+	r.inFlightMutex.Lock()
+	defer r.inFlightMutex.Unlock()
+	if r.inFlightMessages[key] != msg || msg.Index >= 0 {
+		return false
+	}
+	// 回执已经移除或替换的对象既不能重挂，也不能删除新任务。
+	if rearm {
+		msg.Pri = time.Now().Add(options.G.MessageRetry.Interval).UnixNano()
+		r.inFlightPQ.Push(msg)
+		return true
+	}
+	delete(r.inFlightMessages, key)
+	return true
 }
 
 func (r *RetryQueue) processInFlightQueue(t int64) {
 	for !r.stopped.Load() {
-		r.inFlightMutex.Lock()
-		msg, _ := r.inFlightPQ.PeekAndShift(t)
-		r.inFlightMutex.Unlock()
-
+		msg, retryCount := r.takeDueRetry(t)
 		if msg == nil {
-			break
+			return
 		}
-		err := r.finishMessage(msg.FromNode, msg.ConnId, msg.MessageId)
-		if err != nil {
-			r.Error("processInFlightQueue-finishMessage失败", zap.Error(err), zap.Uint64("fromNode", msg.FromNode), zap.Int64("connId", msg.ConnId), zap.Int64("messageId", msg.MessageId))
-			break
-		}
-		r.r.retry(msg) // 重试
+		r.r.retry(r, msg, retryCount)
 	}
 }
 

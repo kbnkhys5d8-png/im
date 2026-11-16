@@ -62,7 +62,8 @@ func (r *RetryManager) AddRetry(msg *types.RetryMessage) {
 
 func (r *RetryManager) RemoveRetry(fromNode uint64, connId int64, messageId int64) error {
 	index := messageId % int64(len(r.retryQueues))
-	return r.retryQueues[index].finishMessage(fromNode, connId, messageId)
+	r.retryQueues[index].finishMessage(fromNode, connId, messageId)
+	return nil
 }
 
 // 获取重试消息
@@ -72,18 +73,34 @@ func (r *RetryManager) RetryMessage(fromNode uint64, connId int64, messageId int
 	return r.retryQueues[index].getInFlightMessage(fromNode, connId, messageId)
 }
 
-func (r *RetryManager) retry(msg *types.RetryMessage) {
-	r.Debug("retry msg", zap.Int("retryCount", msg.Retry), zap.String("uid", msg.Uid), zap.Int64("messageId", msg.MessageId), zap.Int64("connId", msg.ConnId))
-	msg.Retry++
-	if msg.Retry > options.G.MessageRetry.MaxCount {
+func (r *RetryManager) retry(q *RetryQueue, msg *types.RetryMessage, retryCount int) {
+	r.Debug("retry msg",
+		zap.Int("retryCount", retryCount-1),
+		zap.String("uid", msg.Uid),
+		zap.Int64("messageId", msg.MessageId),
+		zap.Int64("connId", msg.ConnId),
+	)
+	if retryCount > options.G.MessageRetry.MaxCount {
+		if !q.completeRetry(msg, false) {
+			return
+		}
 		r.Warn("exceeded the maximum number of retries", zap.String("uid", msg.Uid), zap.String("channelId", msg.ChannelId), zap.Uint8("channelType", msg.ChannelType), zap.Int64("messageId", msg.MessageId), zap.Int("messageMaxRetryCount", options.G.MessageRetry.MaxCount))
 		if options.G.Logger.TraceOn && msg.ChannelType == wkproto.ChannelTypePerson {
-			r.Trace("超过最大重试次数，暂停重试", "retry", zap.String("uid", msg.Uid), zap.Int64("messageId", msg.MessageId), zap.Int64("connId", msg.ConnId), zap.Int("retryCount", msg.Retry), zap.Int("maxRetryCount", options.G.MessageRetry.MaxCount))
+			r.Trace("超过最大重试次数，暂停重试", "retry",
+				zap.String("uid", msg.Uid),
+				zap.Int64("messageId", msg.MessageId),
+				zap.Int64("connId", msg.ConnId),
+				zap.Int("retryCount", retryCount),
+				zap.Int("maxRetryCount", options.G.MessageRetry.MaxCount),
+			)
 		}
 		return
 	}
 	conn := eventbus.User.ConnById(msg.Uid, msg.FromNode, msg.ConnId)
 	if conn == nil {
+		if !q.completeRetry(msg, false) {
+			return
+		}
 		r.Debug("conn offline", zap.String("uid", msg.Uid), zap.Int64("messageId", msg.MessageId), zap.Int64("connId", msg.ConnId))
 
 		if options.G.Logger.TraceOn && msg.ChannelType == wkproto.ChannelTypePerson {
@@ -97,17 +114,33 @@ func (r *RetryManager) retry(msg *types.RetryMessage) {
 		}
 		return
 	}
-	// 添加到重试队列
-	r.AddRetry(msg)
+	// 重挂前再次确认仍是原对象；网络发送不持有队列锁。
+	if !q.completeRetry(msg, true) {
+		return
+	}
 
 	if options.G.Logger.TraceOn && msg.ChannelType == wkproto.ChannelTypePerson {
-		r.Trace("重试消息", "retry", zap.String("uid", msg.Uid), zap.Int64("messageId", msg.MessageId), zap.Int64("connId", msg.ConnId), zap.String("deviceId", conn.DeviceId), zap.String("deviceFlag", conn.DeviceFlag.String()), zap.Int("retryCount", msg.Retry), zap.Int("maxRetryCount", options.G.MessageRetry.MaxCount))
+		r.Trace("重试消息", "retry",
+			zap.String("uid", msg.Uid),
+			zap.Int64("messageId", msg.MessageId),
+			zap.Int64("connId", msg.ConnId),
+			zap.String("deviceId", conn.DeviceId),
+			zap.String("deviceFlag", conn.DeviceFlag.String()),
+			zap.Int("retryCount", retryCount),
+			zap.Int("maxRetryCount", options.G.MessageRetry.MaxCount),
+		)
 	}
 
 	// 发送消息
 	// 在需要打印日志的地方添加概率控制
 	if rand.Float64() < 0.1 { // 10%的概率
-		r.Info("retry send message", zap.Int("retry", msg.Retry), zap.Uint64("fromNode", msg.FromNode), zap.String("uid", msg.Uid), zap.Int64("messageId", msg.MessageId), zap.Int64("connId", msg.ConnId))
+		r.Info("retry send message",
+			zap.Int("retry", retryCount),
+			zap.Uint64("fromNode", msg.FromNode),
+			zap.String("uid", msg.Uid),
+			zap.Int64("messageId", msg.MessageId),
+			zap.Int64("connId", msg.ConnId),
+		)
 	}
 
 	eventbus.User.ConnWrite("", conn, msg.RecvPacket)
