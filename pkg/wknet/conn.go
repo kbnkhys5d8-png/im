@@ -1,7 +1,6 @@
 package wknet
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -296,8 +295,7 @@ func (d *DefaultConn) Fd() NetFd {
 	return d.fd
 }
 
-// 调用次方法需要加锁
-func (d *DefaultConn) close(closeErr error) error {
+func (d *DefaultConn) close(_ error) error {
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -307,15 +305,14 @@ func (d *DefaultConn) close(closeErr error) error {
 	}
 	d.closed.Store(true)
 
-	if closeErr != nil && !errors.Is(closeErr, syscall.ECONNRESET) { // closeErr有值，说明来自系统底层的错误，如果closeErr=nil目前了解的是不需要DeleteFd，ECONNRESET表示fd已经关闭，不需要再次关闭
-		err := d.reactorSub.DeleteFd(d) // 先删除fd
-		if err != nil {
-			d.Debug("delete fd from poller error", zap.Error(err), zap.Int("fd", d.Fd().fd), zap.String("uid", d.uid.Load()))
-		}
+	// 正常关闭和连接重置都要先注销：若底层 socket 还有其他引用，仅关闭当前 FD 不会移除 epoll 事件。
+	if err := d.reactorSub.DeleteFd(d); err != nil {
+		d.Debug("delete fd from poller error", zap.Error(err), zap.Int("fd", d.Fd().fd), zap.String("uid", d.uid.Load()))
 	}
 
-	_ = d.fd.Close()             // 后关闭fd
-	d.eg.RemoveConn(d)           // remove from the engine
+	// 先删旧连接索引，再释放 FD，避免误删已经复用这个 FD 的新连接。
+	d.eg.RemoveConn(d)
+	_ = d.fd.Close()
 	d.reactorSub.ConnDec()       // decrease the connection count
 	d.eg.eventHandler.OnClose(d) // call the close handler
 
