@@ -105,6 +105,9 @@ const (
 	CMDUpdateConversationIfSeqGreater
 	// 条件撤销单独使用新命令号，绝不改变既有日志编号或让旧命令忽略比较条件。
 	CMDUpdateDeviceIfTokenMatches
+	// 旧同步页确认和实时单条回执采用不同的推进规则，保留历史命令的语义。
+	CMDAdvanceCommandSyncCursor
+	CMDAdvanceCommandSyncCursorOnRecvack
 )
 
 func (c CMDType) Uint16() uint16 {
@@ -195,6 +198,10 @@ func (c CMDType) String() string {
 		return "CMDAppendMessageEvent"
 	case CMDUpdateConversationIfSeqGreater:
 		return "CMDUpdateConversationIfSeqGreater"
+	case CMDAdvanceCommandSyncCursor:
+		return "CMDAdvanceCommandSyncCursor"
+	case CMDAdvanceCommandSyncCursorOnRecvack:
+		return "CMDAdvanceCommandSyncCursorOnRecvack"
 	default:
 		return fmt.Sprintf("CMDUnknown[%d]", c)
 	}
@@ -531,7 +538,13 @@ func (c *CMD) CMDContent() (string, error) {
 			return "", err
 		}
 		return wkutil.ToJSON(event), nil
-	case CMDUpdateConversationIfSeqGreater:
+	case CMDAdvanceCommandSyncCursor:
+		uid, cursors, err := c.DecodeCMDAdvanceCommandSyncCursors()
+		if err != nil {
+			return "", err
+		}
+		return wkutil.ToJSON(map[string]interface{}{"uid": uid, "cursors": cursors}), nil
+	case CMDUpdateConversationIfSeqGreater, CMDAdvanceCommandSyncCursorOnRecvack:
 		uid, channelId, channelType, readToMsgSeq, err := c.DecodeCMDUpdateConversationIfSeqGreater()
 		if err != nil {
 			return "", err
@@ -1555,4 +1568,48 @@ func (c *CMD) DecodeCMDUpdateConversationIfSeqGreater() (uid string, channelId s
 		return
 	}
 	return
+}
+
+func encodeCMDAdvanceCommandSyncCursors(uid string, cursors []wkdb.CommandSyncCursor) []byte {
+	encoder := wkproto.NewEncoder()
+	defer encoder.End()
+	encoder.WriteString(uid)
+	encoder.WriteUint32(uint32(len(cursors)))
+	for _, cursor := range cursors {
+		encoder.WriteString(cursor.ChannelID)
+		encoder.WriteUint8(cursor.ChannelType)
+		encoder.WriteUint64(cursor.Seq)
+	}
+	return encoder.Bytes()
+}
+
+// DecodeCMDAdvanceCommandSyncCursors 解码同一用户的补拉页确认。
+func (c *CMD) DecodeCMDAdvanceCommandSyncCursors() (string, []wkdb.CommandSyncCursor, error) {
+	decoder := wkproto.NewDecoder(c.Data)
+	uid, err := decoder.String()
+	if err != nil {
+		return "", nil, err
+	}
+	count, err := decoder.Uint32()
+	if err != nil {
+		return "", nil, err
+	}
+	// 每个游标至少占字符串长度头、频道类型和序号，先限制损坏日志的内存分配。
+	if uint64(count)*11 > uint64(len(c.Data)) {
+		return "", nil, fmt.Errorf("命令游标数量无效：%d", count)
+	}
+	cursors := make([]wkdb.CommandSyncCursor, count)
+	for i := range cursors {
+		cursor := &cursors[i]
+		if cursor.ChannelID, err = decoder.String(); err != nil {
+			return "", nil, err
+		}
+		if cursor.ChannelType, err = decoder.Uint8(); err != nil {
+			return "", nil, err
+		}
+		if cursor.Seq, err = decoder.Uint64(); err != nil {
+			return "", nil, err
+		}
+	}
+	return uid, cursors, nil
 }

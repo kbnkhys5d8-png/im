@@ -2,12 +2,70 @@ package wkdb_test
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+func TestAdvanceCommandSyncCursorIsMonotonicUnderConcurrentAcks(t *testing.T) {
+	db := newTestDB(t)
+	require.NoError(t, db.Open())
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	const uid, commandID, chatID = "concurrent-sync-recipient", "group-cmd", "group-chat"
+	const channelType = uint8(2)
+	now := time.Now().UTC()
+	require.NoError(t, db.AddOrUpdateConversationsWithUser(uid, []wkdb.Conversation{
+		{Id: 1, Uid: uid, ChannelId: commandID, ChannelType: channelType, Type: wkdb.ConversationTypeCMD, ReadToMsgSeq: 5, UnreadCount: 7, UpdatedAt: &now},
+		{Id: 2, Uid: uid, ChannelId: chatID, ChannelType: channelType, Type: wkdb.ConversationTypeChat, ReadToMsgSeq: 2},
+	}))
+	advance := func(channelID string, seq uint64) error {
+		return db.AdvanceCommandSyncCursors(uid, []wkdb.CommandSyncCursor{{ChannelID: channelID, ChannelType: channelType, Seq: seq}})
+	}
+
+	// 模拟 HTTP 多页、重复确认与实时确认交错到达，低序号永久不能覆盖高序号。
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	sequences := []uint64{8, 16, 6, 17, 12, 7, 16, 10, 13}
+	results := make(chan error, len(sequences)+1)
+	for _, seq := range sequences {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			results <- advance(commandID, seq)
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		results <- db.AdvanceCommandSyncCursorOnRecvack(uid, commandID, channelType, 19)
+	}()
+	close(start)
+	wg.Wait()
+	close(results)
+	for err := range results {
+		require.NoError(t, err)
+	}
+	require.NoError(t, advance(commandID, 8))
+	require.NoError(t, advance(chatID, 100))
+	require.NoError(t, advance("missing", 100))
+	command, err := db.GetConversation(uid, commandID, channelType)
+	require.NoError(t, err)
+	require.EqualValues(t, 17, command.ReadToMsgSeq)
+	require.EqualValues(t, 7, command.UnreadCount)
+	require.NotNil(t, command.UpdatedAt)
+	require.True(t, now.Equal(*command.UpdatedAt))
+	chat, err := db.GetConversation(uid, chatID, channelType)
+	require.NoError(t, err)
+	require.EqualValues(t, 2, chat.ReadToMsgSeq)
+	_, err = db.GetConversation(uid, "missing", channelType)
+	require.ErrorIs(t, err, wkdb.ErrNotFound)
+}
 
 func TestConversation(t *testing.T) {
 

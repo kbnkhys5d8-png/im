@@ -36,7 +36,7 @@ func TestLeaderTakeoverReplacesStaleGenerationIndex(t *testing.T) {
 			fixture.db.ban.Store(state == "user-banned")
 			frames := []wkproto.Frame{
 				&wkproto.SendPacket{ChannelID: "recipient", ChannelType: wkproto.ChannelTypePerson, Payload: []byte(`{"type":1,"content":"test"}`)},
-				&wkproto.RecvackPacket{MessageID: 1},
+				&wkproto.RecvackPacket{MessageID: 1, MessageSeq: 1},
 				&wkproto.PingPacket{},
 			}
 			for _, frame := range frames {
@@ -76,8 +76,11 @@ type restoreRetryProbe struct {
 	removed int
 }
 
-func (*restoreRetryProbe) RetryMessage(uint64, int64, int64) *types.RetryMessage { return nil }
-func (r *restoreRetryProbe) RemoveRetry(uint64, int64, int64) error              { r.removed++; return nil }
+func (r *restoreRetryProbe) AcknowledgeRetry(uid string, nodeId uint64, connId, messageId int64, seq uint32) *types.RetryMessage {
+	r.removed++
+	return &types.RetryMessage{Uid: uid, FromNode: nodeId, ConnId: connId, MessageId: messageId,
+		RecvPacket: &wkproto.RecvPacket{MessageID: messageId, MessageSeq: seq}}
+}
 
 type restoreChannelProbe struct{ sent int }
 

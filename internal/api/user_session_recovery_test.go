@@ -292,7 +292,7 @@ func assertRecoverySessionFrames(t *testing.T, f *sessionRaceFixture, conn *even
 	f.users.mu.Unlock()
 	for _, frame := range []wkproto.Frame{
 		&wkproto.SendPacket{ChannelID: "receiver", ChannelType: wkproto.ChannelTypePerson, Payload: []byte(`{"type":1,"content":"body"}`)},
-		&wkproto.RecvackPacket{MessageID: 12},
+		&wkproto.RecvackPacket{MessageID: 12, MessageSeq: 4},
 		&wkproto.PingPacket{},
 	} {
 		f.handler.OnEvent(&eventbus.UserContext{Uid: conn.Uid, EventType: eventbus.EventOnSend, AddConn: f.pool.UpdateConn,

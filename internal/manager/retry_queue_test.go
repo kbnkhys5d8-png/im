@@ -32,6 +32,61 @@ func TestRemoveRetryIsIdempotentAndConnectionScoped(t *testing.T) {
 	}
 }
 
+func TestAcknowledgeRetryMatchesSentMessageAndOnlyConsumesOnce(t *testing.T) {
+	m, q := newRetryQueueTest(t)
+	m.retryQueues = append(m.retryQueues, NewRetryQueue(1, m))
+	msg := retryQueueTestMessage(1, 8, 10)
+	msg.RecvPacket.MessageSeq = 20
+	sibling := retryQueueTestMessage(1, 9, 10)
+	sibling.RecvPacket.MessageSeq = 20
+	m.AddRetry(msg)
+	m.AddRetry(sibling)
+	for _, tc := range []struct {
+		name      string
+		uid       string
+		nodeId    uint64
+		connId    int64
+		messageId int64
+		seq       uint32
+	}{
+		{name: "非正数消息ID", uid: msg.Uid, nodeId: 1, connId: 8, messageId: -1, seq: 20},
+		{name: "其他用户", uid: "another-user", nodeId: 1, connId: 8, messageId: 10, seq: 20},
+		{name: "其他节点", uid: msg.Uid, nodeId: 2, connId: 8, messageId: 10, seq: 20},
+		{name: "其他连接", uid: msg.Uid, nodeId: 1, connId: 7, messageId: 10, seq: 20},
+		{name: "无序列", uid: msg.Uid, nodeId: 1, connId: 8, messageId: 10, seq: 0},
+		{name: "序列不匹配", uid: msg.Uid, nodeId: 1, connId: 8, messageId: 10, seq: 21},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := m.AcknowledgeRetry(tc.uid, tc.nodeId, tc.connId, tc.messageId, tc.seq); got != nil || q.inFlightMessagesCount() != 2 {
+				t.Fatal("不匹配的回执不能移除任务")
+			}
+		})
+	}
+	results := make(chan *types.RetryMessage, 2)
+	start := make(chan struct{})
+	for range 2 {
+		go func() {
+			<-start
+			results <- m.AcknowledgeRetry(msg.Uid, msg.FromNode, msg.ConnId, msg.MessageId, msg.RecvPacket.MessageSeq)
+		}()
+	}
+	close(start)
+	first, second := <-results, <-results
+	if !((first == msg && second == nil) || (first == nil && second == msg)) {
+		t.Fatal("并发或重复的合法回执只能移除一次")
+	}
+	if m.RetryMessage(sibling.FromNode, sibling.ConnId, sibling.MessageId) != sibling || q.inFlightMessagesCount() != 1 {
+		t.Fatal("另一连接的重试必须保留")
+	}
+	// 保留的内部查询和移除入口也不能把外部 ID 变成负数组下标。
+	if m.RetryMessage(1, 8, -1) != nil {
+		t.Fatal("非正数 ID 不应返回任务")
+	}
+	if err := m.RemoveRetry(1, 8, -1); err != nil {
+		t.Fatalf("非正数 ID 应为空操作: %v", err)
+	}
+}
+
 func TestRetryQueueSkipsStaleEntriesWithoutDelayingLaterMessages(t *testing.T) {
 	for _, replaced := range []bool{false, true} {
 		name := "已移除"
@@ -77,6 +132,7 @@ func TestRetryQueueAckWhileResendingDoesNotRearm(t *testing.T) {
 			m, q := newRetryQueueTest(t)
 			probe := registerRetryQueueTestUser(t)
 			msg := retryQueueTestMessage(1, 8, 10)
+			msg.RecvPacket.MessageSeq = 20
 			replacement := retryQueueTestMessage(1, 8, 10)
 			m.AddRetry(msg)
 			msg.Pri = 1
@@ -93,8 +149,8 @@ func TestRetryQueueAckWhileResendingDoesNotRearm(t *testing.T) {
 				q.processInFlightQueue(1)
 			}()
 			<-lookupStarted
-			if err := m.RemoveRetry(msg.FromNode, msg.ConnId, msg.MessageId); err != nil {
-				t.Errorf("扫描中的任务仍应可确认: %v", err)
+			if got := m.AcknowledgeRetry(msg.Uid, msg.FromNode, msg.ConnId, msg.MessageId, msg.RecvPacket.MessageSeq); got != msg {
+				t.Error("扫描中的任务仍应可确认")
 			}
 			if replaced {
 				m.AddRetry(replacement)

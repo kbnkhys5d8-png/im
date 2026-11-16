@@ -355,6 +355,13 @@ const (
 	ConversationTypeCMD
 )
 
+// CommandSyncCursor 记录已确认补拉页内指定命令频道的最后序号。
+type CommandSyncCursor struct {
+	ChannelID   string
+	ChannelType uint8
+	Seq         uint64
+}
+
 // Conversation Conversation
 type Conversation struct {
 	Id              uint64           `json:"id,omitempty"`

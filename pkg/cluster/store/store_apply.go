@@ -52,6 +52,15 @@ func (s *Store) applyCMDs(cmds []*CMD, logIndexs []uint64) error {
 	var addOrUpdateUserConversationsCMDs []*CMD
 	var addOrUpdateConversationsBatchIfNotExistCMDs []*CMD
 
+	// 游标比较必须看到此前的会话写入和删除；含游标命令的批次不重排会话写入。
+	orderedConversations := false
+	for _, cmd := range cmds {
+		if cmd.CmdType == CMDAdvanceCommandSyncCursor || cmd.CmdType == CMDAdvanceCommandSyncCursorOnRecvack {
+			orderedConversations = true
+			break
+		}
+	}
+
 	for i, cmd := range cmds {
 
 		switch cmd.CmdType {
@@ -59,9 +68,21 @@ func (s *Store) applyCMDs(cmds []*CMD, logIndexs []uint64) error {
 			channelClusterConfigsCMDs = append(channelClusterConfigsCMDs, cmd)
 			confVersions = append(confVersions, logIndexs[i])
 		case CMDAddOrUpdateUserConversations: // 添加或更新会话
-			addOrUpdateUserConversationsCMDs = append(addOrUpdateUserConversationsCMDs, cmd)
+			if !orderedConversations {
+				addOrUpdateUserConversationsCMDs = append(addOrUpdateUserConversationsCMDs, cmd)
+				continue
+			}
+			if err := s.applyCMD(cmd, logIndexs[i]); err != nil {
+				return err
+			}
 		case CMDAddOrUpdateConversationsBatchIfNotExist: // 添加或更新用户会话
-			addOrUpdateConversationsBatchIfNotExistCMDs = append(addOrUpdateConversationsBatchIfNotExistCMDs, cmd)
+			if !orderedConversations {
+				addOrUpdateConversationsBatchIfNotExistCMDs = append(addOrUpdateConversationsBatchIfNotExistCMDs, cmd)
+				continue
+			}
+			if err := s.applyCMD(cmd, logIndexs[i]); err != nil {
+				return err
+			}
 		default:
 			err := s.applyCMD(cmd, logIndexs[i])
 			if err != nil {
@@ -166,6 +187,14 @@ func (s *Store) applyCMD(cmd *CMD, logIndex uint64) error {
 		return s.handleAppendMessageEvent(cmd)
 	case CMDUpdateConversationIfSeqGreater: // 更新最近会话的已读位置（如果seq更大）
 		return s.handleUpdateConversationIfSeqGreater(cmd)
+	case CMDAdvanceCommandSyncCursor:
+		uid, cursors, err := cmd.DecodeCMDAdvanceCommandSyncCursors()
+		if err != nil {
+			return err
+		}
+		return s.wdb.AdvanceCommandSyncCursors(uid, cursors)
+	case CMDAdvanceCommandSyncCursorOnRecvack:
+		return s.handleAdvanceCommandSyncCursorOnRecvack(cmd)
 	default:
 		s.Error("unknown cmd type", zap.String("cmdType", cmd.CmdType.String()))
 		return nil
@@ -648,4 +677,12 @@ func (s *Store) handleUpdateConversationIfSeqGreater(cmd *CMD) error {
 		return err
 	}
 	return s.wdb.UpdateConversationIfSeqGreater(uid, channelId, channelType, readToMsgSeq)
+}
+
+func (s *Store) handleAdvanceCommandSyncCursorOnRecvack(cmd *CMD) error {
+	uid, channelID, channelType, seq, err := cmd.DecodeCMDUpdateConversationIfSeqGreater()
+	if err != nil {
+		return err
+	}
+	return s.wdb.AdvanceCommandSyncCursorOnRecvack(uid, channelID, channelType, seq)
 }

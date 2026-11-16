@@ -279,6 +279,12 @@ type ConversationDB interface {
 	// UpdateConversationIfSeqGreater 如果readToMsgSeq大于当前最近会话的readToMsgSeq则更新当前最近会话 (同步操作)
 	UpdateConversationIfSeqGreater(uid, channelId string, channelType uint8, readToMsgSeq uint64) error
 
+	// AdvanceCommandSyncCursors 原子推进单用户已确认补拉页中的命令会话游标。
+	AdvanceCommandSyncCursors(uid string, cursors []CommandSyncCursor) error
+
+	// AdvanceCommandSyncCursorOnRecvack 原子推进单条实时回执的命令会话游标，不跨过缺口。
+	AdvanceCommandSyncCursorOnRecvack(uid, channelID string, channelType uint8, seq uint64) error
+
 	// DeleteConversation 删除最近会话
 	DeleteConversation(uid string, channelId string, channelType uint8) error
 

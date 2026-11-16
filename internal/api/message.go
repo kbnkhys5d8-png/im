@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
@@ -33,15 +32,13 @@ type message struct {
 	s *Server
 	wklog.Log
 
-	syncRecordMap  map[string][]*syncRecord // 记录最后一次同步命令的记录（TODO：这个是临时方案，为了兼容老版本）
-	syncRecordLock sync.RWMutex
+	syncBatches legacySyncBatches
 }
 
 func newMessage(s *Server) *message {
 	return &message{
-		s:             s,
-		Log:           wklog.NewWKLog("message"),
-		syncRecordMap: map[string][]*syncRecord{},
+		s:   s,
+		Log: wklog.NewWKLog("message"),
 	}
 }
 
@@ -356,14 +353,12 @@ func (m *message) sendBatch(c *wkhttp.Context) {
 // 消息同步
 // Deprecated: 将废弃
 func (m *message) sync(c *wkhttp.Context) {
-
-	if options.G.DisableCMDMessageSync {
-		c.JSON(http.StatusOK, []string{})
-		return
-	}
-
 	var req syncReq
 	bodyBytes, err := BindJSON(&req, c)
+	if options.G.DisableCMDMessageSync {
+		writeLegacySyncResponse(c, nil, err == nil && req.Visibility.valid())
+		return
+	}
 	if err != nil {
 		m.Error("数据格式有误！", zap.Error(err))
 		c.ResponseError(err)
@@ -392,6 +387,7 @@ func (m *message) sync(c *wkhttp.Context) {
 		return
 	}
 
+	pullStarted := time.Now()
 	// ==================== 获取用户活跃的最近会话 ====================
 	conversations, err := service.Store.GetConversationsByType(req.UID, wkdb.ConversationTypeCMD)
 	if err != nil {
@@ -439,67 +435,27 @@ func (m *message) sync(c *wkhttp.Context) {
 	// 	return realChannelId
 	// }
 
-	var channelRecentMessageReqs []*channelRecentMessageReq
-	for _, conversation := range conversations {
+	visibility := req.Visibility.forStorage(options.G)
+	channelRecentMessageReqs := legacySyncQueries(conversations, visibility)
 
-		channelRecentMessageReqs = append(channelRecentMessageReqs, &channelRecentMessageReq{
-			ChannelId:   conversation.ChannelId,
-			ChannelType: conversation.ChannelType,
-			LastMsgSeq:  conversation.ReadToMsgSeq + 1, // 这里加1的目的是为了不查询到ReadedToMsgSeq本身这条消息
-		})
+	channelRecentMessages, err := m.s.requset.getRecentMessagesForCluster(req.UID, req.Limit, channelRecentMessageReqs, false)
+	if err != nil {
+		m.Error("获取最近消息失败！", zap.Error(err), zap.String("uid", req.UID))
+		c.ResponseError(errors.New("获取最近消息失败！"))
+		return
 	}
-
-	// 先清空旧记录
-	m.syncRecordLock.Lock()
-	m.syncRecordMap[req.UID] = nil
-	m.syncRecordLock.Unlock()
-
-	// 获取每个session的消息
-	messageResps := make([]*types.MessageResp, 0)
-	if len(channelRecentMessageReqs) > 0 {
-		channelRecentMessages, err := m.s.requset.getRecentMessagesForCluster(req.UID, req.Limit, channelRecentMessageReqs, false)
-		if err != nil {
-			m.Error("获取最近消息失败！", zap.Error(err), zap.String("uid", req.UID))
-			c.ResponseError(errors.New("获取最近消息失败！"))
-			return
-		}
-		for _, channelRecentMessage := range channelRecentMessages {
-
-			if len(channelRecentMessage.Messages) == 0 {
-				continue
-			}
-			isExceedLimit := false // 是否超过限制
-
-			for _, message := range channelRecentMessage.Messages {
-				if len(messageResps) >= req.Limit {
-					isExceedLimit = true
-					break
-				}
-				messageResps = append(messageResps, message)
-			}
-			var lastMsg *types.MessageResp
-			if isExceedLimit {
-				lastMsg = messageResps[len(messageResps)-1]
-			} else {
-				lastMsg = channelRecentMessage.Messages[len(channelRecentMessage.Messages)-1]
-			}
-			m.syncRecordLock.Lock()
-			m.syncRecordMap[req.UID] = append(m.syncRecordMap[req.UID], &syncRecord{
-				channelId:   channelRecentMessage.ChannelId,
-				channelType: channelRecentMessage.ChannelType,
-				lastMsgSeq:  lastMsg.MessageSeq,
-			})
-			m.syncRecordLock.Unlock()
-		}
+	if c.Request.Context().Err() != nil {
+		return
 	}
-	c.JSON(http.StatusOK, messageResps)
+	now := time.Now()
+	// 已耗尽保护期的慢请求不能在旧标记过期后重新登记过时页面。
+	if now.Sub(pullStarted) >= legacySyncBatchRetention {
+		c.ResponseError(errLegacySyncPullExpired)
+		return
+	}
+	messageResps := m.syncBatches.publish(req.UID, channelRecentMessages, req.Limit, visibility, time.Time{})
+	writeLegacySyncResponse(c, messageResps, req.Visibility != nil)
 
-}
-
-type syncRecord struct {
-	channelId   string
-	channelType uint8
-	lastMsgSeq  uint64
 }
 
 func (m *message) syncack(c *wkhttp.Context) {
@@ -535,58 +491,45 @@ func (m *message) syncack(c *wkhttp.Context) {
 		return
 	}
 
-	m.syncRecordLock.Lock()
-	records := m.syncRecordMap[req.UID]
-	m.syncRecordMap[req.UID] = nil
-	m.syncRecordLock.Unlock()
-	if len(records) == 0 {
+	batch, err := m.syncBatches.beginAck(req.UID, req.LastMessageSeq, time.Now())
+	if err != nil {
+		c.ResponseError(err)
+		return
+	}
+	if batch == nil {
 		c.ResponseOK()
 		return
 	}
+	acked := false
+	defer func() {
+		if !acked {
+			m.syncBatches.finishAck(req.UID, batch, false, time.Now())
+		}
+	}()
 
-	conversations := make([]wkdb.Conversation, 0)
-	for _, record := range records {
-		needAdd := false
-
+	cursors := make([]wkdb.CommandSyncCursor, 0, len(batch.records))
+	for _, record := range batch.records {
 		fakeChannelId := record.channelId
 		if !options.G.IsCmdChannel(fakeChannelId) {
 			m.Warn("不是cmd频道！", zap.String("uid", req.UID), zap.String("channelId", fakeChannelId), zap.Uint8("channelType", record.channelType))
 			continue
 		}
-		if record.lastMsgSeq <= 0 {
+		if record.lastMsgSeq == 0 {
 			continue
 		}
-
-		conversation, err := service.Store.GetConversation(req.UID, fakeChannelId, record.channelType)
-		if err != nil {
-			if err == wkdb.ErrNotFound {
-				m.Warn("会话不存在！", zap.String("uid", req.UID), zap.String("channelId", fakeChannelId), zap.Uint8("channelType", record.channelType))
-				continue
-			} else {
-				m.Error("获取conversation失败！", zap.Error(err), zap.String("uid", req.UID), zap.String("channelId", fakeChannelId), zap.Uint8("channelType", record.channelType))
-				c.ResponseError(errors.New("获取conversation失败！"))
-				return
-			}
-		}
-		if conversation.Type != wkdb.ConversationTypeCMD {
-			continue
-		}
-
-		if record.lastMsgSeq > conversation.ReadToMsgSeq || needAdd {
-			conversation.ReadToMsgSeq = record.lastMsgSeq
-			conversations = append(conversations, conversation)
-		}
-
+		cursors = append(cursors, wkdb.CommandSyncCursor{ChannelID: fakeChannelId, ChannelType: record.channelType, Seq: record.lastMsgSeq})
 	}
-	if len(conversations) > 0 {
-		err := service.Store.AddOrUpdateUserConversations(req.UID, conversations)
-		if err != nil {
+	if len(cursors) > 0 {
+		// 单页一次提交；重复回执不能回退或覆盖在线已推进的游标。
+		if err := service.Store.AdvanceCommandSyncCursors(req.UID, cursors); err != nil {
 			m.Error("消息同步回执失败！", zap.Error(err), zap.String("uid", req.UID))
 			c.ResponseError(errors.New("消息同步回执失败！"))
 			return
 		}
 	}
 
+	m.syncBatches.finishAck(req.UID, batch, true, time.Now())
+	acked = true
 	c.ResponseOK()
 }
 

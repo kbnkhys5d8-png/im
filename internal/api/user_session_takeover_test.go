@@ -26,8 +26,11 @@ type takeoverRetry struct {
 	acks atomic.Int32
 }
 
-func (*takeoverRetry) RetryMessage(uint64, int64, int64) *types.RetryMessage { return nil }
-func (r *takeoverRetry) RemoveRetry(uint64, int64, int64) error              { r.acks.Add(1); return nil }
+func (r *takeoverRetry) AcknowledgeRetry(uid string, nodeId uint64, connId, messageId int64, seq uint32) *types.RetryMessage {
+	r.acks.Add(1)
+	return &types.RetryMessage{Uid: uid, FromNode: nodeId, ConnId: connId, MessageId: messageId,
+		RecvPacket: &wkproto.RecvPacket{MessageID: messageId, MessageSeq: seq}}
+}
 
 func TestNewLeaderRestoresValidatedForwardedSession(t *testing.T) {
 	for _, kind := range []string{"SEND", "RECVACK", "PING"} {
@@ -49,7 +52,7 @@ func TestNewLeaderRestoresValidatedForwardedSession(t *testing.T) {
 			case "SEND":
 				frame = &wkproto.SendPacket{ChannelID: "receiver", ChannelType: wkproto.ChannelTypePerson, Payload: []byte(`{"type":1,"content":"body"}`)}
 			case "RECVACK":
-				frame = &wkproto.RecvackPacket{MessageID: 12}
+				frame = &wkproto.RecvackPacket{MessageID: 12, MessageSeq: 4}
 			}
 			done := make(chan struct{})
 			fixture.observer.afterOnSend = func() { close(done) }

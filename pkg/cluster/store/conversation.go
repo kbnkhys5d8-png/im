@@ -259,3 +259,32 @@ func (s *Store) UpdateConversationIfSeqGreaterAsync(uid string, channelId string
 	}
 	return nil
 }
+
+// AdvanceCommandSyncCursors 在用户槽一次应用已确认补拉页的全部游标后返回。
+func (s *Store) AdvanceCommandSyncCursors(uid string, cursors []wkdb.CommandSyncCursor) error {
+	if len(cursors) == 0 {
+		return nil
+	}
+	return s.proposeCommandSyncCursor(uid, CMDAdvanceCommandSyncCursor, encodeCMDAdvanceCommandSyncCursors(uid, cursors))
+}
+
+// AdvanceCommandSyncCursorOnRecvack 提交实时单条回执，只允许在应用时确认紧邻的下一条命令。
+func (s *Store) AdvanceCommandSyncCursorOnRecvack(uid, channelID string, channelType uint8, seq uint64) error {
+	data := EncodeCMDUpdateConversationIfSeqGreater(uid, channelID, channelType, seq)
+	return s.proposeCommandSyncCursor(uid, CMDAdvanceCommandSyncCursorOnRecvack, data)
+}
+
+func (s *Store) proposeCommandSyncCursor(uid string, typ CMDType, data []byte) error {
+	cmdData, err := NewCMD(typ, data).Marshal()
+	if err != nil {
+		return err
+	}
+	// 游标属于收件人的会话，群命令也写到用户槽，与补拉读取使用同一份副本。
+	slotID := s.opts.Slot.GetSlotId(uid)
+	if typ == CMDAdvanceCommandSyncCursorOnRecvack {
+		_, err = s.opts.Slot.Propose(slotID, cmdData)
+	} else {
+		_, err = s.opts.Slot.ProposeUntilApplied(slotID, cmdData)
+	}
+	return err
+}

@@ -83,7 +83,24 @@ func (s *conversation) route(r *wkhttp.WKHttp) {
 // 	c.JSON(http.StatusOK, conversationResps)
 // }
 
-// 清楚会话未读数量
+var errUnreadCommandConversation = errors.New("普通未读接口不支持命令会话")
+
+func unreadChatChannelID(uid, channelID string, channelType uint8) (string, error) {
+	if channelType == wkproto.ChannelTypePerson {
+		// 若直接传入私聊存储键，先拒绝 CMD，避免二次映射掩盖后缀。
+		if options.G.IsFakeChannel(channelID) && options.G.IsCmdChannel(channelID) {
+			return "", errUnreadCommandConversation
+		}
+		channelID = options.GetFakeChannelIDWith(uid, channelID)
+	}
+	// 按实际存储键判断，不把带相同后缀的普通对端 UID 当作 CMD。
+	if options.G.IsCmdChannel(channelID) {
+		return "", errUnreadCommandConversation
+	}
+	return channelID, nil
+}
+
+// 清空会话未读数量
 func (s *conversation) clearConversationUnread(c *wkhttp.Context) {
 	var req clearConversationUnreadReq
 	bodyBytes, err := BindJSON(&req, c)
@@ -93,6 +110,11 @@ func (s *conversation) clearConversationUnread(c *wkhttp.Context) {
 		return
 	}
 	if err := req.Check(); err != nil {
+		c.ResponseError(err)
+		return
+	}
+	fakeChannelId, err := unreadChatChannelID(req.UID, req.ChannelID, req.ChannelType)
+	if err != nil {
 		c.ResponseError(err)
 		return
 	}
@@ -110,16 +132,14 @@ func (s *conversation) clearConversationUnread(c *wkhttp.Context) {
 		return
 	}
 
-	fakeChannelId := req.ChannelID
-	if req.ChannelType == wkproto.ChannelTypePerson {
-		fakeChannelId = options.GetFakeChannelIDWith(req.UID, req.ChannelID)
-
-	}
-
 	conversation, err := service.Store.GetConversation(req.UID, fakeChannelId, req.ChannelType)
 	if err != nil && err != wkdb.ErrNotFound {
 		s.Error("Failed to query conversation", zap.Error(err))
 		c.ResponseError(err)
+		return
+	}
+	if conversation.Type == wkdb.ConversationTypeCMD {
+		c.ResponseError(errUnreadCommandConversation)
 		return
 	}
 	updatedAt := time.Now()
@@ -184,6 +204,11 @@ func (s *conversation) setConversationUnread(c *wkhttp.Context) {
 		c.ResponseError(errors.New("channel_id or channel_type cannot be empty"))
 		return
 	}
+	fakeChannelId, err := unreadChatChannelID(req.UID, req.ChannelID, req.ChannelType)
+	if err != nil {
+		c.ResponseError(err)
+		return
+	}
 
 	if options.G.ClusterOn() {
 		leaderInfo, err := service.Cluster.SlotLeaderOfChannel(req.UID, wkproto.ChannelTypePerson) // 获取频道的领导节点
@@ -200,12 +225,7 @@ func (s *conversation) setConversationUnread(c *wkhttp.Context) {
 		}
 	}
 
-	fakeChannelId := req.ChannelID
-	if req.ChannelType == wkproto.ChannelTypePerson {
-		fakeChannelId = options.GetFakeChannelIDWith(req.UID, req.ChannelID)
-
-	}
-	// 获取此频道最新的消息
+	// 保留普通会话的读取顺序，避免扩大读取游标到更新之间的窗口。
 	lastMsgSeq, err := s.getChannelLastMsgSeq(fakeChannelId, req.ChannelType)
 	if err != nil {
 		s.Error("Failed to query last message", zap.Error(err))
@@ -217,6 +237,15 @@ func (s *conversation) setConversationUnread(c *wkhttp.Context) {
 	if err != nil && err != wkdb.ErrNotFound {
 		s.Error("Failed to query conversation", zap.Error(err))
 		c.ResponseError(err)
+		return
+	}
+	if conversation.Type == wkdb.ConversationTypeCMD {
+		c.ResponseError(errUnreadCommandConversation)
+		return
+	}
+	// 空频道没有可设置的未读消息，避免从零减一导致序号下溢。
+	if lastMsgSeq == 0 {
+		c.ResponseOK()
 		return
 	}
 	updatedAt := time.Now()

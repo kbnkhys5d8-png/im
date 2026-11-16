@@ -7,7 +7,6 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/track"
 	"github.com/WuKongIM/WuKongIM/internal/types"
 	"github.com/WuKongIM/WuKongIM/pkg/trace"
-	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"go.uber.org/zap"
 )
@@ -23,58 +22,42 @@ func (h *Handler) recvack(event *eventbus.Event) {
 	trace.GlobalTrace.Metrics.App().RecvackPacketBytesAdd(recvackPacket.GetFrameSize())
 
 	conn := event.Conn
-	isCmd := recvackPacket.SyncOnce                           // 是命令消息
-	isMaster := conn.DeviceLevel == wkproto.DeviceLevelMaster // 是master设备，只有master设备才能擦除指令消息
+	if !persist || recvackPacket.MessageID <= 0 || recvackPacket.MessageSeq == 0 {
+		return
+	}
 
-	var currMsg *types.RetryMessage
-	if persist {
-		currMsg = service.RetryManager.RetryMessage(conn.NodeId, conn.ConnId, recvackPacket.MessageID)
-	}
-	if isCmd && persist && isMaster {
-		if currMsg != nil {
-			// 更新最近会话的已读位置
-			err := service.Store.UpdateConversationIfSeqGreaterAsync(conn.Uid, currMsg.ChannelId, currMsg.ChannelType, uint64(recvackPacket.MessageSeq))
-			if err != nil && err != wkdb.ErrNotFound {
-				h.Error("UpdateConversationIfSeqGreaterAsync failed", zap.Error(err), zap.String("channelId", currMsg.ChannelId), zap.Uint8("channelType", currMsg.ChannelType), zap.Uint64("messageSeq", uint64(recvackPacket.MessageSeq)))
-			}
-		}
-	}
-	if persist { // 只有需要持久化的消息才会重试
-		// r.Debug("remove retry", zap.String("uid", req.uid), zap.Int64("connId", msg.ConnId), zap.Int64("messageID", recvackPacket.MessageID))
-		err := service.RetryManager.RemoveRetry(conn.NodeId, conn.ConnId, recvackPacket.MessageID)
+	currMsg := service.RetryManager.AcknowledgeRetry(conn.Uid, conn.NodeId, conn.ConnId, recvackPacket.MessageID, recvackPacket.MessageSeq)
+	if seq := acknowledgedCommandSeq(conn, currMsg); seq != 0 {
+		err := service.Store.AdvanceCommandSyncCursorOnRecvack(currMsg.Uid, currMsg.ChannelId, currMsg.ChannelType, seq)
 		if err != nil {
-			h.Warn("removeRetry error", zap.Error(err), zap.String("uid", conn.Uid), zap.String("deviceId", conn.DeviceId), zap.Int64("connId", conn.ConnId), zap.Uint64("nodeId", conn.NodeId), zap.Int64("messageID", recvackPacket.MessageID))
-		}
-
-		if options.G.Logger.TraceOn {
-			if currMsg != nil {
-				if currMsg.ChannelType == wkproto.ChannelTypePerson { // 只打印个人的 ，理论上currMsg应该一直有值。
-					h.Trace("收到消息回执...",
-						"recvack",
-						zap.Int64("messageId", recvackPacket.MessageID),
-						zap.Uint64("messageSeq", uint64(recvackPacket.MessageSeq)),
-						zap.String("uid", conn.Uid),
-						zap.String("deviceId", conn.DeviceId),
-						zap.String("deviceFlag", conn.DeviceFlag.String()),
-						zap.Int64("connId", conn.ConnId),
-						zap.String("channelId", currMsg.ChannelId),
-						zap.Uint8("channelType", currMsg.ChannelType),
-					)
-				}
-
-			} else {
-				h.Trace("收到消息回执",
-					"recvack",
-					zap.Int64("messageId", recvackPacket.MessageID),
-					zap.Uint64("messageSeq", uint64(recvackPacket.MessageSeq)),
-					zap.String("uid", conn.Uid),
-					zap.String("deviceId", conn.DeviceId),
-					zap.String("deviceFlag", conn.DeviceFlag.String()),
-					zap.Int64("connId", conn.ConnId),
-				)
-			}
-
+			h.Error("AdvanceCommandSyncCursorOnRecvack failed", zap.Error(err), zap.String("channelId", currMsg.ChannelId), zap.Uint8("channelType", currMsg.ChannelType), zap.Uint64("messageSeq", seq))
 		}
 	}
 
+	if !options.G.Logger.TraceOn {
+		return
+	}
+	fields := []zap.Field{
+		zap.Int64("messageId", recvackPacket.MessageID),
+		zap.Uint64("messageSeq", uint64(recvackPacket.MessageSeq)),
+		zap.String("uid", conn.Uid),
+		zap.String("deviceId", conn.DeviceId),
+		zap.String("deviceFlag", conn.DeviceFlag.String()),
+		zap.Int64("connId", conn.ConnId),
+	}
+	if currMsg == nil {
+		h.Trace("收到消息回执", "recvack", fields...)
+	} else if currMsg.ChannelType == wkproto.ChannelTypePerson {
+		fields = append(fields, zap.String("channelId", currMsg.ChannelId), zap.Uint8("channelType", currMsg.ChannelType))
+		h.Trace("收到消息回执...", "recvack", fields...)
+	}
+}
+
+func acknowledgedCommandSeq(conn *eventbus.Conn, msg *types.RetryMessage) uint64 {
+	// 命令标志和游标取自已匹配的服务端下行包；旧客户端无需回传命令标志。
+	if msg == nil || msg.RecvPacket == nil || !msg.RecvPacket.SyncOnce ||
+		msg.RecvPacket.NoPersist || conn.DeviceLevel != wkproto.DeviceLevelMaster {
+		return 0
+	}
+	return uint64(msg.RecvPacket.MessageSeq)
 }

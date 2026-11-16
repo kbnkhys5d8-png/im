@@ -32,9 +32,20 @@ func (m messageSendReq) Check() error {
 }
 
 type syncReq struct {
-	UID        string `json:"uid"`         // 用户uid
-	MessageSeq uint64 `json:"message_seq"` // 客户端最大消息序列号
-	Limit      int    `json:"limit"`       // 消息数量限制
+	UID        string                `json:"uid"`                  // 用户uid
+	MessageSeq uint64                `json:"message_seq"`          // 客户端最大消息序列号
+	Limit      int                   `json:"limit"`                // 消息数量限制
+	Visibility *legacySyncVisibility `json:"visibility,omitempty"` // 网关传入的指定频道历史可见下界
+}
+
+type legacySyncVisibility struct {
+	ChannelID   string `json:"channel_id"` // 只有确切的 CMD 存储键才参与补拉过滤
+	ChannelType uint8  `json:"channel_type"`
+	AfterSeq    uint64 `json:"after_seq"`
+}
+
+func (v *legacySyncVisibility) valid() bool {
+	return v != nil && strings.TrimSpace(v.ChannelID) != "" && v.ChannelType != 0 && v.AfterSeq != 0
 }
 
 func (r syncReq) Check() error {
@@ -43,6 +54,9 @@ func (r syncReq) Check() error {
 	}
 	if r.Limit < 0 {
 		return errors.New("limit不能为负数！")
+	}
+	if r.Visibility != nil && !r.Visibility.valid() {
+		return errors.New("同步消息的可见范围有误！")
 	}
 	return nil
 }

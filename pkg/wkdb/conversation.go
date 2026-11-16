@@ -265,6 +265,8 @@ func (wk *wukongDB) UpdateConversationIfSeqGreaterAsync(uid, channelId string, c
 }
 
 func (wk *wukongDB) UpdateConversationIfSeqGreater(uid, channelId string, channelType uint8, readToMsgSeq uint64) error {
+	wk.dblock.conversationLock.lock(uid)
+	defer wk.dblock.conversationLock.unlock(uid)
 
 	existConversation, err := wk.GetConversation(uid, channelId, channelType)
 	if err != nil && err != ErrNotFound {
@@ -297,6 +299,70 @@ func (wk *wukongDB) UpdateConversationIfSeqGreater(uid, channelId string, channe
 	}
 	wk.conversationCache.InvalidateUserConversations(uid)
 	return w.Commit(wk.sync)
+}
+
+func (wk *wukongDB) AdvanceCommandSyncCursors(uid string, cursors []CommandSyncCursor) error {
+	wk.dblock.conversationLock.lock(uid)
+	defer wk.dblock.conversationLock.unlock(uid)
+
+	advances := make(map[uint64]uint64, len(cursors))
+	for _, cursor := range cursors {
+		conversation, err := wk.GetConversation(uid, cursor.ChannelID, cursor.ChannelType)
+		if err == ErrNotFound {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if conversation.Type == ConversationTypeCMD && cursor.Seq > conversation.ReadToMsgSeq && cursor.Seq > advances[conversation.Id] {
+			advances[conversation.Id] = cursor.Seq
+		}
+	}
+	if len(advances) == 0 {
+		return nil
+	}
+
+	// 同一补拉页中的各个频道在一个数据库批次完成，重复频道只写其最大序号。
+	batch := wk.shardDB(uid).NewBatch()
+	defer batch.Close()
+	for id, seq := range advances {
+		var value [8]byte
+		wk.endian.PutUint64(value[:], seq)
+		if err := batch.Set(key.NewConversationColumnKey(uid, id, key.TableConversation.Column.ReadedToMsgSeq), value[:], wk.noSync); err != nil {
+			return err
+		}
+	}
+	if err := batch.Commit(wk.sync); err != nil {
+		return err
+	}
+	wk.conversationCache.InvalidateUserConversations(uid)
+	return nil
+}
+
+func (wk *wukongDB) AdvanceCommandSyncCursorOnRecvack(uid, channelID string, channelType uint8, seq uint64) error {
+	wk.dblock.conversationLock.lock(uid)
+	defer wk.dblock.conversationLock.unlock(uid)
+
+	conversation, err := wk.GetConversation(uid, channelID, channelType)
+	if err == ErrNotFound {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	// 实时回执仅证明收到这一条；较大的序号不能代替中间缺失的命令。
+	if conversation.Type != ConversationTypeCMD || seq <= conversation.ReadToMsgSeq || seq-conversation.ReadToMsgSeq != 1 {
+		return nil
+	}
+
+	// 只更新游标，避免旧补拉页覆盖其他会话字段。
+	var value [8]byte
+	wk.endian.PutUint64(value[:], seq)
+	if err := wk.shardDB(uid).Set(key.NewConversationColumnKey(uid, conversation.Id, key.TableConversation.Column.ReadedToMsgSeq), value[:], wk.sync); err != nil {
+		return err
+	}
+	wk.conversationCache.InvalidateUserConversations(uid)
+	return nil
 }
 
 // GetConversations 获取指定用户的最近会话

@@ -87,6 +87,11 @@ func (r *RetryQueue) finishMessage(fromNode uint64, connId int64, messageId int6
 		// 重复或迟到的回执无需再次移除，不视为失败。
 		return
 	}
+	r.removeInFlightMessageLocked(key, msg)
+}
+
+// removeInFlightMessageLocked 只在持有队列锁且已确认任务对象时调用。
+func (r *RetryQueue) removeInFlightMessageLocked(key string, msg *types.RetryMessage) {
 	delete(r.inFlightMessages, key)
 	if msg.Index >= 0 {
 		r.inFlightPQ.Remove(msg.Index)

@@ -56,21 +56,50 @@ func (r *RetryManager) RetryMessageCount() int {
 }
 
 func (r *RetryManager) AddRetry(msg *types.RetryMessage) {
-	index := msg.MessageId % int64(len(r.retryQueues))
-	r.retryQueues[index].startInFlightTimeout(msg)
+	if q := r.queueForMessage(msg.MessageId); q != nil {
+		q.startInFlightTimeout(msg)
+	}
 }
 
 func (r *RetryManager) RemoveRetry(fromNode uint64, connId int64, messageId int64) error {
-	index := messageId % int64(len(r.retryQueues))
-	r.retryQueues[index].finishMessage(fromNode, connId, messageId)
+	if q := r.queueForMessage(messageId); q != nil {
+		q.finishMessage(fromNode, connId, messageId)
+	}
 	return nil
+}
+
+// AcknowledgeRetry 在同一次加锁中验证和移除，防止重复或过期回执删除另一条任务。
+func (r *RetryManager) AcknowledgeRetry(uid string, fromNode uint64, connId int64, messageId int64, messageSeq uint32) *types.RetryMessage {
+	q := r.queueForMessage(messageId)
+	if q == nil || uid == "" || messageSeq == 0 {
+		return nil
+	}
+	key := q.getInFlightKey(fromNode, connId, messageId)
+	q.inFlightMutex.Lock()
+	defer q.inFlightMutex.Unlock()
+	msg := q.inFlightMessages[key]
+	if msg == nil || msg.Uid != uid || msg.RecvPacket == nil ||
+		msg.RecvPacket.NoPersist || msg.RecvPacket.MessageID != messageId || msg.RecvPacket.MessageSeq != messageSeq {
+		return nil
+	}
+	q.removeInFlightMessageLocked(key, msg)
+	return msg
 }
 
 // 获取重试消息
 func (r *RetryManager) RetryMessage(fromNode uint64, connId int64, messageId int64) *types.RetryMessage {
-	index := messageId % int64(len(r.retryQueues))
+	if q := r.queueForMessage(messageId); q != nil {
+		return q.getInFlightMessage(fromNode, connId, messageId)
+	}
+	return nil
+}
 
-	return r.retryQueues[index].getInFlightMessage(fromNode, connId, messageId)
+func (r *RetryManager) queueForMessage(messageId int64) *RetryQueue {
+	// 回执的 ID 来自客户端，不能将非正数用于选择重试队列。
+	if messageId <= 0 || len(r.retryQueues) == 0 {
+		return nil
+	}
+	return r.retryQueues[messageId%int64(len(r.retryQueues))]
 }
 
 func (r *RetryManager) retry(q *RetryQueue, msg *types.RetryMessage, retryCount int) {
