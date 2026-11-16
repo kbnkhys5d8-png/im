@@ -76,6 +76,70 @@ func historyLocalHTTP(router *wkhttp.WKHttp, path string, body any) *httptest.Re
 	return historyHTTP(router, path, body, "127.0.0.1:30000", "synthetic-history-token")
 }
 
+func TestHistoryCleanupUsesFenceWithoutReadingOrReleasingHistory(t *testing.T) {
+	router, db, request := historyAPIFixture(t, 20)
+	id, err := request.identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := options.GetFakeChannelIDWith("b", "c")
+	if err := db.AddOrUpdateConversations([]wkdb.Conversation{
+		{Id: 1, Uid: "a", ChannelId: id.ChannelID, ChannelType: 1}, {Id: 2, Uid: "c", ChannelId: id.ChannelID, ChannelType: 1},
+		{Id: 3, Uid: "b", ChannelId: other, ChannelType: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if r := historyLocalHTTP(router, "/history/fence", request); r.Code != http.StatusOK {
+		t.Fatal(r.Code, r.Body.String())
+	}
+	const path = "/history/conversations/cleanup"
+	high := uint64(1)
+	request.High, request.Limit = &high, 0
+	if r := historyHTTP(router, path, request, "203.0.113.1:1234", "synthetic-history-token"); r.Code != http.StatusForbidden {
+		t.Fatal(r.Code)
+	}
+	wrong := request
+	wrong.TaskID = strings.Repeat("b", 64)
+	if r := historyLocalHTTP(router, path, wrong); r.Code == http.StatusOK {
+		t.Fatal("错误任务不应清理会话")
+	}
+	badHigh := high + 1
+	wrong = request
+	wrong.High = &badHigh
+	if r := historyLocalHTTP(router, path, wrong); r.Code == http.StatusOK {
+		t.Fatal("错误水位不应清理会话")
+	}
+	for _, uid := range []string{"a", "c"} {
+		item, err := db.GetConversation(uid, id.ChannelID, 1)
+		if err != nil || item.DeletedAtMsgSeq != 0 {
+			t.Fatal(err, item.DeletedAtMsgSeq)
+		}
+	}
+	for i := 0; i < 2; i++ {
+		if r := historyLocalHTTP(router, path, request); r.Code != http.StatusOK {
+			t.Fatal(r.Code, r.Body.String())
+		}
+	}
+	for _, uid := range []string{"a", "c"} {
+		item, err := db.GetConversation(uid, id.ChannelID, 1)
+		if err != nil || item.DeletedAtMsgSeq != high {
+			t.Fatal(err, item.DeletedAtMsgSeq)
+		}
+	}
+	item, err := db.GetConversation("b", other, 1)
+	if err != nil || item.DeletedAtMsgSeq != 0 {
+		t.Fatal(err, item.DeletedAtMsgSeq)
+	}
+	fence, err := db.(wkdb.HistoryFenceStore).GetHistoryFence(id.ChannelID, 1)
+	if err != nil || fence == nil || fence.HighWatermark != high {
+		t.Fatal(err, fence)
+	}
+	msg, err := db.LoadMsg(id.ChannelID, 1, 1)
+	if err != nil || msg.MessageID != 100 {
+		t.Fatal(err, msg.MessageID)
+	}
+}
+
 func TestHistoryHTTPIdentityAndLoopback(t *testing.T) {
 	router, _, request := historyAPIFixture(t, 20)
 	for _, path := range []string{"/history/capabilities", "/history/fence", "/history/export", "/history/fence/release"} {

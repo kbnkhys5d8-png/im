@@ -241,6 +241,54 @@ func (s *Store) ReleaseHistory(ctx context.Context, identity wkdb.HistoryFence) 
 	return s.historyCommand(ctx, CMDHistoryFenceRelease, identity)
 }
 
+// 只隐藏原会话的两个最近会话条目，不读正文、不释放迁移门禁。
+func (s *Store) CleanupHistoryConversations(ctx context.Context, identity wkdb.HistoryFence, high uint64) error {
+	unlock, err := s.historyReadLockContext(ctx, identity.ChannelID, 1)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	fence, err := s.historyFence(identity.ChannelID, 1)
+	if err != nil {
+		return err
+	}
+	if fence == nil || !sameFenceIdentity(*fence, identity) || fence.HighWatermark != high {
+		return wkdb.ErrHistoryConflict
+	}
+	topology := s.historyTopology(identity.ChannelID)
+	if topology != nil && !(errors.Is(topology, wkdb.ErrHistoryChannelMissing) && high == 0) {
+		return topology
+	}
+	last, _, err := s.wdb.GetChannelLastMessageSeq(identity.ChannelID, 1)
+	if err != nil {
+		return err
+	}
+	if last != high {
+		return wkdb.ErrHistoryConflict
+	}
+	for _, uid := range [...]string{identity.SourceUID, identity.PeerUID} {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		item, err := s.wdb.GetConversation(uid, identity.ChannelID, 1)
+		if err != nil && !errors.Is(err, wkdb.ErrNotFound) {
+			return err
+		}
+		if wkdb.IsEmptyConversation(item) || item.DeletedAtMsgSeq >= high {
+			continue
+		}
+		cmd := NewCMD(CMDUpdateConversationDeletedAtMsgSeq, EncodeCMDUpdateConversationDeletedAtMsgSeq(uid, identity.ChannelID, 1, high))
+		data, err := cmd.Marshal()
+		if err != nil {
+			return err
+		}
+		if _, err := s.opts.Slot.ProposeUntilAppliedTimeout(ctx, s.opts.Slot.GetSlotId(uid), data); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 type HistoryExportPage struct {
 	Messages      []wkdb.Message
 	HighWatermark uint64

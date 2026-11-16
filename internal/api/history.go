@@ -49,6 +49,7 @@ func (h *historyAPI) route(r *wkhttp.WKHttp) {
 	r.POST("/history/export", h.export)
 	r.POST("/history/preflight", h.preflight)
 	r.POST("/history/fence/release", h.release)
+	r.POST("/history/conversations/cleanup", h.cleanupConversations)
 }
 
 func (h *historyAPI) capabilities(c *wkhttp.Context) {
@@ -121,6 +122,22 @@ func (h *historyAPI) release(c *wkhttp.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, map[string]bool{"released": true})
+}
+
+func (h *historyAPI) cleanupConversations(c *wkhttp.Context) {
+	req, identity, ok := historyInput(c, true)
+	if !ok {
+		return
+	}
+	if req.High == nil || req.AfterSeq != 0 || req.Limit != 0 {
+		c.ResponseError(errors.New("invalid history cleanup request"))
+		return
+	}
+	if err := h.store.CleanupHistoryConversations(c.Request.Context(), identity, *req.High); err != nil {
+		c.ResponseError(err)
+		return
+	}
+	c.JSON(http.StatusOK, map[string]bool{"cleaned": true})
 }
 
 type historyResponse struct {
