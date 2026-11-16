@@ -6,6 +6,7 @@ package wknet
 import (
 	"bytes"
 	"fmt"
+	"net"
 	"os"
 	"sync"
 
@@ -16,9 +17,20 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+type reactorPoller interface {
+	PollingWithSnapshot(func() uint64, func(int, uint64, netpoll.PollEvent) error) error
+	AddRead(int) error
+	AddWrite(int) error
+	DeleteRead(int) error
+	DeleteWrite(int) error
+	DeleteReadAndWrite(int) error
+	Delete(int) error
+	Close() error
+}
+
 // ReactorSub is a sub reactor.
 type ReactorSub struct {
-	poller    *netpoll.Poller
+	poller    reactorPoller
 	eg        *Engine
 	idx       int // index of the current sub reactor
 	connCount atomic.Int32
@@ -26,8 +38,9 @@ type ReactorSub struct {
 	ReadBuffer []byte
 	cache      bytes.Buffer // temporary buffer for scattered bytes
 
-	stopped atomic.Bool
-	runWG   sync.WaitGroup
+	stopped      atomic.Bool
+	registration atomic.Uint64
+	runWG        sync.WaitGroup
 }
 
 // NewReactorSub instantiates a sub reactor.
@@ -45,9 +58,23 @@ func NewReactorSub(eg *Engine, index int) *ReactorSub {
 
 // AddConn adds a connection to the sub reactor.
 func (r *ReactorSub) AddConn(conn Conn) error {
-	r.eg.AddConn(conn)
+	if d := defaultConnOf(conn); d != nil {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		if d.closed.Load() {
+			return net.ErrClosed
+		}
+		d.owner = conn
+	}
+	// 只有接管了底层 FD 后才分配新代次；旧批次始终早于复用后的连接。
+	r.eg.addConn(conn, r.registration.Inc())
 	r.connCount.Inc()
-	return r.poller.AddRead(conn.Fd().fd)
+	if err := r.poller.AddRead(conn.Fd().fd); err != nil {
+		r.eg.removeConn(conn)
+		r.connCount.Dec()
+		return err
+	}
+	return nil
 }
 
 // Start starts the sub reactor.
@@ -106,26 +133,38 @@ func (r *ReactorSub) run() {
 		}
 	}()
 
-	err := r.poller.Polling(func(fd int, event netpoll.PollEvent) (err error) {
-		conn := r.eg.GetConn(fd)
-		if conn == nil {
-			return nil
-		}
-		switch event {
-		case netpoll.PollEventClose:
-			r.Debug("conn 连接关闭！", zap.Int64("id", conn.ID()), zap.Int("fd", fd))
-			_ = r.CloseConn(conn, unix.ECONNRESET)
-		case netpoll.PollEventRead:
-			err = r.read(conn)
-		case netpoll.PollEventWrite:
-			err = r.write(conn)
-		}
-		return
-	})
+	err := r.poller.PollingWithSnapshot(r.registration.Load, r.handleEvent)
 
 	if err != nil && !r.stopped.Load() {
 		r.Panic("poller error", zap.Error(err), zap.Int("idx", r.idx))
 	}
+}
+
+func (r *ReactorSub) handleEvent(fd int, generation uint64, event netpoll.PollEvent) error {
+	conn := r.eg.getConnAt(fd, generation)
+	if conn == nil || conn.IsClosed() {
+		return nil
+	}
+	switch event {
+	case netpoll.PollEventClose:
+		r.Debug("conn 连接关闭！", zap.Int64("id", conn.ID()), zap.Int("fd", fd))
+		return r.CloseConn(conn, unix.ECONNRESET)
+	case netpoll.PollEventRead:
+		return r.read(conn)
+	case netpoll.PollEventWrite:
+		return r.write(conn)
+	}
+	return nil
+}
+
+func (d *DefaultConn) readFD(buf []byte) (int, error) {
+	// Unix 已接受的 socket 是非阻塞的，读系统调用必须与关闭/复用串行。
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed.Load() {
+		return 0, net.ErrClosed
+	}
+	return d.fd.Read(buf)
 }
 
 func (r *ReactorSub) CloseConn(c Conn, er error) (rerr error) {
@@ -140,7 +179,7 @@ func (r *ReactorSub) read(c Conn) error {
 		// A TLS read can return valid plaintext followed by a fatal record
 		// error from the same socket read. Deliver the plaintext before
 		// closing the connection for the fatal error.
-		if _, hasNewData := err.(*readErrorWithData); hasNewData {
+		if _, hasNewData := err.(*readErrorWithData); hasNewData && !c.IsClosed() {
 			if dataErr := r.eg.eventHandler.OnData(c); dataErr != nil && dataErr != unix.EAGAIN {
 				if err1 := r.CloseConn(c, dataErr); err1 != nil {
 					r.Warn("failed to close conn", zap.Error(err1))
@@ -159,6 +198,9 @@ func (r *ReactorSub) read(c Conn) error {
 	}
 	if n == 0 {
 		return r.CloseConn(c, os.NewSyscallError("read", unix.ECONNRESET))
+	}
+	if c.IsClosed() {
+		return nil
 	}
 	if err = r.eg.eventHandler.OnData(c); err != nil {
 		if err == unix.EAGAIN {

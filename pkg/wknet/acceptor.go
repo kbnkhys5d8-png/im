@@ -247,6 +247,8 @@ func (a *acceptor) acceptConn(listenFd int, ws bool, wss bool) error {
 			return err
 		}
 	}
+	// 先保存原包装连接，预认证超时也要用同一个对象执行关闭回调。
+	bindConnOwner(conn)
 	// call on connect
 	err = a.eg.eventHandler.OnConnect(conn)
 	if err != nil {
@@ -255,7 +257,10 @@ func (a *acceptor) acceptConn(listenFd int, ws bool, wss bool) error {
 	// Register read events only after OnConnect has initialized the connection.
 	err = subReactor.AddConn(conn)
 	if err != nil {
-		a.Warn("subReactor.AddConn() failed", zap.Error(err))
+		if err != net.ErrClosed {
+			a.Warn("subReactor.AddConn() failed", zap.Error(err))
+		}
+		_ = conn.Close()
 	}
 
 	return nil

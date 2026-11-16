@@ -134,18 +134,41 @@ type DefaultConn struct {
 	context        atomic.Value
 	authed         atomic.Bool // if the connection is authed
 	id             atomic.Int64
-	generation     atomic.Uint64
 	uid            atomic.String
 	valueMap       sync.Map
 
+	// mu 保护发送、底层 FD 关闭、连接身份及空闲定时器。
+	owner          Conn
+	idleGeneration uint64
+	idleTimer      *timingwheel.Timer
+
 	uptime       atomic.Time
 	lastActivity atomic.Time
-	maxIdle      time.Duration
-	maxIdleLock  sync.RWMutex
 
-	idleTimer *timingwheel.Timer
+	// 接收解析可以写回 TLS/WS 数据，所以接收和发送使用不同的锁。
+	recvMu           sync.Mutex
+	temporaryInbound []InboundBuffer
 
 	wklog.Log
+}
+
+func (d *DefaultConn) defaultConn() *DefaultConn { return d }
+
+func defaultConnOf(c Conn) *DefaultConn {
+	if wrapper, ok := c.(interface{ defaultConn() *DefaultConn }); ok {
+		return wrapper.defaultConn()
+	}
+	return nil
+}
+
+func bindConnOwner(conn Conn) {
+	if d := defaultConnOf(conn); d != nil {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		if !d.closed.Load() {
+			d.owner = conn
+		}
+	}
 }
 
 func GetDefaultConn(id int64, connFd NetFd, localAddr, remoteAddr net.Addr, eg *Engine, reactorSub *ReactorSub) *DefaultConn {
@@ -153,7 +176,6 @@ func GetDefaultConn(id int64, connFd NetFd, localAddr, remoteAddr net.Addr, eg *
 	// Reusing it through sync.Pool allows stale goroutines to act on a
 	// different accepted connection after release.
 	defaultConn := &DefaultConn{}
-	defaultConn.generation.Inc()
 	defaultConn.id.Store(id)
 	defaultConn.fd = connFd
 	defaultConn.remoteAddr = remoteAddr
@@ -167,7 +189,6 @@ func GetDefaultConn(id int64, connFd NetFd, localAddr, remoteAddr net.Addr, eg *
 	defaultConn.valueMap = sync.Map{}
 	defaultConn.context = atomic.Value{}
 	defaultConn.lastActivity.Store(time.Now())
-	defaultConn.maxIdle = 0
 	defaultConn.uptime.Store(time.Now())
 	defaultConn.Log = wklog.NewWKLog(fmt.Sprintf("Conn[[reactor-%d]%d]", reactorSub.idx, id))
 
@@ -211,13 +232,17 @@ func (d *DefaultConn) SetID(id int64) {
 }
 
 func (d *DefaultConn) ReadToInboundBuffer() (int, error) {
+	var n int
+	d.recvMu.Lock()
+	defer func() {
+		d.recvMu.Unlock()
+		d.reportRead(n)
+	}()
 	readBuffer := d.reactorSub.ReadBuffer
-	n, err := d.fd.Read(readBuffer)
+	var err error
+	n, err = d.readFD(readBuffer)
 	if err != nil || n == 0 {
 		return 0, err
-	}
-	if d.eg.options.Event.OnReadBytes != nil {
-		d.eg.options.Event.OnReadBytes(n)
 	}
 	if d.overflowForInbound(n) {
 		return 0, fmt.Errorf("inbound buffer overflow, fd: %d buffSize:%d n: %d currentSize: %d maxSize: %d", d.fd, d.inboundBuffer.BoundBufferSize(), n, d.inboundBuffer.BoundBufferSize()+n, d.eg.options.MaxReadBufferSize)
@@ -227,11 +252,19 @@ func (d *DefaultConn) ReadToInboundBuffer() (int, error) {
 	return n, err
 }
 
+func (d *DefaultConn) reportRead(n int) {
+	if n > 0 && d.eg.options.Event.OnReadBytes != nil {
+		d.eg.options.Event.OnReadBytes(n)
+	}
+}
+
 func (d *DefaultConn) KeepLastActivity() {
 	d.lastActivity.Store(time.Now())
 }
 
 func (d *DefaultConn) Read(buf []byte) (int, error) {
+	d.recvMu.Lock()
+	defer d.recvMu.Unlock()
 	if d.inboundBuffer.IsEmpty() {
 		return 0, nil
 	}
@@ -243,12 +276,11 @@ func (d *DefaultConn) Read(buf []byte) (int, error) {
 }
 
 func (d *DefaultConn) Write(b []byte) (int, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	if d.closed.Load() {
 		return -1, net.ErrClosed
 	}
-	// 这里不能使用d.mu上锁，否则会导致死锁 WSSConn死锁
-	// d.mu.Lock()
-	// defer d.mu.Unlock()
 	n, err := d.write(b)
 	if err != nil {
 		return 0, err
@@ -261,11 +293,11 @@ func (d *DefaultConn) WriteToOutboundBuffer(b []byte) (int, error) {
 	if len(b) == 0 {
 		return 0, nil
 	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	if d.closed.Load() {
 		return -1, net.ErrClosed
 	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
 	return d.outboundBuffer.Write(b)
 
 }
@@ -296,14 +328,25 @@ func (d *DefaultConn) Fd() NetFd {
 }
 
 func (d *DefaultConn) close(_ error) error {
-
 	d.mu.Lock()
-	defer d.mu.Unlock()
+	owner := d.closeLocked()
+	d.mu.Unlock()
+	d.finishClose(owner)
+	return nil
+}
 
+// closeLocked 在释放 FD 前原子地认领关闭；上层回调必须在解锁后调用。
+func (d *DefaultConn) closeLocked() Conn {
 	if d.closed.Load() {
 		return nil
 	}
 	d.closed.Store(true)
+	d.cancelIdleLocked()
+
+	owner := d.owner
+	if owner == nil {
+		owner = d
+	}
 
 	// 正常关闭和连接重置都要先注销：若底层 socket 还有其他引用，仅关闭当前 FD 不会移除 epoll 事件。
 	if err := d.reactorSub.DeleteFd(d); err != nil {
@@ -311,14 +354,31 @@ func (d *DefaultConn) close(_ error) error {
 	}
 
 	// 先删旧连接索引，再释放 FD，避免误删已经复用这个 FD 的新连接。
-	d.eg.RemoveConn(d)
+	if d.eg.removeConn(owner) {
+		d.reactorSub.ConnDec()
+	}
 	_ = d.fd.Close()
-	d.reactorSub.ConnDec()       // decrease the connection count
-	d.eg.eventHandler.OnClose(d) // call the close handler
+	if err := d.outboundBuffer.Release(); err != nil {
+		d.Debug("outboundBuffer release error", zap.Error(err))
+	}
+	return owner
+}
 
-	d.release()
-
-	return nil
+func (d *DefaultConn) finishClose(owner Conn) {
+	if owner == nil {
+		return
+	}
+	d.eg.eventHandler.OnClose(owner)
+	d.recvMu.Lock()
+	defer d.recvMu.Unlock()
+	if err := d.inboundBuffer.Release(); err != nil {
+		d.Debug("inboundBuffer release error", zap.Error(err))
+	}
+	for _, buffer := range d.temporaryInbound {
+		if err := buffer.Release(); err != nil {
+			d.Debug("temporary inbound buffer release error", zap.Error(err))
+		}
+	}
 }
 
 func (d *DefaultConn) Close() error {
@@ -358,26 +418,9 @@ func (d *DefaultConn) SetWriteDeadline(t time.Time) error {
 	return ErrUnsupportedOp
 }
 
-func (d *DefaultConn) release() {
-
-	d.Debug("release connection")
-	d.maxIdle = 0
-	if d.idleTimer != nil {
-		d.idleTimer.Stop()
-		d.idleTimer = nil
-	}
-	err := d.inboundBuffer.Release()
-	if err != nil {
-		d.Debug("inboundBuffer release error", zap.Error(err))
-	}
-	err = d.outboundBuffer.Release()
-	if err != nil {
-		d.Debug("outboundBuffer release error", zap.Error(err))
-	}
-
-}
-
 func (d *DefaultConn) Peek(n int) ([]byte, error) {
+	d.recvMu.Lock()
+	defer d.recvMu.Unlock()
 	totalLen := d.inboundBuffer.BoundBufferSize()
 	if n > totalLen {
 		return nil, io.ErrShortBuffer
@@ -401,6 +444,8 @@ func (d *DefaultConn) Peek(n int) ([]byte, error) {
 }
 
 func (d *DefaultConn) Discard(n int) (int, error) {
+	d.recvMu.Lock()
+	defer d.recvMu.Unlock()
 	return d.inboundBuffer.Discard(n)
 }
 
@@ -455,45 +500,51 @@ func (d *DefaultConn) Uptime() time.Time {
 }
 
 func (d *DefaultConn) SetMaxIdle(maxIdle time.Duration) {
-
-	d.maxIdleLock.Lock()
-	defer d.maxIdleLock.Unlock()
+	d.mu.Lock()
+	defer d.mu.Unlock()
 
 	if d.closed.Load() {
 		d.Debug("connection is closed, setMaxIdle failed")
 		return
 	}
 
-	d.maxIdle = maxIdle
-	connGeneration := d.generation.Load()
+	d.cancelIdleLocked()
+	if maxIdle > 0 {
+		d.scheduleIdleLocked(d.idleGeneration, maxIdle)
+	}
+}
 
+func (d *DefaultConn) scheduleIdleLocked(generation uint64, maxIdle time.Duration) {
+	// 由当前代次检查之后才续排，已经开始执行的旧回调不会留下一条重复定时任务。
+	d.idleTimer = d.eg.timingWheel.AfterFunc(maxIdle/2, func() {
+		d.expireIdle(generation, maxIdle)
+	})
+}
+
+func (d *DefaultConn) cancelIdleLocked() {
+	d.idleGeneration++
 	if d.idleTimer != nil {
 		d.idleTimer.Stop()
 		d.idleTimer = nil
 	}
+}
 
-	if maxIdle > 0 {
-		d.idleTimer = d.eg.Schedule(maxIdle/2, func() {
-			d.maxIdleLock.Lock()
-			defer d.maxIdleLock.Unlock()
-
-			if d.generation.Load() != connGeneration {
-				return
-			}
-			if d.lastActivity.Load().Add(maxIdle).After(time.Now()) {
-				return
-			}
-			d.Debug("max idle time exceeded, close the connection", zap.Duration("maxIdle", maxIdle), zap.Duration("lastActivity", time.Since(d.lastActivity.Load())), zap.String("conn", d.String()))
-			if d.idleTimer != nil {
-				d.idleTimer.Stop()
-				d.idleTimer = nil
-			}
-			if d.closed.Load() {
-				return
-			}
-			_ = d.close(nil)
-		})
+func (d *DefaultConn) expireIdle(generation uint64, maxIdle time.Duration) {
+	d.mu.Lock()
+	// 用同一把锁检查并认领关闭，旧回调不能越过更新后的空闲期限。
+	if generation != d.idleGeneration || d.closed.Load() {
+		d.mu.Unlock()
+		return
 	}
+	if d.lastActivity.Load().Add(maxIdle).After(time.Now()) {
+		d.scheduleIdleLocked(generation, maxIdle)
+		d.mu.Unlock()
+		return
+	}
+	d.Debug("max idle time exceeded, close the connection", zap.Duration("maxIdle", maxIdle), zap.Duration("lastActivity", time.Since(d.lastActivity.Load())), zap.String("conn", d.String()))
+	owner := d.closeLocked()
+	d.mu.Unlock()
+	d.finishClose(owner)
 }
 
 func (d *DefaultConn) flush() error {
@@ -507,8 +558,8 @@ func (d *DefaultConn) flush() error {
 	}
 
 	if d.outboundBuffer.IsEmpty() {
-		d.mu.Unlock()
 		_ = d.removeWriteIfExist()
+		d.mu.Unlock()
 		return nil
 	}
 	var (
@@ -647,21 +698,25 @@ func (e *readErrorWithData) Unwrap() error {
 }
 
 func newTLSConn(d *DefaultConn) *TLSConn {
-
-	return &TLSConn{
-		d:                d,
-		tmpInboundBuffer: d.eg.eventHandler.OnNewInboundConn(d, d.eg),
-	}
+	buffer := d.eg.eventHandler.OnNewInboundConn(d, d.eg)
+	d.temporaryInbound = append(d.temporaryInbound, buffer)
+	return &TLSConn{d: d, tmpInboundBuffer: buffer}
 }
 
+func (t *TLSConn) defaultConn() *DefaultConn { return t.d }
+
 func (t *TLSConn) ReadToInboundBuffer() (int, error) {
+	var n int
+	t.d.recvMu.Lock()
+	defer func() {
+		t.d.recvMu.Unlock()
+		t.d.reportRead(n)
+	}()
 	readBuffer := t.d.reactorSub.ReadBuffer
-	n, err := t.d.fd.Read(readBuffer)
+	var err error
+	n, err = t.d.readFD(readBuffer)
 	if err != nil || n == 0 {
 		return 0, err
-	}
-	if t.d.eg.options.Event.OnReadBytes != nil {
-		t.d.eg.options.Event.OnReadBytes(n)
 	}
 	_, err = t.tmpInboundBuffer.Write(readBuffer[:n]) // 将tls加密的内容写到tmpInboundBuffer内， tls会从tmpInboundBuffer读取数据（BuffReader接口）
 	if err != nil {
@@ -735,6 +790,8 @@ func (t *TLSConn) SetRemoteAddr(addr net.Addr) {
 }
 
 func (t *TLSConn) Read(b []byte) (int, error) {
+	t.d.recvMu.Lock()
+	defer t.d.recvMu.Unlock()
 	return t.tlsconn.Read(b)
 }
 
@@ -755,12 +812,10 @@ func (t *TLSConn) SetWriteDeadline(tim time.Time) error {
 }
 
 func (t *TLSConn) Close() error {
-	_ = t.tmpInboundBuffer.Release()
 	return t.d.Close()
 }
 
 func (t *TLSConn) CloseWithErr(err error) error {
-	t.tmpInboundBuffer.Release()
 	return t.d.CloseWithErr(err)
 }
 
@@ -829,7 +884,7 @@ func (t *TLSConn) Uptime() time.Time {
 }
 
 func (t *TLSConn) WriteToOutboundBuffer(b []byte) (int, error) {
-	return t.d.outboundBuffer.Write(b)
+	return t.d.WriteToOutboundBuffer(b)
 }
 
 func (t *TLSConn) SetMaxIdle(maxIdle time.Duration) {
@@ -891,19 +946,24 @@ func (e *eofBuff) Read(p []byte) (int, error) {
 
 type connMatrix struct {
 	connCount atomic.Int32
-	conns     map[int]Conn
+	conns     map[int]connRegistration
+}
+
+type connRegistration struct {
+	conn       Conn
+	generation uint64
 }
 
 func newConnMatrix() *connMatrix {
 	return &connMatrix{
-		conns: make(map[int]Conn),
+		conns: make(map[int]connRegistration),
 	}
 }
 
 func (cm *connMatrix) iterate(f func(Conn) bool) {
-	for _, c := range cm.conns {
-		if c != nil {
-			if !f(c) {
+	for _, reg := range cm.conns {
+		if reg.conn != nil {
+			if !f(reg.conn) {
 				return
 			}
 		}
@@ -913,18 +973,26 @@ func (cm *connMatrix) countAdd(delta int32) {
 	cm.connCount.Add(delta)
 }
 
-func (cm *connMatrix) addConn(c Conn) {
-	cm.conns[c.Fd().Fd()] = c
-	cm.countAdd(1)
+func (cm *connMatrix) addConn(c Conn, generation uint64) {
+	fd := c.Fd().Fd()
+	if _, ok := cm.conns[fd]; !ok {
+		cm.countAdd(1)
+	}
+	cm.conns[fd] = connRegistration{conn: c, generation: generation}
 }
 
-func (cm *connMatrix) delConn(c Conn) {
-	delete(cm.conns, c.Fd().Fd())
+func (cm *connMatrix) delConn(c Conn) bool {
+	fd := c.Fd().Fd()
+	if cm.conns[fd].conn != c {
+		return false
+	}
+	delete(cm.conns, fd)
 	cm.countAdd(-1)
+	return true
 }
 
 func (cm *connMatrix) getConn(fd int) Conn {
-	return cm.conns[fd]
+	return cm.conns[fd].conn
 }
 func (cm *connMatrix) loadCount() (n int32) {
 	return cm.connCount.Load()

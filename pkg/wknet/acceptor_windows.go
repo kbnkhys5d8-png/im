@@ -173,7 +173,10 @@ func (a *Acceptor) acceptConn(connNetFd NetFd, ws bool, wss bool) error {
 		}
 	}
 	// add conn to sub reactor
-	subReactor.AddConn(conn)
+	if err := subReactor.AddConn(conn); err != nil {
+		_ = conn.Close()
+		return err
+	}
 	// call on connect
 	a.eg.eventHandler.OnConnect(conn)
 	return nil

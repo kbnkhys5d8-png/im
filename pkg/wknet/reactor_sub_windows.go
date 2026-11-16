@@ -3,6 +3,7 @@ package wknet
 import (
 	"bytes"
 	"fmt"
+	"net"
 	"os"
 	"syscall"
 
@@ -55,6 +56,14 @@ func (r *ReactorSub) ConnDec() {
 
 // AddConn adds a connection to the sub reactor.
 func (r *ReactorSub) AddConn(conn Conn) error {
+	if d := defaultConnOf(conn); d != nil {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		if d.closed.Load() {
+			return net.ErrClosed
+		}
+		d.owner = conn
+	}
 	r.eg.AddConn(conn)
 	r.ConnInc()
 
@@ -84,6 +93,14 @@ func (r *ReactorSub) RemoveWrite(conn Conn) error {
 	return nil
 }
 
+func (d *DefaultConn) readFD(buf []byte) (int, error) {
+	// Windows 的 net.Conn 负责同步阻塞读与 Close，不用发送锁包住阻塞读。
+	if d.closed.Load() {
+		return 0, net.ErrClosed
+	}
+	return d.fd.Read(buf)
+}
+
 func (r *ReactorSub) readLoop(conn Conn) {
 	for {
 		n, err := conn.ReadToInboundBuffer()
@@ -99,6 +116,9 @@ func (r *ReactorSub) readLoop(conn Conn) {
 		}
 		if n == 0 {
 			r.CloseConn(conn, os.NewSyscallError("read", syscall.ECONNRESET))
+			return
+		}
+		if conn.IsClosed() {
 			return
 		}
 		if err = r.eg.eventHandler.OnData(conn); err != nil {

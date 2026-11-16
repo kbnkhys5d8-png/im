@@ -65,6 +65,13 @@ func NewPoller(index int, name string) *Poller {
 
 // Polling blocks the current goroutine, waiting for network-events.
 func (p *Poller) Polling(callback func(fd int, event PollEvent) error) (retErr error) {
+	return p.PollingWithSnapshot(nil, func(fd int, _ uint64, event PollEvent) error {
+		return callback(fd, event)
+	})
+}
+
+// PollingWithSnapshot 将下一批事件与调用前的连接注册代次绑定。
+func (p *Poller) PollingWithSnapshot(snapshot func() uint64, callback func(fd int, generation uint64, event PollEvent) error) (retErr error) {
 	p.mu.Lock()
 	switch p.state.Load() {
 	case pollerClosed:
@@ -87,6 +94,10 @@ func (p *Poller) Polling(callback func(fd int, event PollEvent) error) (retErr e
 	el := newEventList(InitPollEventsCap)
 	msec := -1
 	for p.state.Load() != pollerClosed {
+		var generation uint64
+		if snapshot != nil {
+			generation = snapshot()
+		}
 		n, err := unix.EpollWait(p.fd, el.events, msec)
 		if n == 0 || (n < 0 && err == unix.EINTR) {
 			msec = -1
@@ -124,7 +135,7 @@ func (p *Poller) Polling(callback func(fd int, event PollEvent) error) (retErr e
 				pollEvent = PollEventClose
 			}
 			if pollEvent != PollEventUnknown {
-				switch err = callback(int(fd), pollEvent); err {
+				switch err = callback(int(fd), generation, pollEvent); err {
 				case nil:
 				default:
 					p.Error("error occurs in event-loop", zap.Error(err))
@@ -134,7 +145,7 @@ func (p *Poller) Polling(callback func(fd int, event PollEvent) error) (retErr e
 				return nil
 			}
 			if triggerWrite && !(triggerHup || triggerError) {
-				switch err = callback(int(fd), PollEventWrite); err {
+				switch err = callback(int(fd), generation, PollEventWrite); err {
 				case nil:
 				default:
 					p.Error("error occurs in event-loop", zap.Error(err))

@@ -54,21 +54,39 @@ func (e *Engine) Stop() error {
 }
 
 func (e *Engine) AddConn(conn Conn) {
+	e.addConn(conn, 0)
+}
+
+func (e *Engine) addConn(conn Conn, registration uint64) {
 	e.connsUnixLock.Lock()
-	e.connMatrix.addConn(conn)
+	e.connMatrix.addConn(conn, registration)
 	e.connsUnixLock.Unlock()
 }
 
 func (e *Engine) RemoveConn(conn Conn) {
+	e.removeConn(conn)
+}
+
+func (e *Engine) removeConn(conn Conn) bool {
 	e.connsUnixLock.Lock()
-	e.connMatrix.delConn(conn)
-	e.connsUnixLock.Unlock()
+	defer e.connsUnixLock.Unlock()
+	return e.connMatrix.delConn(conn)
 }
 
 func (e *Engine) GetConn(fd int) Conn {
 	e.connsUnixLock.RLock()
 	defer e.connsUnixLock.RUnlock()
 	return e.connMatrix.getConn(fd)
+}
+
+func (e *Engine) getConnAt(fd int, snapshot uint64) Conn {
+	e.connsUnixLock.RLock()
+	defer e.connsUnixLock.RUnlock()
+	reg := e.connMatrix.conns[fd]
+	if reg.generation > snapshot {
+		return nil
+	}
+	return reg.conn
 }
 
 func (e *Engine) GetAllConn() []Conn {

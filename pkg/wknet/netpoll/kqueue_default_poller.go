@@ -50,6 +50,13 @@ func NewPoller(index int, name string) *Poller {
 
 // Polling blocks the current goroutine, waiting for network-events.
 func (p *Poller) Polling(callback func(fd int, event PollEvent) error) error {
+	return p.PollingWithSnapshot(nil, func(fd int, _ uint64, event PollEvent) error {
+		return callback(fd, event)
+	})
+}
+
+// PollingWithSnapshot 将下一批事件与调用前的连接注册代次绑定。
+func (p *Poller) PollingWithSnapshot(snapshot func() uint64, callback func(fd int, generation uint64, event PollEvent) error) error {
 	el := newEventList(InitPollEventsCap)
 	var (
 		ts  unix.Timespec // 超时
@@ -57,6 +64,10 @@ func (p *Poller) Polling(callback func(fd int, event PollEvent) error) error {
 	)
 	p.shutdown.Store(false)
 	for !p.shutdown.Load() {
+		var generation uint64
+		if snapshot != nil {
+			generation = snapshot()
+		}
 		n, err := unix.Kevent(p.fd, nil, el.events, tsp)
 
 		if n == 0 || (n < 0 && err == unix.EINTR) {
@@ -90,14 +101,14 @@ func (p *Poller) Polling(callback func(fd int, event PollEvent) error) error {
 					pollEvent = PollEventClose
 				}
 				if pollEvent != PollEventUnknown {
-					switch err = callback(fd, pollEvent); err {
+					switch err = callback(fd, generation, pollEvent); err {
 					case nil:
 					default:
 						p.Error("error occurs in event-loop", zap.Error(err))
 					}
 				}
 				if triggerWrite && !triggerHup {
-					switch err = callback(fd, PollEventWrite); err {
+					switch err = callback(fd, generation, PollEventWrite); err {
 					case nil:
 					default:
 						p.Error("error occurs in event-loop", zap.Error(err))

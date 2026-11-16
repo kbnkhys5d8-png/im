@@ -154,12 +154,13 @@ func (c *badFDReproConn) CloseWithErr(err error) error {
 
 func (c *badFDReproConn) closeWithPause(closeErr error) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	if c.closed.Load() {
+		c.mu.Unlock()
 		return nil
 	}
 	c.closed.Store(true)
+	c.cancelIdleLocked()
 
 	if closeErr != nil && !errors.Is(closeErr, syscall.ECONNRESET) {
 		if err := c.reactorSub.DeleteFd(c); err != nil {
@@ -168,10 +169,12 @@ func (c *badFDReproConn) closeWithPause(closeErr error) error {
 	}
 
 	_ = c.fd.Close()
-	c.eg.RemoveConn(c)
-	c.reactorSub.ConnDec()
-	c.eg.eventHandler.OnClose(c)
-	c.release()
+	if c.eg.removeConn(c) {
+		c.reactorSub.ConnDec()
+	}
+	_ = c.outboundBuffer.Release()
+	c.mu.Unlock()
+	c.finishClose(c)
 
 	if c.holdAfterRelease > 0 {
 		time.Sleep(c.holdAfterRelease)

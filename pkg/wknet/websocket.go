@@ -37,21 +37,23 @@ type WSConn struct {
 }
 
 func NewWSConn(d *DefaultConn) *WSConn {
-	w := &WSConn{
-		DefaultConn:      d,
-		tmpInboundBuffer: d.eg.eventHandler.OnNewInboundConn(d, d.eg),
-	}
-	return w
+	buffer := d.eg.eventHandler.OnNewInboundConn(d, d.eg)
+	d.temporaryInbound = append(d.temporaryInbound, buffer)
+	return &WSConn{DefaultConn: d, tmpInboundBuffer: buffer}
 }
 
 func (w *WSConn) ReadToInboundBuffer() (int, error) {
+	var n int
+	w.recvMu.Lock()
+	defer func() {
+		w.recvMu.Unlock()
+		w.reportRead(n)
+	}()
 	readBuffer := w.reactorSub.ReadBuffer
-	n, err := w.fd.Read(readBuffer)
+	var err error
+	n, err = w.readFD(readBuffer)
 	if err != nil || n == 0 {
 		return 0, err
-	}
-	if w.eg.options.Event.OnReadBytes != nil {
-		w.eg.options.Event.OnReadBytes(n)
 	}
 	_, err = w.tmpInboundBuffer.Write(readBuffer[:n])
 	if err != nil {
@@ -67,12 +69,18 @@ func (w *WSConn) ReadToInboundBuffer() (int, error) {
 func (w *WSConn) WriteServerBinary(data []byte) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.closed.Load() {
+		return net.ErrClosed
+	}
 	return wsutil.WriteServerBinary(w.outboundBuffer, data)
 }
 
 func (w *WSConn) WriteServerText(data []byte) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.closed.Load() {
+		return net.ErrClosed
+	}
 	return wsutil.WriteServerText(w.outboundBuffer, data)
 }
 
@@ -255,11 +263,6 @@ func (w *WSConn) DiscardFromTemp(n int) {
 	_, _ = w.tmpInboundBuffer.Discard(n)
 }
 
-func (w *WSConn) Close() error {
-	_ = w.tmpInboundBuffer.Release()
-	return w.DefaultConn.Close()
-}
-
 type readWrite struct {
 	io.Reader
 	io.Writer
@@ -273,20 +276,24 @@ type WSSConn struct {
 }
 
 func NewWSSConn(tlsConn *TLSConn) *WSSConn {
-	return &WSSConn{
-		TLSConn:            tlsConn,
-		wsTmpInboundBuffer: tlsConn.d.eg.eventHandler.OnNewInboundConn(tlsConn.d, tlsConn.d.eg), // tls解码后的数据
-	}
+	d := tlsConn.d
+	buffer := d.eg.eventHandler.OnNewInboundConn(d, d.eg)
+	d.temporaryInbound = append(d.temporaryInbound, buffer)
+	return &WSSConn{TLSConn: tlsConn, wsTmpInboundBuffer: buffer}
 }
 
 func (w *WSSConn) ReadToInboundBuffer() (int, error) {
+	var n int
+	w.d.recvMu.Lock()
+	defer func() {
+		w.d.recvMu.Unlock()
+		w.d.reportRead(n)
+	}()
 	readBuffer := w.d.reactorSub.ReadBuffer
-	n, err := w.d.fd.Read(readBuffer)
+	var err error
+	n, err = w.d.readFD(readBuffer)
 	if err != nil || n == 0 {
 		return 0, err
-	}
-	if w.d.eg.options.Event.OnReadBytes != nil {
-		w.d.eg.options.Event.OnReadBytes(n)
 	}
 
 	_, err = w.tmpInboundBuffer.Write(readBuffer[:n])
@@ -411,22 +418,29 @@ func (w *WSSConn) unpacketWSData() error {
 	return nil
 }
 
-func (w *WSSConn) Close() error {
-	w.upgraded = false
-	_ = w.wsTmpInboundBuffer.Release()
-	return w.TLSConn.Close()
-}
-
 func (w *WSSConn) WriteServerBinary(data []byte) error {
-	w.d.mu.Lock()
-	defer w.d.mu.Unlock()
-	return wsutil.WriteServerBinary(w.TLSConn, data)
+	if w.IsClosed() {
+		return net.ErrClosed
+	}
+	// 先组装完整 WS 帧，再交给 TLS；TLS 回写会自行取得发送锁。
+	var frame bytes.Buffer
+	if err := wsutil.WriteServerBinary(&frame, data); err != nil {
+		return err
+	}
+	_, err := w.TLSConn.Write(frame.Bytes())
+	return err
 }
 
 func (w *WSSConn) WriteServerText(data []byte) error {
-	w.d.mu.Lock()
-	defer w.d.mu.Unlock()
-	return wsutil.WriteServerText(w.TLSConn, data)
+	if w.IsClosed() {
+		return net.ErrClosed
+	}
+	var frame bytes.Buffer
+	if err := wsutil.WriteServerText(&frame, data); err != nil {
+		return err
+	}
+	_, err := w.TLSConn.Write(frame.Bytes())
+	return err
 }
 
 func (w *WSSConn) decode() ([]wsutil.Message, error) {
