@@ -93,6 +93,24 @@ func TestSearchQueryMissingAndOfflinePluginUseActualHTTPStatus(t *testing.T) {
 	})
 }
 
+func TestSearchGroupPurgeRouteIsPrivate(t *testing.T) {
+	server := newSearchQueryHTTPTestServer(t)
+	server.searchQueryGate = func(string, string) error {
+		t.Fatal("内部群清理不能进入通用插件转发")
+		return nil
+	}
+	router := wkhttp.New()
+	server.SetRoute(router)
+	for _, path := range []string{"/internal/group-purge", "/internal/group-purge-check"} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/plugins/"+searchSourcePluginNo+path, nil)
+		router.GetGinRoute().ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("private route HTTP status = %d", rec.Code)
+		}
+	}
+}
+
 func newSearchQueryHTTPTestServer(t *testing.T) *Server {
 	t.Helper()
 	root := t.TempDir()

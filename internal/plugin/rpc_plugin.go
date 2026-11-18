@@ -206,6 +206,10 @@ func (a *rpc) pluginHttpForward(c *wkrpc.Context) {
 		c.WriteErr(err)
 		return
 	}
+	if forwardReq.Request == nil || searchGroupPurgeInternalRoute(forwardReq.PluginNo, forwardReq.Request.Path) {
+		c.WriteErr(fmt.Errorf("plugin route is not available for forwarding"))
+		return
+	}
 
 	// ---------- 如果指定了节点，且不是本地节点，则转发到指定节点 ----------
 	if forwardReq.ToNodeId > 0 && !options.G.IsLocalNode(uint64(forwardReq.ToNodeId)) {

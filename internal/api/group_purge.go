@@ -1,6 +1,8 @@
 package api
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -10,6 +12,8 @@ import (
 
 	"github.com/WuKongIM/WuKongIM/internal/options"
 	"github.com/WuKongIM/WuKongIM/internal/service"
+	"github.com/WuKongIM/WuKongIM/internal/types"
+	"github.com/WuKongIM/WuKongIM/internal/types/pluginproto"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wkhttp"
 )
@@ -32,9 +36,28 @@ func (h *historyAPI) groupPurge(c *wkhttp.Context, checkOnly bool) {
 		c.AbortWithStatus(http.StatusBadRequest)
 		return
 	}
-	// 无在线插件不代表历史上没有外部副本，默认不启用。必须由部署方独立核对后显式确认。
-	if os.Getenv("WK_GROUP_PURGE_NO_EXTERNAL_SEARCH") != "verified" || os.Getenv("SEARCH_OPENSEARCH_URL") != "" ||
-		service.PluginManager == nil || len(options.G.Plugin.Install) != 0 || len(service.PluginManager.Plugins()) != 0 {
+	search := os.Getenv("WK_GROUP_PURGE_OPENSEARCH") == "verified"
+	noSearch := os.Getenv("WK_GROUP_PURGE_NO_EXTERNAL_SEARCH") == "verified"
+	// 无在线插件不等于历史没有副本，两种模式均须明确确认且不可同时开启。
+	if search == noSearch || service.PluginManager == nil {
+		c.AbortWithStatus(http.StatusConflict)
+		return
+	}
+	plugins := service.PluginManager.Plugins()
+	var searchPlugin types.Plugin
+	if search {
+		if options.G.Channel.CmdSuffix != "____cmd" || len(options.G.Plugin.Install) > 1 ||
+			len(plugins) != 1 || plugins[0].GetNo() != "wk.plugin.search" ||
+			plugins[0].Status() != types.PluginStatusNormal {
+			c.AbortWithStatus(http.StatusConflict)
+			return
+		}
+		searchPlugin = plugins[0]
+		if err := requestGroupSearchPurge(c.Request.Context(), searchPlugin, req.Group, true); err != nil {
+			c.AbortWithStatus(http.StatusConflict)
+			return
+		}
+	} else if os.Getenv("SEARCH_OPENSEARCH_URL") != "" || len(options.G.Plugin.Install) != 0 || len(plugins) != 0 {
 		c.AbortWithStatus(http.StatusConflict)
 		return
 	}
@@ -47,5 +70,41 @@ func (h *historyAPI) groupPurge(c *wkhttp.Context, checkOnly bool) {
 		c.AbortWithStatus(http.StatusServiceUnavailable)
 		return
 	}
-	c.JSON(http.StatusOK, map[string]any{"group_no": req.Group, "protocol": 1, "checked": checkOnly, "purged": !checkOnly})
+	if search && !checkOnly {
+		if err := requestGroupSearchPurge(c.Request.Context(), searchPlugin, req.Group, false); err != nil {
+			// IM 已清理。索引尚未核实，保留原任务，不能用预检拒绝回执撤销预约。
+			c.AbortWithStatus(http.StatusServiceUnavailable)
+			return
+		}
+	}
+	c.JSON(http.StatusOK, map[string]any{"group_no": req.Group, "protocol": 1, "checked": checkOnly, "purged": !checkOnly,
+		"search_enabled": search, "search_verified": search && !checkOnly})
+}
+
+func requestGroupSearchPurge(ctx context.Context, plugin types.Plugin, id string, check bool) error {
+	path := "/internal/group-purge"
+	if check {
+		path += "-check"
+	}
+	body, err := json.Marshal(map[string]string{"group_no": id})
+	if err != nil {
+		return err
+	}
+	reply, err := plugin.Route(ctx, &pluginproto.HttpRequest{Path: path, Method: http.MethodPost, Body: body})
+	if err != nil || reply == nil || reply.Status != http.StatusOK || len(reply.Body) > 1024 {
+		return errors.New("group search purge was not confirmed")
+	}
+	var proof struct {
+		ID       string `json:"group_no"`
+		Protocol int    `json:"protocol"`
+		Checked  *bool  `json:"checked"`
+		Empty    *bool  `json:"verified_empty"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(reply.Body))
+	dec.DisallowUnknownFields()
+	if dec.Decode(&proof) != nil || dec.Decode(new(any)) != io.EOF || proof.ID != id || proof.Protocol != 1 ||
+		proof.Checked == nil || *proof.Checked != check || proof.Empty == nil || *proof.Empty == check {
+		return errors.New("invalid group search purge receipt")
+	}
+	return nil
 }

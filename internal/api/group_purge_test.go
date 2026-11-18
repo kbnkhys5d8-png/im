@@ -1,11 +1,15 @@
 package api
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
 	"testing"
 
 	"github.com/WuKongIM/WuKongIM/internal/options"
 	"github.com/WuKongIM/WuKongIM/internal/service"
 	"github.com/WuKongIM/WuKongIM/internal/types"
+	"github.com/WuKongIM/WuKongIM/internal/types/pluginproto"
 	rafttypes "github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
@@ -19,6 +23,64 @@ func (s *historyAPISlot) ProposeUntilApplied(_ uint32, data []byte) (*rafttypes.
 type groupPurgeTestPlugins struct{ service.IPluginManager }
 
 func (groupPurgeTestPlugins) Plugins(...types.PluginMethod) []types.Plugin { return nil }
+
+type groupSearchTestManager struct {
+	service.IPluginManager
+	search types.Plugin
+}
+
+func (s groupSearchTestManager) Plugins(...types.PluginMethod) []types.Plugin {
+	return []types.Plugin{s.search}
+}
+
+type groupSearchTestPlugin struct {
+	types.Plugin
+	executeOK bool
+}
+
+func (*groupSearchTestPlugin) GetNo() string              { return "wk.plugin.search" }
+func (*groupSearchTestPlugin) Status() types.PluginStatus { return types.PluginStatusNormal }
+func (p *groupSearchTestPlugin) Route(_ context.Context, req *pluginproto.HttpRequest) (*pluginproto.HttpResponse, error) {
+	check := req.Path == "/internal/group-purge-check"
+	if !check && !p.executeOK {
+		return &pluginproto.HttpResponse{Status: http.StatusServiceUnavailable}, nil
+	}
+	var request struct {
+		Group string `json:"group_no"`
+	}
+	if err := json.Unmarshal(req.Body, &request); err != nil {
+		return nil, err
+	}
+	body, err := json.Marshal(map[string]any{"group_no": request.Group, "checked": check, "protocol": 1, "verified_empty": !check})
+	return &pluginproto.HttpResponse{Status: http.StatusOK, Body: body}, err
+}
+
+func TestGroupPurgeOpenSearchFailureRequiresSameGroupRetry(t *testing.T) {
+	r, db, _ := historyAPIFixture(t)
+	old := service.PluginManager
+	plugin := &groupSearchTestPlugin{}
+	service.PluginManager = groupSearchTestManager{search: plugin}
+	t.Cleanup(func() { service.PluginManager = old })
+	t.Setenv("WK_GROUP_PURGE_OPENSEARCH", "verified")
+	t.Setenv("WK_GROUP_PURGE_NO_EXTERNAL_SEARCH", "")
+	const group = "synthetic-search"
+	const kind = wkproto.ChannelTypeGroup
+	require.NoError(t, db.AppendMessages(group, kind, []wkdb.Message{{RecvPacket: wkproto.RecvPacket{
+		ChannelID: group, ChannelType: kind, MessageID: 555, MessageSeq: 1, Payload: []byte("synthetic"),
+	}}}))
+	request := map[string]string{"group_no": group}
+	check := historyLocalHTTP(r, "/history/group-purge/check", request)
+	require.Equal(t, 200, check.Code, check.Body.String())
+	require.Contains(t, check.Body.String(), `"search_enabled":true`)
+	result := historyLocalHTTP(r, "/history/group-purge", request)
+	require.Equal(t, 503, result.Code, result.Body.String())
+	_, err := db.LoadMsg(group, kind, 1)
+	require.ErrorIs(t, err, wkdb.ErrNotFound)
+	plugin.executeOK = true
+	result = historyLocalHTTP(r, "/history/group-purge", request)
+	require.Equal(t, 200, result.Code, result.Body.String())
+	require.Contains(t, result.Body.String(), `"search_verified":true`)
+}
 
 func TestGroupPurgeLocalEndpointPreflightAndDelete(t *testing.T) {
 	r, db, _ := historyAPIFixture(t)

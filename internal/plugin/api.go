@@ -106,6 +106,11 @@ func (s *Server) handleGetPlugins(c *wkhttp.Context) {
 func (s *Server) handlePluginRoute(c *wkhttp.Context) {
 	pluginNo := c.Param("plugin")
 	pluginPath := c.Param("path")
+	// 删除索引仅由已核验的 IM 群删除流程直接调用，不经通用插件路由暴露。
+	if searchGroupPurgeInternalRoute(pluginNo, pluginPath) {
+		c.Status(http.StatusNotFound)
+		return
+	}
 	isSearchQuery := pluginNo == searchSourcePluginNo && pluginPath == searchQueryPluginPath
 	if s.searchQueryGate == nil || s.searchQueryGate(pluginNo, pluginPath) != nil {
 		if isSearchQuery {
@@ -205,6 +210,10 @@ func (s *Server) handlePluginRoute(c *wkhttp.Context) {
 	if err != nil {
 		s.Error("write response error", zap.Error(err), zap.String("plugin", pluginNo), zap.String("path", pluginPath))
 	}
+}
+
+func searchGroupPurgeInternalRoute(pluginNo, path string) bool {
+	return pluginNo == searchSourcePluginNo && strings.HasPrefix(path, "/internal/group-purge")
 }
 
 func (s *Server) handleUpdatePluginConfig(c *wkhttp.Context) {
