@@ -13,6 +13,11 @@ import (
 
 func (wk *wukongDB) AddOrUpdateConversations(conversations []Conversation) error {
 	wk.metrics.AddOrUpdateConversationsAdd(1)
+	conversations, unlock, err := wk.filterGroupPurgeConversations(conversations)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 
 	if len(conversations) == 0 {
 		return nil
@@ -61,7 +66,7 @@ func (wk *wukongDB) AddOrUpdateConversations(conversations []Conversation) error
 		}
 	}
 
-	err := wk.setConversationLocalUserRelation(conversations, false)
+	err = wk.setConversationLocalUserRelation(conversations, false)
 	if err != nil {
 		return err
 	}
@@ -85,6 +90,11 @@ func (wk *wukongDB) AddOrUpdateConversations(conversations []Conversation) error
 }
 
 func (wk *wukongDB) AddOrUpdateConversationsBatchIfNotExist(conversations []Conversation) error {
+	conversations, unlock, err := wk.filterGroupPurgeConversations(conversations)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	if len(conversations) == 0 {
 		return nil
 	}
@@ -130,7 +140,7 @@ func (wk *wukongDB) AddOrUpdateConversationsBatchIfNotExist(conversations []Conv
 		batchs = append(batchs, batch)
 	}
 
-	err := Commits(batchs)
+	err = Commits(batchs)
 	if err != nil {
 		wk.Error("commits failed", zap.Error(err))
 		return err
@@ -144,6 +154,11 @@ func (wk *wukongDB) AddOrUpdateConversationsBatchIfNotExist(conversations []Conv
 
 func (wk *wukongDB) AddOrUpdateConversationsWithUser(uid string, conversations []Conversation) error {
 	wk.metrics.AddOrUpdateConversationsAdd(1)
+	conversations, unlock, err := wk.filterGroupPurgeConversations(conversations)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 
 	// 防御性检查：如果 uid 为空，记录警告并返回
 	if uid == "" {
@@ -193,7 +208,7 @@ func (wk *wukongDB) AddOrUpdateConversationsWithUser(uid string, conversations [
 		}
 	}
 
-	err := wk.setConversationLocalUserRelation(conversations, false)
+	err = wk.setConversationLocalUserRelation(conversations, false)
 	if err != nil {
 		return err
 	}

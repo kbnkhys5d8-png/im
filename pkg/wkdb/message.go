@@ -26,6 +26,17 @@ func (wk *wukongDB) AppendMessagesForRaft(channelId string, channelType uint8, m
 
 func (wk *wukongDB) appendMessages(channelId string, channelType uint8, msgs []Message, replay bool) error {
 	var frozen bool
+	if channelType == wkproto.ChannelTypeGroup {
+		unlock := wk.historyFenceLocks.acquire(channelId, false)
+		defer unlock()
+		purged, err := wk.GroupMessagesPurged(channelId)
+		if err != nil {
+			return err
+		}
+		if purged {
+			return ErrGroupMessagesPurged
+		}
+	}
 	if channelType == 1 {
 		unlock := wk.historyFenceLocks.acquire(channelId, false)
 		defer unlock()

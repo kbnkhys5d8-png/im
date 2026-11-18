@@ -1270,3 +1270,16 @@ func NewMessageEventSeqKey(channelId string, channelType uint8, clientMsgNo stri
 	binary.BigEndian.PutUint64(key[12:], HashWithString(clientMsgNo))
 	return key
 }
+
+// MessageEventChannelPrefixes 覆盖频道内的快照、序列和旧版事件索引。
+func MessageEventChannelPrefixes(channelID string, channelType uint8) [][]byte {
+	const channelPrefixLength = 4 + 8
+	const eventIndexPrefixLength = 6 + 8
+	return [][]byte{
+		NewMessageEventStateKey(channelID, channelType, "", "")[:channelPrefixLength],
+		NewMessageEventSeqKey(channelID, channelType, "")[:channelPrefixLength],
+		NewMessageEventClientSeqKey(channelID, channelType, "", 0)[:eventIndexPrefixLength],
+		NewMessageEventKeySeqKey(channelID, channelType, "", "", 0)[:eventIndexPrefixLength],
+		NewMessageEventIDIndexKey(channelID, channelType, "", "")[:eventIndexPrefixLength],
+	}
+}

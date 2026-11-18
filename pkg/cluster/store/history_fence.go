@@ -102,6 +102,15 @@ func (s *Store) historyFence(channel string, kind uint8) (*wkdb.HistoryFence, er
 }
 
 func (s *Store) historyWritable(channel string, kind uint8) error {
+	if kind == wkproto.ChannelTypeGroup {
+		purged, err := s.GroupMessagesPurged(channel)
+		if err != nil {
+			return err
+		}
+		if purged {
+			return wkdb.ErrGroupMessagesPurged
+		}
+	}
 	fence, err := s.historyFence(channel, kind)
 	if err != nil {
 		return err

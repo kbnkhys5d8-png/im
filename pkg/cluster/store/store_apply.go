@@ -2,11 +2,13 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
+	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"go.uber.org/zap"
 )
 
@@ -622,7 +624,22 @@ func (s *Store) handleAppendMessageEvent(cmd *CMD) error {
 	if err != nil {
 		return err
 	}
+	if event.ChannelType == wkproto.ChannelTypeGroup {
+		unlock, err := s.lockGroupStreamApply(context.Background(), event.ChannelId)
+		if err != nil {
+			return err
+		}
+		defer unlock()
+		purged, err := s.GroupMessagesPurged(event.ChannelId)
+		if err != nil || purged {
+			return err
+		}
+	}
 	_, _, err = s.wdb.AppendMessageEventWithState(event)
+	if errors.Is(err, wkdb.ErrGroupMessagesPurged) {
+		// 群已清理时跳过迟到事件，避免阻断整个槽的后续日志应用。
+		return nil
+	}
 	return err
 }
 

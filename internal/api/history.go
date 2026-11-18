@@ -50,6 +50,8 @@ func (h *historyAPI) route(r *wkhttp.WKHttp) {
 	r.POST("/history/preflight", h.preflight)
 	r.POST("/history/fence/release", h.release)
 	r.POST("/history/conversations/cleanup", h.cleanupConversations)
+	r.POST("/history/group-purge/check", h.groupPurgeCheck)
+	r.POST("/history/group-purge", h.groupPurgeExecute)
 }
 
 func (h *historyAPI) capabilities(c *wkhttp.Context) {

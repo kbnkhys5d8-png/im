@@ -134,7 +134,18 @@ func (c *ConversationManager) GetUserChannelsFromCache(uid string, conversationT
 	var allChannels []wkproto.Channel
 	for _, updater := range c.updaters {
 		channels := updater.getUserChannels(uid, conversationType)
-		allChannels = append(allChannels, channels...)
+		for _, channel := range channels {
+			if channel.ChannelType == wkproto.ChannelTypeGroup && service.Store != nil {
+				purged, err := service.Store.GroupMessagesPurged(channel.ChannelID)
+				if err != nil {
+					return nil, err
+				}
+				if purged {
+					continue
+				}
+			}
+			allChannels = append(allChannels, channel)
+		}
 	}
 	return allChannels, nil
 }

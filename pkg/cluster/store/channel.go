@@ -1,12 +1,22 @@
 package store
 
-import "github.com/WuKongIM/WuKongIM/pkg/wkdb"
+import (
+	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
+	wkproto "github.com/WuKongIM/WuKongIMGoProto"
+)
 
 // AddSubscribers 添加订阅者
 func (s *Store) AddSubscribers(channelId string, channelType uint8, subscribers []wkdb.Member) error {
 
 	if len(subscribers) == 0 {
 		return nil
+	}
+	if channelType == wkproto.ChannelTypeGroup {
+		unlock := s.historyReadLock(channelId, channelType)
+		defer unlock()
+		if err := s.historyWritable(channelId, channelType); err != nil {
+			return err
+		}
 	}
 
 	data := EncodeMembers(channelId, channelType, subscribers)
@@ -60,6 +70,13 @@ func (s *Store) GetSubscribers(channelID string, channelType uint8) ([]wkdb.Memb
 
 // AddOrUpdateChannel add or update channel
 func (s *Store) AddChannelInfo(channelInfo wkdb.ChannelInfo) error {
+	if channelInfo.ChannelType == wkproto.ChannelTypeGroup && !channelInfo.Disband {
+		unlock := s.historyConfigLock(channelInfo.ChannelId, channelInfo.ChannelType)
+		defer unlock()
+		if err := s.historyWritable(channelInfo.ChannelId, channelInfo.ChannelType); err != nil {
+			return err
+		}
+	}
 	data, err := EncodeChannelInfo(channelInfo, CmdVersionChannelInfo)
 	if err != nil {
 		return err
@@ -75,6 +92,13 @@ func (s *Store) AddChannelInfo(channelInfo wkdb.ChannelInfo) error {
 }
 
 func (s *Store) UpdateChannelInfo(channelInfo wkdb.ChannelInfo) error {
+	if channelInfo.ChannelType == wkproto.ChannelTypeGroup && !channelInfo.Disband {
+		unlock := s.historyConfigLock(channelInfo.ChannelId, channelInfo.ChannelType)
+		defer unlock()
+		if err := s.historyWritable(channelInfo.ChannelId, channelInfo.ChannelType); err != nil {
+			return err
+		}
+	}
 	data, err := EncodeChannelInfo(channelInfo, CmdVersionChannelInfo)
 	if err != nil {
 		return err

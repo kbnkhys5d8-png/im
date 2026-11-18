@@ -324,6 +324,9 @@ func (w *Webhook) AppendMessageOfNotifyQueue(messages []wkdb.Message) error {
 		if w.isStopping() {
 			return errors.New("webhook is stopping")
 		}
+		if purgedGroupNotification(msg) {
+			continue
+		}
 		data, err := msg.Marshal()
 		if err != nil {
 			return err
@@ -403,6 +406,16 @@ func (w *Webhook) notifyQueueLoop() {
 // 暂停人工核验不等于投递成功；只有远端确认才返回 allSucceeded=true。
 // retryableMessages 也保留归档失败的消息，此时背压等待存储恢复，不继续请求远端。
 func (w *Webhook) pushMessages(messages []wkdb.Message, errMessageIDMap map[int64]int) (allSucceeded bool, retryableMessages []wkdb.Message) {
+	// 只停止已永久清理群的迟到通知；其他群和私聊仍沿用原批次及重试。
+	eligible := messages[:0]
+	for _, msg := range messages {
+		if purgedGroupNotification(msg) {
+			delete(errMessageIDMap, msg.MessageID)
+			continue
+		}
+		eligible = append(eligible, msg)
+	}
+	messages = eligible
 	if len(messages) == 0 {
 		return true, nil
 	}
@@ -436,6 +449,15 @@ func (w *Webhook) pushMessages(messages []wkdb.Message, errMessageIDMap map[int6
 	retryableMessages = append(normalRetryable, agentRetryable...)
 
 	return normalOK && agentOK, retryableMessages
+}
+
+func purgedGroupNotification(msg wkdb.Message) bool {
+	if msg.ChannelType != wkproto.ChannelTypeGroup || service.Store == nil {
+		return false
+	}
+	purged, err := service.Store.GroupMessagesPurged(msg.ChannelID)
+	// 读取失败不丢通知；API 落库仍有独立门禁。
+	return err == nil && purged
 }
 
 // groupMessagesByType 将消息按类型分组

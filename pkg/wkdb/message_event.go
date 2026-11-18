@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb/key"
+	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"github.com/cockroachdb/pebble"
 )
 
@@ -101,6 +102,18 @@ func (wk *wukongDB) AppendMessageEventWithState(event *MessageEvent) (*MessageEv
 		event.OccurredAt = time.Now().UnixMilli()
 	}
 
+	if event.ChannelType == wkproto.ChannelTypeGroup {
+		// Raft 的迟到应用也不能绕过群删除，与流式历史检查共用锁。
+		unlock := wk.historyFenceLocks.acquire(event.ChannelId, false)
+		defer unlock()
+		purged, err := wk.GroupMessagesPurged(event.ChannelId)
+		if err != nil {
+			return nil, nil, err
+		}
+		if purged {
+			return nil, nil, ErrGroupMessagesPurged
+		}
+	}
 	lockKey := "message_event:" + event.ClientMsgNo
 	wk.dblock.userLock.Lock(lockKey)
 	defer wk.dblock.userLock.Unlock(lockKey)

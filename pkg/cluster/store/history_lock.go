@@ -52,7 +52,7 @@ func (t *historyLockTable) release(key historyLockKey, entry *historyChannelLock
 }
 
 func (s *Store) historyKey(channel string, kind uint8) historyLockKey {
-	if kind == 1 && s.opts.HistorySourceChannel != nil {
+	if (kind == 1 || kind == 2) && s.opts.HistorySourceChannel != nil {
 		channel = s.opts.HistorySourceChannel(channel)
 	}
 	return historyLockKey{channel: channel, kind: kind}
