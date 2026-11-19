@@ -4,6 +4,7 @@ package netpoll
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"runtime"
 	"strings"
@@ -175,6 +176,52 @@ func TestPollerCloseInsideReadCallback(t *testing.T) {
 		t.Fatalf("callback Close must suppress the same event's later write callback: %v", events)
 	}
 	assertPollerFDsClosed(t, p)
+}
+
+func TestPollerOrdinaryReadInterest(t *testing.T) {
+	p := NewPoller(0, t.Name())
+	defer p.Close()
+	sockets, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(sockets[0])
+	defer unix.Close(sockets[1])
+
+	// 检查内核实际登记的掩码，覆盖添加写监听及恢复只读的路径。
+	const mask = unix.EPOLLIN | unix.EPOLLOUT | unix.EPOLLPRI
+	for _, step := range []struct {
+		name string
+		set  func(int) error
+		want uint32
+	}{
+		{"read", p.AddRead, unix.EPOLLIN},
+		{"read-write", p.AddWrite, unix.EPOLLIN | unix.EPOLLOUT},
+		{"read-again", p.DeleteWrite, unix.EPOLLIN},
+	} {
+		if err := step.set(sockets[0]); err != nil {
+			t.Fatalf("%s: %v", step.name, err)
+		}
+		info, err := os.ReadFile(fmt.Sprintf("/proc/self/fdinfo/%d", p.fd))
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, line := range strings.Split(string(info), "\n") {
+			var fd int
+			var events uint32
+			if n, _ := fmt.Sscanf(line, "tfd: %d events: %x", &fd, &events); n == 2 && fd == sockets[0] {
+				found = true
+				if events&mask != step.want {
+					t.Errorf("%s: kernel interest = %#x, want %#x (read/write/priority bits)", step.name, events&mask, step.want)
+				}
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("%s: socket missing from the kernel interest list", step.name)
+		}
+	}
 }
 
 func TestPollerReadAndWriteCallbacks(t *testing.T) {

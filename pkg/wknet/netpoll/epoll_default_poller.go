@@ -151,7 +151,8 @@ func (p *Poller) Polling(callback func(fd int, event PollEvent) error) (retErr e
 }
 
 const (
-	readEvents      = unix.EPOLLPRI | unix.EPOLLIN
+	// 普通读不消费优先事件，订阅它会在没有普通数据时反复唤醒。
+	readEvents      = unix.EPOLLIN
 	writeEvents     = unix.EPOLLOUT
 	readWriteEvents = readEvents | writeEvents
 	errorEvents     = unix.EPOLLERR | unix.EPOLLHUP | unix.EPOLLRDHUP
