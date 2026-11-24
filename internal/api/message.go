@@ -293,8 +293,9 @@ func sendMessageToChannel(req messageSendReq, channelId string, channelType uint
 			PreStart: time.Now(),
 		},
 	}
-	eventbus.Channel.SendMessage(fakeChannelId, channelType, event)
+	// 入队后事件由消费方接管，开始轨迹必须在交接前记录。
 	event.Track.Record(track.PositionStart)
+	eventbus.Channel.SendMessage(fakeChannelId, channelType, event)
 	eventbus.Channel.Advance(fakeChannelId, channelType)
 
 	return messageId, nil
