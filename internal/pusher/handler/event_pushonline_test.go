@@ -8,9 +8,49 @@ import (
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
 	"github.com/WuKongIM/WuKongIM/internal/options"
+	"github.com/WuKongIM/WuKongIM/internal/service"
+	"github.com/WuKongIM/WuKongIM/internal/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 )
+
+func TestSetupRetryKeepsOriginalConnectionSession(t *testing.T) {
+	previous := service.RetryManager
+	t.Cleanup(func() { service.RetryManager = previous })
+	for _, version := range []uint8{3, 4, 5} {
+		t.Run(fmt.Sprintf("protocol-%d", version), func(t *testing.T) {
+			probe := &pushRetrySessionProbe{}
+			service.RetryManager = probe
+			conn := pushTestConn("receiver", 8, "original-session")
+			conn.ProtoVersion = version
+			packet := &wkproto.RecvPacket{MessageID: 10, MessageSeq: 20, Payload: []byte("ciphertext")}
+			(&Handler{}).setupRetryIfNeeded(packet, "group", wkproto.ChannelTypeGroup, conn, 10)
+			if len(probe.messages) != 1 {
+				t.Fatal("持久化消息必须保留原重试登记")
+			}
+			msg := probe.messages[0]
+			conn.SessionId = "replacement-session"
+			if msg.SessionId != "original-session" || msg.RecvPacket != packet || msg.MessageId != 10 ||
+				msg.Uid != "receiver" || msg.ConnId != 8 || msg.FromNode != conn.NodeId {
+				t.Fatal("重试必须快照原会话，保持原包和目标身份不变")
+			}
+			packet.NoPersist = true
+			(&Handler{}).setupRetryIfNeeded(packet, "group", wkproto.ChannelTypeGroup, conn, 10)
+			if len(probe.messages) != 1 {
+				t.Fatal("不持久化消息仍不得新增重试")
+			}
+		})
+	}
+}
+
+type pushRetrySessionProbe struct {
+	service.RetryMgr
+	messages []*types.RetryMessage
+}
+
+func (p *pushRetrySessionProbe) AddRetry(msg *types.RetryMessage) {
+	p.messages = append(p.messages, msg)
+}
 
 func TestProcessChannelPushTargetSessions(t *testing.T) {
 	for _, frameName := range []string{"消息", "事件"} {

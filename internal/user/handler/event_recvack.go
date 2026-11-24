@@ -26,7 +26,7 @@ func (h *Handler) recvack(event *eventbus.Event) {
 		return
 	}
 
-	currMsg := service.RetryManager.AcknowledgeRetry(conn.Uid, conn.NodeId, conn.ConnId, recvackPacket.MessageID, recvackPacket.MessageSeq)
+	currMsg := service.RetryManager.AcknowledgeRetry(conn.Uid, conn.NodeId, conn.ConnId, recvackPacket.MessageID, recvackPacket.MessageSeq, conn.SessionId)
 	if seq := acknowledgedCommandSeq(conn, currMsg); seq != 0 {
 		err := service.Store.AdvanceCommandSyncCursorOnRecvack(currMsg.Uid, currMsg.ChannelId, currMsg.ChannelType, seq)
 		if err != nil {

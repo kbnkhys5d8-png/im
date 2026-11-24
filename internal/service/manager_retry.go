@@ -12,7 +12,7 @@ type RetryMgr interface {
 	// RemoveRetry 移除重试消息
 	RemoveRetry(fromNode uint64, connId int64, messageId int64) error
 	// AcknowledgeRetry 核对收件连接与服务端原始消息后，原子地移除重试任务。
-	AcknowledgeRetry(uid string, fromNode uint64, connId int64, messageId int64, messageSeq uint32) *types.RetryMessage
+	AcknowledgeRetry(uid string, fromNode uint64, connId int64, messageId int64, messageSeq uint32, sessionId string) *types.RetryMessage
 	// 获取重试消息
 	RetryMessage(fromNode uint64, connId int64, messageId int64) *types.RetryMessage
 }

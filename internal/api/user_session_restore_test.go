@@ -76,7 +76,7 @@ type restoreRetryProbe struct {
 	removed int
 }
 
-func (r *restoreRetryProbe) AcknowledgeRetry(uid string, nodeId uint64, connId, messageId int64, seq uint32) *types.RetryMessage {
+func (r *restoreRetryProbe) AcknowledgeRetry(uid string, nodeId uint64, connId, messageId int64, seq uint32, sessionId string) *types.RetryMessage {
 	r.removed++
 	return &types.RetryMessage{Uid: uid, FromNode: nodeId, ConnId: connId, MessageId: messageId,
 		RecvPacket: &wkproto.RecvPacket{MessageID: messageId, MessageSeq: seq}}

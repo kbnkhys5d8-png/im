@@ -118,6 +118,7 @@ type RetryMessage struct {
 	Uid         string              // 用户id
 	FromNode    uint64              // 来源节点
 	ConnId      int64               // 需要接受的连接id
+	SessionId   string              // 原下行包所属的会话代次，仅用于进程内重试校验
 	MessageId   int64               // 消息id
 	Retry       int                 // 重试次数
 	Index       int                 //在切片中的索引值

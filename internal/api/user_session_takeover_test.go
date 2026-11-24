@@ -26,7 +26,7 @@ type takeoverRetry struct {
 	acks atomic.Int32
 }
 
-func (r *takeoverRetry) AcknowledgeRetry(uid string, nodeId uint64, connId, messageId int64, seq uint32) *types.RetryMessage {
+func (r *takeoverRetry) AcknowledgeRetry(uid string, nodeId uint64, connId, messageId int64, seq uint32, sessionId string) *types.RetryMessage {
 	r.acks.Add(1)
 	return &types.RetryMessage{Uid: uid, FromNode: nodeId, ConnId: connId, MessageId: messageId,
 		RecvPacket: &wkproto.RecvPacket{MessageID: messageId, MessageSeq: seq}}

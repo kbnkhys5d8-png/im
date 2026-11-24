@@ -20,7 +20,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func startConnectionFollowupTestServer(t *testing.T) (*Server, string) {
+func startConnectionFollowupTestServer(t *testing.T, extra ...options.Option) (*Server, string) {
 	t.Helper()
 	httpAddr := fmt.Sprintf("127.0.0.1:%d", getFreePort(t))
 	clusterAddr := fmt.Sprintf("tcp://127.0.0.1:%d", getFreePort(t))
@@ -39,6 +39,7 @@ func startConnectionFollowupTestServer(t *testing.T) (*Server, string) {
 		options.WithClusterServerAddr(clusterAddr),
 		options.WithClusterAPIURL("http://"+httpAddr),
 		func(o *options.Options) { o.Plugin.SocketPath = filepath.Join(socketDir, "plugin.sock") },
+		options.WithOpts(extra...),
 	)
 	require.NoError(t, s.Start())
 	t.Cleanup(s.StopNoErr)

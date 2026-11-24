@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/RussellLuo/timingwheel"
+	"github.com/WuKongIM/WuKongIM/internal/eventbus"
 	"github.com/WuKongIM/WuKongIM/internal/options"
 	"github.com/WuKongIM/WuKongIM/internal/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
@@ -42,17 +43,35 @@ func NewRetryQueue(index int, r *RetryManager) *RetryQueue {
 
 func (r *RetryQueue) startInFlightTimeout(msg *types.RetryMessage) {
 	key := r.getInFlightKey(msg.FromNode, msg.ConnId, msg.MessageId)
-	r.inFlightMutex.Lock()
-	if r.inFlightMessages[key] != nil {
+	for {
+		r.inFlightMutex.Lock()
+		previous := r.inFlightMessages[key]
+		if previous == nil {
+			break
+		}
 		r.inFlightMutex.Unlock()
-		r.Warn("ID already in flight",
-			zap.String("key", key),
-			zap.String("uid", msg.Uid),
-			zap.Uint64("fromNode", msg.FromNode),
-			zap.Int64("connId", msg.ConnId),
-			zap.Int64("messageId", msg.MessageId),
-		)
-		return
+		if previous.SessionId == msg.SessionId {
+			r.Warn("ID already in flight",
+				zap.String("key", key),
+				zap.String("uid", msg.Uid),
+				zap.Uint64("fromNode", msg.FromNode),
+				zap.Int64("connId", msg.ConnId),
+				zap.Int64("messageId", msg.MessageId),
+			)
+			return
+		}
+		// 目录查询不持有队列锁；只有仍有效的新会话才可替换旧任务。
+		conn := eventbus.User.ConnById(msg.Uid, msg.FromNode, msg.ConnId)
+		if conn == nil || conn.SessionId != msg.SessionId {
+			return
+		}
+		r.inFlightMutex.Lock()
+		if r.inFlightMessages[key] != previous {
+			r.inFlightMutex.Unlock()
+			continue
+		}
+		r.removeInFlightMessageLocked(key, previous)
+		break
 	}
 	// 表和堆一起登记，避免回执移除了表项后仍留下堆项。
 	r.inFlightMessages[key] = msg

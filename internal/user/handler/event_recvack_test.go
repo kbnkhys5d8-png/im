@@ -49,11 +49,11 @@ func TestRecvackOnlyUsesMatchedDownlinkForCommandCursor(t *testing.T) {
 	codec := wkproto.New()
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			conn := &eventbus.Conn{Uid: "ack-recipient", NodeId: 2, ConnId: 3, ProtoVersion: tc.proto}
+			conn := &eventbus.Conn{Uid: "ack-recipient", NodeId: 2, ConnId: 3, ProtoVersion: tc.proto, SessionId: "server-session"}
 			if tc.master {
 				conn.DeviceLevel = wkproto.DeviceLevelMaster
 			}
-			msg := &types.RetryMessage{Uid: conn.Uid, FromNode: conn.NodeId, ConnId: conn.ConnId, MessageId: 10,
+			msg := &types.RetryMessage{Uid: conn.Uid, FromNode: conn.NodeId, ConnId: conn.ConnId, MessageId: 10, SessionId: conn.SessionId,
 				ChannelId: "receipt-channel", ChannelType: wkproto.ChannelTypeGroup,
 				RecvPacket: &wkproto.RecvPacket{Framer: wkproto.Framer{SyncOnce: tc.downlinkSync}, MessageID: 10, MessageSeq: 19}}
 			retry := &recvackRetryProbe{pending: msg}
@@ -96,11 +96,11 @@ type recvackRetryProbe struct {
 	calls   int
 }
 
-func (p *recvackRetryProbe) AcknowledgeRetry(uid string, nodeId uint64, connId, messageId int64, seq uint32) *types.RetryMessage {
+func (p *recvackRetryProbe) AcknowledgeRetry(uid string, nodeId uint64, connId, messageId int64, seq uint32, sessionId string) *types.RetryMessage {
 	p.calls++
 	msg := p.pending
 	if msg == nil || msg.Uid != uid || msg.FromNode != nodeId ||
-		msg.ConnId != connId || msg.MessageId != messageId || msg.RecvPacket.MessageSeq != seq {
+		msg.ConnId != connId || msg.MessageId != messageId || msg.RecvPacket.MessageSeq != seq || msg.SessionId != sessionId {
 		return nil
 	}
 	p.pending = nil

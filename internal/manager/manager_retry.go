@@ -69,7 +69,7 @@ func (r *RetryManager) RemoveRetry(fromNode uint64, connId int64, messageId int6
 }
 
 // AcknowledgeRetry 在同一次加锁中验证和移除，防止重复或过期回执删除另一条任务。
-func (r *RetryManager) AcknowledgeRetry(uid string, fromNode uint64, connId int64, messageId int64, messageSeq uint32) *types.RetryMessage {
+func (r *RetryManager) AcknowledgeRetry(uid string, fromNode uint64, connId int64, messageId int64, messageSeq uint32, sessionId string) *types.RetryMessage {
 	q := r.queueForMessage(messageId)
 	if q == nil || uid == "" || messageSeq == 0 {
 		return nil
@@ -78,7 +78,7 @@ func (r *RetryManager) AcknowledgeRetry(uid string, fromNode uint64, connId int6
 	q.inFlightMutex.Lock()
 	defer q.inFlightMutex.Unlock()
 	msg := q.inFlightMessages[key]
-	if msg == nil || msg.Uid != uid || msg.RecvPacket == nil ||
+	if msg == nil || msg.Uid != uid || msg.SessionId != sessionId || msg.RecvPacket == nil ||
 		msg.RecvPacket.NoPersist || msg.RecvPacket.MessageID != messageId || msg.RecvPacket.MessageSeq != messageSeq {
 		return nil
 	}
@@ -109,24 +109,9 @@ func (r *RetryManager) retry(q *RetryQueue, msg *types.RetryMessage, retryCount 
 		zap.Int64("messageId", msg.MessageId),
 		zap.Int64("connId", msg.ConnId),
 	)
-	if retryCount > options.G.MessageRetry.MaxCount {
-		if !q.completeRetry(msg, false) {
-			return
-		}
-		r.Warn("exceeded the maximum number of retries", zap.String("uid", msg.Uid), zap.String("channelId", msg.ChannelId), zap.Uint8("channelType", msg.ChannelType), zap.Int64("messageId", msg.MessageId), zap.Int("messageMaxRetryCount", options.G.MessageRetry.MaxCount))
-		if options.G.Logger.TraceOn && msg.ChannelType == wkproto.ChannelTypePerson {
-			r.Trace("超过最大重试次数，暂停重试", "retry",
-				zap.String("uid", msg.Uid),
-				zap.Int64("messageId", msg.MessageId),
-				zap.Int64("connId", msg.ConnId),
-				zap.Int("retryCount", retryCount),
-				zap.Int("maxRetryCount", options.G.MessageRetry.MaxCount),
-			)
-		}
-		return
-	}
+	// 原密文只能发给原会话，连接号复用后不能改投新密钥对应的连接。
 	conn := eventbus.User.ConnById(msg.Uid, msg.FromNode, msg.ConnId)
-	if conn == nil {
+	if conn == nil || conn.SessionId != msg.SessionId {
 		if !q.completeRetry(msg, false) {
 			return
 		}
@@ -140,6 +125,30 @@ func (r *RetryManager) retry(q *RetryQueue, msg *types.RetryMessage, retryCount 
 					r.Trace("用户名下有其他连接（仅提醒）", "retry", zap.String("uid", msg.Uid), zap.Int64("messageId", msg.MessageId), zap.Int64("connId", conn.ConnId), zap.String("deviceId", conn.DeviceId), zap.String("deviceFlag", conn.DeviceFlag.String()))
 				}
 			}
+		}
+		return
+	}
+	if retryCount > options.G.MessageRetry.MaxCount {
+		if !q.completeRetry(msg, false) {
+			return
+		}
+		var messageSeq uint32
+		if msg.RecvPacket != nil {
+			messageSeq = msg.RecvPacket.MessageSeq
+		}
+		r.Warn("exceeded the maximum number of retries",
+			zap.String("uid", msg.Uid), zap.String("channelId", msg.ChannelId), zap.Uint8("channelType", msg.ChannelType),
+			zap.Int64("messageId", msg.MessageId), zap.Uint32("messageSeq", messageSeq),
+			zap.Uint64("fromNode", msg.FromNode), zap.Int64("connId", msg.ConnId),
+			zap.Int("retryCount", retryCount-1), zap.Int("messageMaxRetryCount", options.G.MessageRetry.MaxCount))
+		if options.G.Logger.TraceOn && msg.ChannelType == wkproto.ChannelTypePerson {
+			r.Trace("超过最大重试次数，暂停重试", "retry",
+				zap.String("uid", msg.Uid),
+				zap.Int64("messageId", msg.MessageId),
+				zap.Int64("connId", msg.ConnId),
+				zap.Int("retryCount", retryCount),
+				zap.Int("maxRetryCount", options.G.MessageRetry.MaxCount),
+			)
 		}
 		return
 	}
