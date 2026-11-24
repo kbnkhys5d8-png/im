@@ -73,7 +73,7 @@ func (r *ReactorSub) AddConn(conn Conn) error {
 
 func (r *ReactorSub) CloseConn(c Conn, er error) (rerr error) {
 	r.Debug("connection error", zap.Error(er))
-	return c.Close()
+	return c.CloseWithErr(er)
 }
 
 func (r *ReactorSub) AddWrite(conn Conn) error {
@@ -107,6 +107,12 @@ func (r *ReactorSub) readLoop(conn Conn) {
 		if err != nil {
 			if err == syscall.EAGAIN {
 				continue
+			}
+			// 与 Unix 一致：先交付错误前已完整解码的数据，再关闭连接。
+			if _, ok := err.(*readErrorWithData); ok && !conn.IsClosed() {
+				if dataErr := r.eg.eventHandler.OnData(conn); dataErr != nil && dataErr != syscall.EAGAIN {
+					r.Warn("failed to call OnData", zap.Error(dataErr))
+				}
 			}
 			r.Error("readLoop error", zap.Error(err))
 			if err1 := r.CloseConn(conn, err); err1 != nil {

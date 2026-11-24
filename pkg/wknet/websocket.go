@@ -32,6 +32,7 @@ func CreateWSSConn(id int64, connFd NetFd, localAddr, remoteAddr net.Addr, eg *E
 
 type WSConn struct {
 	*DefaultConn
+	stream           wsStream
 	upgraded         bool
 	tmpInboundBuffer InboundBuffer // inboundBuffer InboundBuffer
 }
@@ -39,7 +40,7 @@ type WSConn struct {
 func NewWSConn(d *DefaultConn) *WSConn {
 	buffer := d.eg.eventHandler.OnNewInboundConn(d, d.eg)
 	d.temporaryInbound = append(d.temporaryInbound, buffer)
-	return &WSConn{DefaultConn: d, tmpInboundBuffer: buffer}
+	return &WSConn{DefaultConn: d, tmpInboundBuffer: buffer, stream: wsStream{limit: d.eg.options.MaxReadBufferSize}}
 }
 
 func (w *WSConn) ReadToInboundBuffer() (int, error) {
@@ -66,60 +67,30 @@ func (w *WSConn) ReadToInboundBuffer() (int, error) {
 	return n, err
 }
 
-func (w *WSConn) WriteServerBinary(data []byte) error {
+func (w *WSConn) WriteServerBinary(data []byte) error { return w.writeFrame(ws.OpBinary, data) }
+
+func (w *WSConn) WriteServerText(data []byte) error { return w.writeFrame(ws.OpText, data) }
+
+func (w *WSConn) writeFrame(op ws.OpCode, data []byte) error {
+	w.stream.sendMu.Lock()
+	defer w.stream.sendMu.Unlock()
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.closed.Load() {
+	if w.stream.closeSent || w.closed.Load() {
 		return net.ErrClosed
 	}
-	return wsutil.WriteServerBinary(w.outboundBuffer, data)
+	return wsutil.WriteServerMessage(w.outboundBuffer, op, data)
 }
 
-func (w *WSConn) WriteServerText(data []byte) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.closed.Load() {
-		return net.ErrClosed
-	}
-	return wsutil.WriteServerText(w.outboundBuffer, data)
-}
+func (w *WSConn) CloseWithErr(err error) error { return closeWSWithErr(w.DefaultConn, err) }
 
 // 解包ws的数据
 func (w *WSConn) unpacketWSData() error {
-
 	if !w.upgraded {
-		err := w.upgrade()
-		if err != nil {
-			return err
-		}
-		return nil
+		return w.upgrade()
 	}
-
 	messages, err := w.decode()
-	if err != nil {
-		return err
-	}
-	if len(messages) > 0 {
-		for _, msg := range messages {
-			if msg.OpCode.IsControl() {
-				err = wsutil.HandleClientControlMessage(w, msg)
-				if err != nil {
-					return err
-				}
-				continue
-			}
-			if msg.OpCode == ws.OpPing {
-				w.KeepLastActivity()
-			}
-			if len(msg.Payload) > 0 {
-				_, err = w.inboundBuffer.Write(msg.Payload)
-				if err != nil {
-					return err
-				}
-			}
-		}
-	}
-	return nil
+	return w.stream.deliver(w.DefaultConn, w.inboundBuffer, messages, err)
 }
 
 func (w *WSConn) decode() ([]wsutil.Message, error) {
@@ -127,44 +98,7 @@ func (w *WSConn) decode() ([]wsutil.Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(buff) < ws.MinHeaderSize { // 数据不完整
-		w.Debug("数据不完整", zap.Int("len", len(buff)))
-		return nil, nil
-	}
-	tmpReader := bytes.NewReader(buff)
-	header, err := ws.ReadHeader(tmpReader)
-	if err != nil {
-		if err == io.EOF || err == io.ErrUnexpectedEOF { //数据不完整
-			return nil, nil
-		}
-		w.Debug("发送错误，丢弃数据", zap.Error(err))
-		w.DiscardFromTemp(len(buff)) // 发送错误，丢弃数据
-		return nil, err
-	}
-	dataLen := header.Length
-	if dataLen > int64(tmpReader.Len()) { // 数据不完整
-		w.Debug("数据不完整", zap.Int64("dataLen", dataLen), zap.Int64("tmpReader.Len()", int64(tmpReader.Len())))
-		return nil, nil
-	}
-
-	if header.Fin { // 当前 frame 已经是最后一个frame
-		var messages []wsutil.Message
-		tmpReader.Reset(buff)
-		remLen := tmpReader.Len()
-		for tmpReader.Len() > 0 {
-			messages, err = wsutil.ReadClientMessage(tmpReader, messages)
-			if err != nil {
-				w.Warn("read client message error", zap.Error(err))
-				break
-			}
-		}
-		remLen = remLen - tmpReader.Len()
-		w.DiscardFromTemp(remLen)
-		return messages, nil
-	} else {
-		w.Debug("ws header not is fin", zap.Int("len", len(buff)))
-	}
-	return nil, nil
+	return w.stream.decode(buff, w.DiscardFromTemp)
 }
 
 func (w *WSConn) upgrade() error {
@@ -270,6 +204,7 @@ type readWrite struct {
 
 type WSSConn struct {
 	*TLSConn
+	stream   wsStream
 	upgraded bool
 
 	wsTmpInboundBuffer InboundBuffer // inboundBuffer InboundBuffer
@@ -279,7 +214,7 @@ func NewWSSConn(tlsConn *TLSConn) *WSSConn {
 	d := tlsConn.d
 	buffer := d.eg.eventHandler.OnNewInboundConn(d, d.eg)
 	d.temporaryInbound = append(d.temporaryInbound, buffer)
-	return &WSSConn{TLSConn: tlsConn, wsTmpInboundBuffer: buffer}
+	return &WSSConn{TLSConn: tlsConn, wsTmpInboundBuffer: buffer, stream: wsStream{limit: d.eg.options.MaxReadBufferSize}}
 }
 
 func (w *WSSConn) ReadToInboundBuffer() (int, error) {
@@ -301,27 +236,32 @@ func (w *WSSConn) ReadToInboundBuffer() (int, error) {
 		return 0, err
 	}
 
+	var terminal error
 	for {
-		tlsN, err := w.tlsconn.Read(readBuffer)
-		if err != nil {
-			if err == tls.ErrDataNotEnough {
-				return n, nil
+		tlsN, readErr := w.tlsconn.Read(readBuffer)
+		if tlsN > 0 {
+			if _, err := w.wsTmpInboundBuffer.Write(readBuffer[:tlsN]); err != nil {
+				return n, err
 			}
-			return n, err
 		}
-		if tlsN == 0 {
+		if readErr != nil || tlsN == 0 {
+			if readErr != tls.ErrDataNotEnough {
+				terminal = readErr
+			}
 			break
-		}
-		_, err = w.wsTmpInboundBuffer.Write(readBuffer[:tlsN])
-		if err != nil {
-			return n, err
 		}
 	}
 
 	w.d.KeepLastActivity()
-
-	err = w.unpacketWSData()
-	return n, err
+	before := w.d.inboundBuffer.BoundBufferSize()
+	if err := w.unpacketWSData(); err != nil {
+		return n, err
+	}
+	// 同次读取的 TLS 尾部可能不完整或出错，前面已经解出的完整消息仍须交付。
+	if terminal != nil && w.d.inboundBuffer.BoundBufferSize() > before {
+		return n, &readErrorWithData{err: terminal}
+	}
+	return n, terminal
 }
 
 func (w *WSSConn) peekFromWSTemp(n int) ([]byte, error) {
@@ -384,106 +324,36 @@ func (w *WSSConn) upgrade() error {
 // 解包ws的数据
 func (w *WSSConn) unpacketWSData() error {
 	if !w.upgraded {
-		err := w.upgrade()
-		if err != nil {
-			return err
-		}
-		return nil
+		return w.upgrade()
 	}
-
 	messages, err := w.decode()
-	if err != nil {
-		return err
-	}
-	if len(messages) > 0 {
-		for _, msg := range messages {
-			if msg.OpCode.IsControl() {
-				err = wsutil.HandleClientControlMessage(w.TLSConn, msg)
-				if err != nil {
-					return err
-				}
-				continue
-			}
-			if msg.OpCode == ws.OpPing {
-				w.d.KeepLastActivity()
-			}
-			if len(msg.Payload) > 0 {
-				_, err = w.d.inboundBuffer.Write(msg.Payload)
-				if err != nil {
-					return err
-				}
-			}
-		}
-	}
-	return nil
+	return w.stream.deliver(w.TLSConn, w.d.inboundBuffer, messages, err)
 }
 
-func (w *WSSConn) WriteServerBinary(data []byte) error {
-	if w.IsClosed() {
+func (w *WSSConn) WriteServerBinary(data []byte) error { return w.writeFrame(ws.OpBinary, data) }
+
+func (w *WSSConn) WriteServerText(data []byte) error { return w.writeFrame(ws.OpText, data) }
+
+func (w *WSSConn) writeFrame(op ws.OpCode, data []byte) error {
+	w.stream.sendMu.Lock()
+	defer w.stream.sendMu.Unlock()
+	if w.stream.closeSent || w.IsClosed() {
 		return net.ErrClosed
 	}
-	// 先组装完整 WS 帧，再交给 TLS；TLS 回写会自行取得发送锁。
 	var frame bytes.Buffer
-	if err := wsutil.WriteServerBinary(&frame, data); err != nil {
+	if err := wsutil.WriteServerMessage(&frame, op, data); err != nil {
 		return err
 	}
 	_, err := w.TLSConn.Write(frame.Bytes())
 	return err
 }
 
-func (w *WSSConn) WriteServerText(data []byte) error {
-	if w.IsClosed() {
-		return net.ErrClosed
-	}
-	var frame bytes.Buffer
-	if err := wsutil.WriteServerText(&frame, data); err != nil {
-		return err
-	}
-	_, err := w.TLSConn.Write(frame.Bytes())
-	return err
-}
+func (w *WSSConn) CloseWithErr(err error) error { return closeWSWithErr(w.d, err) }
 
 func (w *WSSConn) decode() ([]wsutil.Message, error) {
 	buff, err := w.peekFromWSTemp(-1)
 	if err != nil {
 		return nil, err
 	}
-	if len(buff) < ws.MinHeaderSize { // 数据不完整
-		w.d.Debug("数据还没读完", zap.Int("len", len(buff)))
-		return nil, nil
-	}
-	tmpReader := bytes.NewReader(buff)
-	header, err := ws.ReadHeader(tmpReader)
-	if err != nil {
-		if err == io.EOF || err == io.ErrUnexpectedEOF { //数据不完整
-			return nil, nil
-		}
-		w.d.Debug("wss: 发送错误，丢弃数据", zap.Error(err))
-		w.discardFromWSTemp(len(buff)) // 发送错误，丢弃数据
-		return nil, err
-	}
-	dataLen := header.Length
-	if dataLen > int64(tmpReader.Len()) { // 数据不完整
-		w.d.Debug("wss: 数据还没读完....", zap.Int("dataLen", int(dataLen)), zap.Int("tmpReader.Len()", int(tmpReader.Len())))
-		return nil, nil
-	}
-	if header.Fin { // 当前 frame 已经是最后一个frame
-
-		var messages []wsutil.Message
-		tmpReader.Reset(buff)
-		remLen := tmpReader.Len()
-		for tmpReader.Len() > 0 {
-			messages, err = wsutil.ReadClientMessage(tmpReader, messages)
-			if err != nil {
-				w.d.Warn("read client message error", zap.Error(err))
-				break
-			}
-		}
-		remLen = remLen - tmpReader.Len()
-		w.discardFromWSTemp(remLen)
-		return messages, nil
-	} else {
-		w.d.Debug("wss: ws header not is fin", zap.Int("len", len(buff)))
-	}
-	return nil, nil
+	return w.stream.decode(buff, w.discardFromWSTemp)
 }

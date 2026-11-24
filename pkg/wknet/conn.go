@@ -141,6 +141,7 @@ type DefaultConn struct {
 	owner          Conn
 	idleGeneration uint64
 	idleTimer      *timingwheel.Timer
+	wsCloseTimer   *time.Timer // 仅在 WS 关闭应答等待排空时使用，由 mu 保护。
 
 	uptime       atomic.Time
 	lastActivity atomic.Time
@@ -342,6 +343,10 @@ func (d *DefaultConn) closeLocked() Conn {
 	}
 	d.closed.Store(true)
 	d.cancelIdleLocked()
+	if d.wsCloseTimer != nil {
+		d.wsCloseTimer.Stop()
+		d.wsCloseTimer = nil
+	}
 
 	owner := d.owner
 	if owner == nil {
@@ -371,6 +376,13 @@ func (d *DefaultConn) finishClose(owner Conn) {
 	d.eg.eventHandler.OnClose(owner)
 	d.recvMu.Lock()
 	defer d.recvMu.Unlock()
+	// TCP 意外断开时也释放尚未拼完的消息，不让旧连接引用继续占用大分片内存。
+	switch w := owner.(type) {
+	case *WSConn:
+		w.stream.partial = nil
+	case *WSSConn:
+		w.stream.partial = nil
+	}
 	if err := d.inboundBuffer.Release(); err != nil {
 		d.Debug("inboundBuffer release error", zap.Error(err))
 	}
@@ -558,8 +570,7 @@ func (d *DefaultConn) flush() error {
 	}
 
 	if d.outboundBuffer.IsEmpty() {
-		_ = d.removeWriteIfExist()
-		d.mu.Unlock()
+		d.finishFlushLocked()
 		return nil
 	}
 	var (
@@ -569,9 +580,11 @@ func (d *DefaultConn) flush() error {
 
 	head, tail := d.outboundBuffer.Peek(-1)
 	n, err = d.writeDirect(head, tail)
-	_, _ = d.outboundBuffer.Discard(n)
-	if d.eg.options.Event.OnWirteBytes != nil {
-		d.eg.options.Event.OnWirteBytes(n)
+	if n > 0 {
+		_, _ = d.outboundBuffer.Discard(n)
+		if d.eg.options.Event.OnWirteBytes != nil {
+			d.eg.options.Event.OnWirteBytes(n)
+		}
 	}
 	d.mu.Unlock()
 
@@ -591,12 +604,24 @@ func (d *DefaultConn) flush() error {
 	// remove the writable event from poller to help the future event-loops.
 
 	d.mu.Lock()
-	if d.outboundBuffer.IsEmpty() {
-		_ = d.removeWriteIfExist()
+	if !d.closed.Load() && d.outboundBuffer.IsEmpty() {
+		d.finishFlushLocked()
+	} else {
+		d.mu.Unlock()
 	}
-	d.mu.Unlock()
 	return nil
+}
 
+// 发送队列已空，持锁进入；关闭回调不得在发送锁内执行。
+func (d *DefaultConn) finishFlushLocked() {
+	if d.wsCloseTimer != nil {
+		owner := d.closeLocked()
+		d.mu.Unlock()
+		d.finishClose(owner)
+		return
+	}
+	_ = d.removeWriteIfExist()
+	d.mu.Unlock()
 }
 
 func (d *DefaultConn) WriteDirect(head, tail []byte) (int, error) {

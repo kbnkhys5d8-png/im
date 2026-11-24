@@ -176,16 +176,10 @@ func (r *ReactorSub) read(c Conn) error {
 	var err error
 	var n int
 	if n, err = c.ReadToInboundBuffer(); err != nil {
-		// A TLS read can return valid plaintext followed by a fatal record
-		// error from the same socket read. Deliver the plaintext before
-		// closing the connection for the fatal error.
+		// 同一次读取可能先解出完整消息，再遇到 TLS/WS 终止。先交付，再按原读取原因关闭。
 		if _, hasNewData := err.(*readErrorWithData); hasNewData && !c.IsClosed() {
 			if dataErr := r.eg.eventHandler.OnData(c); dataErr != nil && dataErr != unix.EAGAIN {
-				if err1 := r.CloseConn(c, dataErr); err1 != nil {
-					r.Warn("failed to close conn", zap.Error(err1))
-				}
 				r.Warn("failed to call OnData", zap.Error(dataErr))
-				return nil
 			}
 		}
 		if err == unix.EAGAIN {

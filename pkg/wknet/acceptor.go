@@ -28,7 +28,6 @@ type acceptor struct {
 	listenWS          *listener // websocket
 	listenWSS         *listener // websocket
 	tcpRealListenAddr net.Addr  // tcp real listen addr
-	wsRealListenAddr  net.Addr  // websocket real listen addr
 
 	runWG sync.WaitGroup
 
@@ -183,7 +182,6 @@ func (a *acceptor) initWSListener(wg *sync.WaitGroup) error {
 	if err != nil {
 		return err
 	}
-	a.wsRealListenAddr = a.listenWS.realAddr
 	if err := a.listenWSPoller.AddRead(a.listenWS.fd); err != nil {
 		return fmt.Errorf("add ws listener fd to poller failed %s", err)
 	}
@@ -200,7 +198,6 @@ func (a *acceptor) initWSSListener(wg *sync.WaitGroup) error {
 	if err != nil {
 		return err
 	}
-	a.wsRealListenAddr = a.listenWSS.realAddr
 	if err := a.listenWSSPoller.AddRead(a.listenWSS.fd); err != nil {
 		return fmt.Errorf("add ws listener fd to poller failed %s", err)
 	}
